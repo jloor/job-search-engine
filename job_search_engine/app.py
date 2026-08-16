@@ -3687,6 +3687,34 @@ MCP_TOOLS = [
                     "Messages flagged auth_warn are possible spoofs.",
      "inputSchema": {"type": "object", "properties": {
          "limit": {"type": "integer", "default": 15}, "unhandled_only": {"type": "boolean"}}}},
+    # ⭐ THE SCAN QUEUE WAS NOT REACHABLE AT ALL. Every tool above reads `application`,
+    # which is what he has already SUBMITTED. The 12,000 scored candidates behind it, and
+    # the ~350 that clear every gate, could only be seen by running a script on his laptop.
+    # That is the half of the system a front-end is actually for.
+    {"name": "search_queue",
+     "description": "Scored, gated job candidates NOT yet applied to. This is the queue, not "
+                    "the application pipeline. Filter by pay floor, remote mode, title or "
+                    "company. Pay carries its provenance: a 'board' band was published by "
+                    "the employer, 'body_regex' was recovered from the posting text, 'model' "
+                    "was read by a model. A missing band means the employer published "
+                    "nothing, NOT that the role pays badly.",
+     "inputSchema": {"type": "object", "properties": {
+         "min_score": {"type": "integer", "default": 70},
+         "min_pay": {"type": "integer",
+                     "description": "annual floor; rows with no band are excluded when set"},
+         "remote": {"type": "string",
+                    "description": "fully_remote|remote_in_metro|hybrid_commutable|any"},
+         "title": {"type": "string"}, "company": {"type": "string"},
+         "limit": {"type": "integer", "default": 25}}}},
+    {"name": "commute_check",
+     "description": "What the system concludes about a location string and WHY. Returns the "
+                    "verdict, which layer decided it (human beats measurement beats model), "
+                    "the model's estimate and the measured drive and transit times side by "
+                    "side, and a resolved street address where one was needed. Use this "
+                    "before claiming a role is or is not commutable.",
+     "inputSchema": {"type": "object", "properties": {
+         "location": {"type": "string", "description": "a location string, or part of one"},
+         "limit": {"type": "integer", "default": 10}}, "required": ["location"]}},
 ]
 
 
@@ -3741,6 +3769,94 @@ def _mcp_call(name: str, args: dict) -> str:
                     f"contact: {r['contact_raw'] or '—'}",
                     f"link:    {r['canonical_url'] or '—'}",
                     f"notes:   {r['notes'] or '—'}", ""]
+        return "\n".join(out)
+
+    if name == "search_queue":
+        w = ["cast(c.score as int) >= ?", "c.triaged = 1",
+             "c.verdict NOT IN ('out_of_scope','duplicate','error')"]
+        params = [int(args.get("min_score", 70))]
+        mode = (args.get("remote") or "").strip()
+        if mode and mode != "any":
+            w.append("c.remote_verdict = ?"); params.append(mode)
+        else:
+            # The default is every mode he can actually work, not every row in the table.
+            w.append("(c.remote_verdict IN ('fully_remote','remote_in_metro',"
+                     "'hybrid_commutable') OR c.remote_verdict IS NULL)")
+        if args.get("title"):
+            w.append("lower(c.title) LIKE ?"); params.append(f"%{args['title'].lower()}%")
+        if args.get("company"):
+            w.append("lower(c.board) LIKE ?"); params.append(f"%{args['company'].lower()}%")
+        if args.get("min_pay"):
+            # ⚠️ Compared against comp_MAX, and hourly rows are excluded rather than
+            # multiplied up. Annualising an hourly rate requires an assumption about hours
+            # that the posting did not make, and a floor filter is not the place to invent
+            # one. The exclusion is stated in the footer so it is never a silent drop.
+            w.append("c.comp_max IS NOT NULL AND c.comp_max >= ? "
+                     "AND COALESCE(c.comp_basis,'') NOT LIKE '%/hour'")
+            params.append(int(args["min_pay"]))
+        params.append(max(1, min(int(args.get("limit", 25)), 100)))
+        rows = _rows(
+            "SELECT c.title, c.board, c.location, c.score, c.remote_verdict, c.url, "
+            "c.comp_min, c.comp_max, c.comp_basis, c.comp_source FROM scan_candidate c "
+            "WHERE " + " AND ".join(w) +
+            " ORDER BY c.comp_max DESC NULLS LAST, cast(c.score as int) DESC LIMIT ?",
+            tuple(params))
+        if not rows:
+            return "no queued roles match"
+        out = []
+        for r in rows:
+            if r["comp_min"] is not None:
+                per = "/hr" if (r["comp_basis"] or "").endswith("/hour") else ""
+                basis = (r["comp_basis"] or "").replace("/hour", "") or "unclear"
+                pay = (f"${r['comp_min']:,}-${r['comp_max']:,}{per} "
+                       f"({basis}, via {r['comp_source'] or '?'})")
+            else:
+                # 🚨 Never render a missing band as a low one. "not published" and "cheap"
+                # are different facts and only one of them is in the posting.
+                pay = "no band published"
+            out.append(f"{r['board'].split('|')[-1]} — {r['title']}\n"
+                       f"  fit {r['score']} | {r['remote_verdict'] or 'unknown'} | "
+                       f"{(r['location'] or '')[:44]}\n  {pay}\n  {r['url'] or ''}")
+        note = ""
+        if args.get("min_pay"):
+            note = ("\n\n⚠️ A pay floor excludes every role with no published band, and "
+                    "hourly bands are excluded rather than annualised.")
+        return "\n".join(out) + note
+
+    if name == "commute_check":
+        rows = _rows(
+            "SELECT location, board, verdict, verdict_from, judged_min, judged_mode, "
+            "judged_conf, judged_note, drive_min, transit_min, best_min, best_mode, "
+            "address, address_status, postings, note FROM place "
+            "WHERE lower(location) LIKE ? ORDER BY COALESCE(postings,0) DESC LIMIT ?",
+            (f"%{args['location'].lower()}%",
+             max(1, min(int(args.get("limit", 10)), 50))))
+        if not rows:
+            return (f"no place record matching {args['location']!r}. That means nobody has "
+                    f"ruled on it, which is not the same as commutable.")
+        out = []
+        for r in rows:
+            who = f"{r['board']} office" if r["board"] else "the city"
+            out.append(f"{r['location']}  ({who})")
+            out.append(f"  verdict : {r['verdict']}  — decided by {r['verdict_from']}")
+            # ⭐ BOTH LAYERS, SIDE BY SIDE, ALWAYS. Showing one number would hide that a
+            # model's guess and a measured route routinely disagree, which is the single
+            # most useful thing this record knows.
+            if r["judged_min"] is not None:
+                out.append(f"  model   : {r['judged_min']} min by {r['judged_mode'] or '?'} "
+                           f"(confidence {r['judged_conf'] or '?'})")
+            if r["best_min"] is not None:
+                out.append(f"  measured: {r['best_min']} min "
+                           f"(drive {r['drive_min'] or '—'}, transit {r['transit_min'] or '—'})")
+            if r["address"]:
+                out.append(f"  address : {r['address']}")
+            elif r["address_status"] and r["address_status"] != "not_attempted":
+                out.append(f"  address : not resolved ({r['address_status']})")
+            if r["judged_note"]:
+                out.append(f"  note    : {r['judged_note'][:160]}")
+            if r["note"]:
+                out.append(f"  ⚠️ {r['note'][:200]}")
+            out.append("")
         return "\n".join(out)
 
     if name == "search_vault":

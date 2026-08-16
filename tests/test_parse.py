@@ -836,6 +836,78 @@ On Wed, Aug 12, 2026 the candidate wrote:
         _C3._cache.clear()
         _app3._COMMUTE_FAR.update(db_at=0, origin=None)
 
+        # ═══════════════════════════════════ the MCP read surface over queue and places
+        #
+        # ⭐ Every other MCP tool reads `application`, which is what he already SUBMITTED.
+        # The scored queue behind it was unreachable, and so was the place data.
+        _c3 = _s3.connect(_d3)
+        _c3.execute("DELETE FROM scan_candidate")
+        for _t, _b, _sc, _mn, _mx, _ba, _srcp in (
+                ("Support Engineer", "greenhouse|rich",   "88", 200000, 250000, "base", "board"),
+                ("Support Engineer", "greenhouse|poor",   "96",  59500,  82000, "base", "body_regex"),
+                ("Support Engineer", "greenhouse|quiet",  "80",   None,   None,  None,  None),
+                ("Support Engineer", "greenhouse|hourly", "75",     60,     90, "hourly/hour", "body_regex"),
+                ("Chef",             "greenhouse|nope",   "90", 300000, 400000, "base", "board")):
+            _c3.execute(
+                "INSERT INTO scan_candidate (at,req_id,board,title,location,score,triaged,"
+                "verdict,remote_verdict,comp_min,comp_max,comp_basis,comp_source) "
+                "VALUES ('now',?,?,?,'Remote',?,1,'apply','fully_remote',?,?,?,?)",
+                (f"{_b}:1", _b, _t, _sc, _mn, _mx, _ba, _srcp))
+        _c3.commit(); _c3.close()
+
+        _q = _app3._mcp_call("search_queue", {"min_score": 70})
+        check("the queue is reachable at all", "rich" in _q and "poor" in _q, True)
+        # 🚨 A MISSING BAND IS NOT A LOW BAND. Rendering it as $0, or omitting the row, makes
+        # "the employer published nothing" look like "this job pays badly".
+        check("a role with no band says so and is still listed",
+              "no band published" in _q and "quiet" in _q, True)
+        check("provenance travels with the number", "via board" in _q, True)
+        check("...and a recovered band is distinguishable", "via body_regex" in _q, True)
+
+        _p = _app3._mcp_call("search_queue", {"min_score": 70, "min_pay": 100000})
+        check("a pay floor keeps the role above it", "rich" in _p, True)
+        check("...and drops the one below it", "poor" in _p, False)
+        # ⚠️ Silently dropping unpriced roles hides most of the queue behind a filter that
+        # looks like it only removed cheap jobs.
+        check("...drops unpriced roles but SAYS it did",
+              "quiet" not in _p and "no published band" in _p, True)
+        # Annualising an hourly rate needs an assumption about hours the posting never made.
+        # ⚠️ Asserted on the RENDERED RATE, not the word "hourly": the footer explaining the
+        # exclusion contains that word, so the obvious substring check passes on the
+        # explanation while the row itself is still there.
+        check("an hourly band is excluded from a salary floor, not multiplied up",
+              "/hr" in _p, False)
+        check("hourly rows still appear when no floor is set", "/hr" in _q, True)
+        check("a title filter excludes off-target roles",
+              "nope" in _app3._mcp_call("search_queue", {"title": "support"}), False)
+
+        _c3 = _s3.connect(_d3)
+        _c3.execute("DELETE FROM place")
+        _c3.execute("INSERT INTO place (origin,board,location,verdict,verdict_from,"
+                    "judged_min,judged_mode,judged_conf,drive_min,transit_min,best_min,"
+                    "postings) VALUES (?,'','New York, NY','commutable','measurement',"
+                    "75,'bus','medium',98,52,52,77)", (_ORIGIN,))
+        _c3.commit(); _c3.close()
+        _cc = _app3._mcp_call("commute_check", {"location": "new york"})
+        # ⭐ BOTH NUMBERS, ALWAYS. Driving alone puts Manhattan over the ceiling at 98 and
+        # transit does it in 52. Reporting one would hide the disagreement that matters most.
+        check("the measured drive AND transit are both shown",
+              "98" in _cc and "52" in _cc, True)
+        check("the model's estimate sits beside them", "75 min by bus" in _cc, True)
+        check("it says which layer decided", "decided by measurement" in _cc, True)
+        # 🚨 Silence is not consent. An unknown location must not read as commutable.
+        check("an unknown location reads as unruled, not commutable",
+              "not the same as commutable" in
+              _app3._mcp_call("commute_check", {"location": "zzz nowhere"}), True)
+
+        check("both tools are advertised, not merely implemented",
+              {"search_queue", "commute_check"} <= {t["name"] for t in _app3.MCP_TOOLS}, True)
+        # ⚠️ READ-ONLY. The MCP token is handed to agents, and a write reachable through it
+        # would let a summariser change pipeline state.
+        _msrc = _src_of(_app3._mcp_call).lower()
+        check("the MCP surface contains no writes",
+              any(k in _msrc for k in ("insert into", "update ", "delete from")), False)
+
         # ⭐ THE PAY BAND IS READ AT INSERT, NOT AFTER SCORING. Asserted through a real
         # sweep rather than by calling the extractor, because the extractor passing while
         # the INSERT never carries its columns is precisely the shape of the failure this
