@@ -58,13 +58,30 @@ _FOREIGN = re.compile(
     r"shanghai|shenzhen|taipei|sydney|melbourne|brisbane|perth|auckland|wellington|"
     r"toronto|montreal|montréal|ottawa|calgary|winnipeg|mexico city|são paulo|sao paulo|"
     r"rio de janeiro|buenos aires|santiago|bogotá|bogota|lima|cape town|johannesburg|"
-    r"nairobi|lagos|accra|casablanca)\b", re.I)
+    r"nairobi|lagos|accra|casablanca|"
+    # ⚠️ CANADA NEEDED MORE THAN ITS FOUR BIGGEST CITIES. A full sweep scored a
+    # "Canada- Sr Solutions Analyst" in "Remote or Mississauga" at 84, because the word
+    # "Remote" satisfied the gate and Mississauga was in no list. The suburbs and the
+    # provinces are where these postings actually sit.
+    #
+    # 🚨 DELIBERATELY OMITTED, because they are US places too and a false rejection is
+    # worse than a false keep here: Ontario (California), Vancouver (Washington),
+    # Victoria (Texas), Windsor, Waterloo, Markham, Scarborough, Halifax, Regina.
+    # Those are caught by "canada" or by the geography rule instead.
+    r"mississauga|brampton|etobicoke|gatineau|burnaby|saskatoon|edmonton|oshawa|vaughan|"
+    r"kitchener|guelph|kelowna|moncton|sherbrooke|nanaimo|coquitlam|richmond hill|"
+    r"north york|british columbia|saskatchewan|manitoba|nova scotia|newfoundland|"
+    r"new brunswick|prince edward island|yukon|nunavut|northwest territories|alberta|"
+    r"québec|quebec)\b", re.I)
 
 # A region name is a place he cannot cover from one timezone, even when it says remote.
 _REGION = re.compile(r"\b(emea|apac|latam|anz|dach|benelux|mena|europe|asia|africa|"
                      r"latin america|oceania|middle east)\b", re.I)
 
-REMOTE_TXT = re.compile(r"\b(remote|distributed|work from home|wfh|anywhere)\b", re.I)
+# ⚠️ "remotely" NEEDS THE OPTIONAL SUFFIX. \bremote\b demands a boundary right after the
+# 'e', so a posting whose location field reads "Remotely based" matched nothing. One was
+# found sitting unread at the top of the remote_check backlog for exactly this reason.
+REMOTE_TXT = re.compile(r"\b(remote(?:ly)?|distributed|work from home|wfh|anywhere)\b", re.I)
 BODY_REMOTE = re.compile(
     r"\b(fully remote|100% remote|remote[- ]first|remote.friendly|work from anywhere|"
     r"remote (?:role|position|opportunity)|or remote|remote or)\b", re.I)

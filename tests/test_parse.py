@@ -792,6 +792,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
         _o3.environ["CANDIDATE_CONFIG"] = str(HERE.parent / "seed" / "candidate.toml")
         try:
             import candidate as _C3
+            import gates as _G3
             _C3._cache.clear()
             _ORIGIN = ((_C3.load().get("commute") or {}).get("origin") or "").strip()
         except Exception:                                     # noqa: BLE001
@@ -835,6 +836,36 @@ On Wed, Aug 12, 2026 the candidate wrote:
             _o3.environ["CANDIDATE_CONFIG"] = _prev_cfg
         _C3._cache.clear()
         _app3._COMMUTE_FAR.update(db_at=0, origin=None)
+
+        # ══════════════════════════ three bugs a full sweep found, 2026-08-16
+        #
+        # 🚨 A CANADIAN SUBURB SCORED 84. "Canada- Sr Solutions Analyst" in "Remote or
+        # Mississauga" cleared every gate, because the word Remote satisfied it and
+        # Mississauga was in no list. Toronto and Ottawa were; the suburbs were not.
+        check("Mississauga is not a US city", _G3.eligibility("Remote or Mississauga"),
+              "ineligible")
+        check("...nor is a Canadian province",
+              _G3.eligibility("Sherwood Park, Alberta"), "ineligible")
+        # ⚠️ The omissions are deliberate: these names are US places too, and a false
+        # rejection costs a real job while a false keep only costs a triage call.
+        for _amb in ("Ontario, CA", "Vancouver, WA", "Victoria, TX"):
+            check(f"{_amb} is not treated as Canada",
+                  _G3.eligibility(_amb) == "ineligible", False)
+
+        # ⚠️ \bremote\b demands a boundary after the 'e', so this matched nothing.
+        check("'Remotely based' counts as remote text",
+              bool(_G3.REMOTE_TXT.search("Remotely based")), True)
+        check("...and plain 'Remote' still does",
+              bool(_G3.REMOTE_TXT.search("Remote")), True)
+
+        # 🚨 THE STARVATION. job_remote_check took the top N by score and THEN dropped rows
+        # that never mention remote, so a block of high-scoring onsite roles pinned the
+        # batch and the job reported "nothing to check" forever. 92 rows were eligible, 0 of
+        # the top 24 qualified, 68 were unreachable. Asserted on the SQL, because the
+        # symptom is a job that succeeds while doing nothing.
+        _rc = _src_of(_app3.job_remote_check)
+        check("the remote-mention filter is inside the query, not after the LIMIT",
+              _rc.index("LIKE '%remote%'") < _rc.index("LIMIT ?"), True)
 
         # ═══════════════════════════════════ the MCP read surface over queue and places
         #

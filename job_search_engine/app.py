@@ -2687,8 +2687,25 @@ def job_remote_check() -> str:
 
     with db() as con:
         rows = [dict(r) for r in con.execute(
+            # 🚨 THE MENTION FILTER MUST BE INSIDE THE LIMIT, NOT AFTER IT.
+            # This selected the top 24 by score and THEN dropped everything that never
+            # mentions remote. When those 24 are all onsite roles the job returns "nothing
+            # to check", and because the same 24 sort to the top again it returns that
+            # forever: measured on 2026-08-16, 92 rows were eligible, 0 of the top 24
+            # qualified, and the remaining 68 were unreachable. A job that reports success
+            # while doing nothing is the exact failure this codebase keeps rediscovering.
+            #
+            # ⚠️ SQL cannot run the regex, so this is a deliberately loose prefilter and the
+            # precise REMOTE_TXT match still runs below. Loose here is safe: it only decides
+            # which rows are candidates for reading, never what the answer is.
             "SELECT id,title,location,description FROM scan_candidate "
             " WHERE cast(score as int) >= ? AND remote_verdict IS NULL "
+            "   AND (lower(description) LIKE '%remote%' OR lower(location) LIKE '%remote%'"
+            "        OR lower(description) LIKE '%hybrid%'"
+            "        OR lower(description) LIKE '%work from home%'"
+            "        OR lower(description) LIKE '%wfh%'"
+            "        OR lower(description) LIKE '%distributed%'"
+            "        OR lower(description) LIKE '%anywhere%') "
             " ORDER BY cast(score as int) DESC LIMIT ?",
             (TRIAGE_BAND_MIN, REMOTE_BATCH)).fetchall()]
     # Only postings that mention remote at all are worth asking about; the rest were
