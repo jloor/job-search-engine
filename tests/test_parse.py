@@ -775,6 +775,110 @@ On Wed, Aug 12, 2026 the candidate wrote:
               "con.executemany(" in _src_of(_app3._job_scan_locked), True)
         check("and _Hrana can actually batch",
               callable(getattr(_app3._Hrana, "executemany", None)), True)
+
+        # ═══════════════════════════════════ the commute rejection set, from the database
+        #
+        # ⭐ This moved out of a markdown file in the synced repo and into the `place`
+        # table, so the container can write it and a front-end can read it.
+        # ⚠️ Read the origin the way the code under test reads it. Hardcoding one here
+        # would make this pass against a config that says something else, which is the
+        # failure mode the whole candidate-config layer exists to prevent.
+        # 🚨 POINT IT AT THE SEED PROFILE FIRST. With no config the engine has no origin,
+        # _commute_too_far declines to read the table at all, and every assertion below
+        # would pass or fail for a reason that has nothing to do with what it is testing.
+        # This is the same trap the seed-profile check at the top of e2e-check.sh warns
+        # about: an empty config makes the code decline politely and look like it worked.
+        _prev_cfg = _o3.environ.get("CANDIDATE_CONFIG")
+        _o3.environ["CANDIDATE_CONFIG"] = str(HERE.parent / "seed" / "candidate.toml")
+        try:
+            import candidate as _C3
+            _C3._cache.clear()
+            _ORIGIN = ((_C3.load().get("commute") or {}).get("origin") or "").strip()
+        except Exception:                                     # noqa: BLE001
+            _ORIGIN = ""
+        check("the seed profile supplies a commute origin", bool(_ORIGIN), True)
+        _c3 = _s3.connect(_d3)
+        _c3.execute("DELETE FROM place")
+        for _loc, _v in (("Philadelphia, PA", "too_far"), ("Pittsburgh, PA", "too_far"),
+                         ("Brooklyn, NY", "commutable"), ("New Jersey", "review")):
+            _c3.execute("INSERT INTO place (origin,board,location,verdict,verdict_from) "
+                        "VALUES (?,'',?,?,'measurement')", (_ORIGIN, _loc, _v))
+        # ⚠️ A row scoped to ONE employer's office must never reject a different employer
+        # in the same city, so board != '' is excluded from the set entirely.
+        _c3.execute("INSERT INTO place (origin,board,location,verdict,verdict_from) "
+                    "VALUES (?,'greenhouse|acme','Newark, NJ','too_far','measurement')",
+                    (_ORIGIN,))
+        _c3.commit(); _c3.close()
+        _app3._COMMUTE_FAR.update(db_at=0, origin=None)
+        _far = _app3._commute_too_far()
+        check("the rejection set comes from the database", "Philadelphia, PA" in _far, True)
+        check("only too_far rows are in it",
+              {"Brooklyn, NY", "New Jersey"} & _far, set())
+        check("a board-scoped row cannot reject the whole city",
+              "Newark, NJ" in _far, False)
+
+        # 🚨 CACHED. _location_gate calls this once PER POSTING, inside a loop over the
+        # whole sweep. Uncached, a 157,000-posting backfill is 157,000 HTTP round-trips for
+        # a set that changes about weekly. Asserted by deleting every row and checking the
+        # answer does NOT change until the cache is expired by hand.
+        _c3 = _s3.connect(_d3); _c3.execute("DELETE FROM place"); _c3.commit(); _c3.close()
+        check("a second call does not re-read the database",
+              "Philadelphia, PA" in _app3._commute_too_far(), True)
+        _app3._COMMUTE_FAR.update(db_at=0, origin=None)
+        # 📌 With the table empty the markdown fallback takes over, which is what keeps an
+        # un-migrated deployment from silently losing its whole commute filter.
+        check("an empty table falls back rather than answering nothing",
+              isinstance(_app3._commute_too_far(), set), True)
+        if _prev_cfg is None:
+            _o3.environ.pop("CANDIDATE_CONFIG", None)
+        else:
+            _o3.environ["CANDIDATE_CONFIG"] = _prev_cfg
+        _C3._cache.clear()
+        _app3._COMMUTE_FAR.update(db_at=0, origin=None)
+
+        # ⭐ THE PAY BAND IS READ AT INSERT, NOT AFTER SCORING. Asserted through a real
+        # sweep rather than by calling the extractor, because the extractor passing while
+        # the INSERT never carries its columns is precisely the shape of the failure this
+        # is here to catch: the comp columns lived only as hand-run ALTER statements for
+        # weeks and nothing noticed.
+        _c3 = _s3.connect(_d3)
+        _c3.execute("DELETE FROM scan_board")
+        _c3.execute("DELETE FROM board_state WHERE board LIKE 'greenhouse|payco%'")
+        _c3.execute("INSERT INTO scan_board (platform,token,api_url,source,added_at,"
+                    "enabled) VALUES ('greenhouse','payco','https://example.invalid/p',"
+                    "'t','now',1)")
+        _c3.commit(); _c3.close()
+        _paid = {"id": 77, "title": "Support Engineer", "location": {"name": "Remote"},
+                 "content": "The salary range for this role is $118,000 - $142,000 per year."}
+        _free = {"id": 78, "title": "Support Engineer", "location": {"name": "Remote"},
+                 "content": "We help customers move more than $40 billion to $60 billion."}
+        _seed = {"id": 76, "title": "Support Engineer", "location": {"name": "Remote"},
+                 "content": "No pay information here."}
+        # ⚠️ First contact SEEDS and announces nothing, so a posting present on sweep one
+        # never becomes a candidate. Both of these have to arrive on a LATER sweep to be
+        # new. Getting this wrong made the first version of this test assert against an
+        # empty table and pass its negative case for the wrong reason.
+        _sweep([_seed])
+        _sweep([_seed, _paid, _free])
+        _c3 = _s3.connect(_d3); _c3.row_factory = _s3.Row
+        _got = {r["req_id"].rpartition(":")[2]: dict(r) for r in _c3.execute(
+            "SELECT req_id,comp_min,comp_max,comp_basis,comp_evidence,comp_source "
+            "FROM scan_candidate WHERE req_id LIKE '%payco%'").fetchall()}
+        _c3.close()
+        check("a swept posting lands with its band already read",
+              (_got.get("77", {}).get("comp_min"), _got.get("77", {}).get("comp_max")),
+              (118000, 142000))
+        check("...labelled as recovered from the body, not published by the board",
+              _got.get("77", {}).get("comp_source"), "body_regex")
+        check("...with the span it was read from stored beside it",
+              "$118,000" in (_got.get("77", {}).get("comp_evidence") or ""), True)
+        # 🚨 THE ONE THAT MATTERS MOST. A posting whose only money is a company statistic
+        # must land with NO band. A wrong number is worse than a missing one, and NULL is
+        # what the paid comp job selects on, so this row still reaches a model later.
+        check("$40 billion of company revenue is not a salary",
+              _got.get("78", {}).get("comp_min"), None)
+        check("...and that row stays eligible for the paid reader",
+              _got.get("78", {}).get("comp_basis"), None)
     finally:
         _u3.urlopen = _real3
         if _p3 is None: _o3.environ.pop("DB_PATH", None)

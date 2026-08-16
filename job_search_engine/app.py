@@ -1854,16 +1854,58 @@ def _job_scan_locked() -> str:
 
 # ---------------------------------------------------------------- location gates --
 
-_COMMUTE_FAR: dict = {"mtime": None, "set": set()}
+_COMMUTE_FAR: dict = {"mtime": None, "set": set(), "db_at": 0.0, "origin": None}
+# ⚠️ The rejection set changes when he reviews a place, roughly weekly. Ten minutes is
+# short enough that a correction reaches a running scheduler without a redeploy, which
+# was the whole point of reading it from the synced repo before the database took over.
+COMMUTE_CACHE_SEC = int(os.environ.get("COMMUTE_CACHE_SEC", "600"))
 
 
 def _commute_too_far() -> set:
     """Location strings the reviewed commute table marked as beyond the ceiling.
 
-    📌 Read from the SYNCED REPO and re-read when it changes, because the table is a
-    human-reviewed artifact. A hand correction there has to reach the scanner without a
-    redeploy, otherwise nobody will make the correction.
+    ⭐ THE DATABASE IS THE STORE NOW. This used to parse a markdown table in the synced
+    repo, which meant the answer existed on exactly one laptop, the container could never
+    add to it, and nothing else could query it. The `place` table holds the same facts
+    with their provenance, so the service can write them and a front-end can read them.
+    See that table's comment in schema.sql for why the three layers are kept apart.
+
+    📌 THE MARKDOWN STAYS AS A FALLBACK, deliberately. A deployment whose `place` table has
+    not been imported yet must not silently lose the whole commute filter and start keeping
+    jobs in Philadelphia. No rows means "not migrated", not "nothing is too far".
+
+    ⚠️ CITY-LEVEL ROWS ONLY (board = ''). A commute measured to one employer's own office
+    says nothing about a different employer that happens to be in the same city.
     """
+    origin = ""
+    try:
+        import candidate as _C
+        origin = ((_C.load().get("commute") or {}).get("origin") or "").strip()
+    except Exception:                                         # noqa: BLE001
+        pass
+    # 🚨 CACHED, AND THE CACHE IS NOT OPTIONAL. This is called once per posting from
+    # _location_gate, inside a loop over an entire sweep. Uncached, a 157,000-posting
+    # backfill is 157,000 HTTP round-trips to Bunny for a set that changes about once a
+    # week. The markdown version was cached on file mtime and the database version has to
+    # be cached too, or moving the store makes the scanner unusable.
+    now = time.time()
+    if origin and _COMMUTE_FAR.get("origin") == origin and \
+            now - _COMMUTE_FAR.get("db_at", 0) < COMMUTE_CACHE_SEC:
+        return _COMMUTE_FAR["set"]
+    if origin:
+        try:
+            with db() as con:
+                rows = con.execute(
+                    "SELECT location FROM place WHERE origin = ? AND board = '' "
+                    "AND verdict = 'too_far'", (origin,)).fetchall()
+            if rows:
+                _COMMUTE_FAR.update(set={r["location"] for r in rows}, db_at=now,
+                                    origin=origin)
+                return _COMMUTE_FAR["set"]
+        except Exception:                                     # noqa: BLE001
+            # A database that cannot answer must not take the commute filter down with it.
+            pass
+
     try:
         import gitsync
         f = gitsync.REPO_DIR / "vault" / "Commute Table.md"
@@ -1871,12 +1913,23 @@ def _commute_too_far() -> set:
     except Exception:                                         # noqa: BLE001
         return set()
     if _COMMUTE_FAR["mtime"] != m:
-        out = set()
+        # \ud83d\udea8 FIND THE COLUMN BY ITS HEADER, NEVER BY POSITION. This hardcoded cells[2], and
+        # the moment the generator gained a `from` column every rejection silently became a
+        # posting COUNT and the filter matched nothing. The file is generated now, so its
+        # shape can change again. A parser that reads the header survives that; one that
+        # counts pipes fails silently, which is the only failure mode that matters here.
+        out, idx = set(), None
         for line in f.read_text().splitlines():
-            if line.startswith("| \u274c too far |"):
-                cells = [c.strip() for c in line.strip().strip("|").split("|")]
-                if len(cells) > 2:
-                    out.add(cells[2])
+            if not line.startswith("| "):
+                continue
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            low = [c.lower() for c in cells]
+            if idx is None:
+                if "location" in low:
+                    idx = low.index("location")
+                continue
+            if cells and cells[0].startswith("\u274c") and len(cells) > idx:
+                out.add(cells[idx])
         _COMMUTE_FAR.update(mtime=m, set=out)
     return _COMMUTE_FAR["set"]
 

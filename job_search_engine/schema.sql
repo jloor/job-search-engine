@@ -316,3 +316,64 @@ CREATE TABLE IF NOT EXISTS scan_run (
   status      TEXT NOT NULL DEFAULT 'running',   -- running | ok | interrupted
   finished_at TEXT
 );
+
+
+-- ───────────────────────────────────────────────────────────────────── places
+--
+-- ⭐ WHERE A JOB PHYSICALLY IS, AND HOW LONG IT TAKES TO GET THERE. Until 2026-08-16 this
+-- lived in two JSON files on one laptop (config/commute-cache.json, 311 measured places,
+-- and config/office-address.json, 3 resolved offices) plus a hand-reviewed markdown table.
+-- The container could not write any of them, so a commute the service measured was thrown
+-- away, and nothing outside that laptop could read the data at all.
+--
+-- 🚨 THREE LAYERS, KEPT APART ON PURPOSE, BECAUSE THEY ARE NOT EQUALLY TRUSTWORTHY.
+--   judged_*     a model's estimate. Wide coverage, cheap, and NOT a measurement.
+--   address_*    where the office actually is, resolved and verified against the city.
+--   drive/transit a real routing measurement, to whichever of the two above was used.
+-- Collapsing them into one "minutes" column is what makes a guess indistinguishable from a
+-- measurement, and the guess is the one that gets quoted later. Measured proof the layers
+-- disagree: driving alone puts Manhattan at 98 minutes, over the ceiling; transit does it
+-- in 52. A single number could only have been one of those, and either choice is wrong.
+--
+-- ⚠️ KEYED ON THE ORIGIN. Every duration is measured FROM somewhere. Changing the origin
+-- must invalidate every row rather than silently re-labelling somebody else's commute.
+CREATE TABLE IF NOT EXISTS place (
+  id             INTEGER PRIMARY KEY,
+  origin         TEXT NOT NULL,              -- the commute origin these minutes are from
+  board          TEXT NOT NULL DEFAULT '',   -- '' = a city, not one employer's office
+  location       TEXT NOT NULL,              -- the posting's location string, verbatim
+  postings       INTEGER,                    -- how many open postings name it
+
+  judged_as      TEXT,                       -- the place a model resolved the string to
+  judged_min     INTEGER,
+  judged_mode    TEXT,
+  judged_conf    TEXT,                       -- high | medium | low
+  judged_note    TEXT,
+
+  address        TEXT,                       -- resolved street address, when one was needed
+  place_id       TEXT,
+  place_name     TEXT,
+  -- 🚨 not_attempted IS THE COMMON CASE AND MUST STAY VISIBLE. Only a place near the
+  -- ceiling can change verdict on a better address, so most rows are never looked up.
+  -- NULL here would read as "looked and found nothing", which is a different fact.
+  address_status TEXT,                       -- ok|city_mismatch|not_found|not_attempted
+
+  drive_min      INTEGER,
+  transit_min    INTEGER,
+  best_min       INTEGER,
+  best_mode      TEXT,                       -- drive | transit
+  measured_for   TEXT,                       -- the arrival time the route was priced at
+  measured_at    TEXT,
+  measured_to    TEXT,                       -- centroid | street_address
+
+  verdict        TEXT,                       -- commutable | too_far | review
+  -- ⭐ A HAND CORRECTION OUTRANKS A MEASUREMENT, AND A MEASUREMENT OUTRANKS A MODEL. He
+  -- knows the roads. Without this column a re-measurement silently reverses his edit, and
+  -- the person who made the correction is the last to find out.
+  verdict_from   TEXT,                       -- human | measurement | model
+  reviewed_by    TEXT,
+  reviewed_at    TEXT,
+  note           TEXT,
+  UNIQUE(origin, board, location)
+);
+CREATE INDEX IF NOT EXISTS place_verdict ON place (origin, verdict);
