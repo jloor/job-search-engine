@@ -1326,6 +1326,128 @@ On Wed, Aug 12, 2026 the candidate wrote:
     plain = "No quoted history here at all."
     check("unquoted body unchanged", app.strip_quotes(plain), plain)
 
+    # ═══════════════════════════════════════════════════════════ comp at ingestion
+    #
+    # ⭐ These run at INSERT time now, on every posting, before anything is scored. That
+    # makes a false positive expensive in a way the old post-triage pass was not: a wrong
+    # number lands in the record for 12,000 rows instead of the few hundred a human was
+    # about to read. Every case below is a real posting shape, and the negatives matter
+    # more than the positives.
+    print("\ncomp extraction (free, at insert):")
+    import comp as CMP
+
+    check("a plain prose range",
+          (lambda r: (r["min"], r["max"], r["period"]))(
+              CMP.from_body("The salary range for this role is $95,000 - $120,000.")),
+          (95000, 120000, "year"))
+
+    # 🚨 THE CASE THAT JUSTIFIES THE PAY-VOCABULARY RULE. This shape is from a real
+    # GoFundMe posting. A bare currency regex archives $40 billion as the salary.
+    check("'raised more than $40 billion' is NOT pay",
+          CMP.from_body("We have helped people raise more than $40 billion to $50 billion "
+                        "since 2010."), None)
+    check("a discount is not pay",
+          CMP.from_body("Get $5 - $10 off your first order."), None)
+    check("money with no pay word nearby is not pay",
+          CMP.from_body("Our customers process $200,000 to $400,000 in claims monthly."),
+          None)
+
+    # ⚠️ THE SECOND PASS. Greenhouse splits the label from the numbers across elements, so
+    # they never share a sentence. Requiring one sentence missed $210,000 - $250,000 in a
+    # real archived Anthropic posting, which is the highest-paying row in the queue.
+    gh = ('<div>The expected base salary range for this position is shown below.</div>'
+          '<span>$210,000</span><span class="divider">&mdash;</span><span>$250,000</span>')
+    check("markup-split range is recovered",
+          (lambda r: (r["min"], r["max"]))(CMP.from_body(gh)), (210000, 250000))
+    check("...and it is read as base, not OTE", CMP.from_body(gh)["basis"], "base")
+
+    # ⭐ BASIS DECIDES WHETHER TWO NUMBERS ARE COMPARABLE. Ranking an OTE against a base
+    # salary quietly favours every posting that quotes OTE.
+    check("OTE is labelled OTE",
+          CMP.from_body("On-target earnings for this role are $140,000 to $180,000.")["basis"],
+          "ote")
+    check("total target cash is labelled as such",
+          CMP.from_body("Total target cash compensation is $150,000 - $170,000.")["basis"],
+          "total_cash")
+    check("an unlabelled range stays unclear, not guessed as base",
+          CMP.from_body("Compensation: $150,000 - $170,000.")["basis"], "unclear")
+    # A real CaptiveAire posting puts the qualifier AFTER the numbers, inside a span that
+    # also contains "based upon tenure". The word boundary has to keep those apart.
+    check("a trailing 'base' is still base",
+          CMP.from_body("Paid time off (PTO) based upon tenure. Relocation assistance. "
+                        "Salary: $65k-$80k base, negotiable.")["basis"], "base")
+    check("...and 'based upon' alone does not make a band base",
+          CMP.from_body("Compensation: $150,000 - $170,000, based upon experience."
+                        )["basis"], "unclear")
+
+    hourly = CMP.from_body("The hourly rate for this position is $28 - $34 per hour.")
+    check("hourly is not annualised", (hourly["min"], hourly["max"]), (28, 34))
+    check("hourly period is recorded", (hourly["period"], hourly["basis"]),
+          ("hour", "hourly"))
+    # Without the magnitude split an hourly rate fails the annual floor and is silently
+    # dropped; without the hourly floor, "$5 - $10 off" passes as a wage.
+    check("an implausible hourly rate is refused",
+          CMP.from_body("Pay range: $2 - $4 per hour."), None)
+
+    check("K notation", (lambda r: (r["min"], r["max"]))(
+        CMP.from_body("Base salary: $95K - $120K.")), (95000, 120000))
+    check("a reversed range is refused",
+          CMP.from_body("Salary range $120,000 - $95,000."), None)
+
+    # 🚨 PROVENANCE. The board's own field is the employer's statement; a regex over prose
+    # is an inference about it. An inference must never overwrite what it inferred from.
+    check("the board's field wins over the body",
+          CMP.extract("$100,000 - $130,000",
+                      "The salary range is $95,000 - $120,000.")["source"], "board")
+    check("...and its numbers are the board's",
+          (lambda r: (r["min"], r["max"]))(
+              CMP.extract("$100,000 - $130,000",
+                          "The salary range is $95,000 - $120,000.")), (100000, 130000))
+    check("an empty field falls through to the body",
+          CMP.extract("", "The salary range is $95,000 - $120,000.")["source"], "body_regex")
+    check("junk in the board field does not become a band",
+          CMP.extract("Competitive", "No numbers here."), None)
+    check("no comp anywhere is None, not zero",
+          CMP.extract(None, "A posting with no pay information at all."), None)
+
+    # The evidence span is the whole safety story: both numbers must be inside the text
+    # that is stored, or a reader cannot check the claim.
+    ev = CMP.from_body("The annual salary range for this role is $95,000 - $120,000 "
+                       "depending on experience.")
+    check("both numbers appear in the stored evidence",
+          "$95,000" in ev["evidence"] and "$120,000" in ev["evidence"], True)
+
+    # 🚨 DRIFT GUARD. The archiver holds the reference implementation and neither package
+    # can import the other: it declares zero dependencies, and this suite must pass with
+    # nothing installed. So compare them whenever both happen to be present, and say so
+    # loudly when they are not, rather than letting two copies quietly diverge.
+    try:
+        from fetch_job_description.archive import body_comp as _ref
+    except Exception:                                         # noqa: BLE001
+        skipped.append("comp drift vs fetch_job_description (archiver not installed)")
+    else:
+        corpus = [
+            "The salary range for this role is $95,000 - $120,000.",
+            "We have helped people raise more than $40 billion to $50 billion since 2010.",
+            "Get $5 - $10 off your first order.",
+            gh,
+            "On-target earnings for this role are $140,000 to $180,000.",
+            "The hourly rate for this position is $28 - $34 per hour.",
+            "Base salary: $95K - $120K.",
+            "Salary range $120,000 - $95,000.",
+            "A posting with no pay information at all.",
+            "Pay range: $2 - $4 per hour.",
+        ]
+        for i, text in enumerate(corpus):
+            mine = CMP.from_body(text)
+            ref_range, _ = _ref(text)
+            check(f"drift[{i}] agrees a band exists", mine is not None,
+                  ref_range is not None)
+            if mine and ref_range:
+                lo, _, hi = ref_range.partition(" - ")
+                check(f"drift[{i}] agrees on the numbers", (mine["min"], mine["max"]),
+                      (int(CMP._to_number(lo)), int(CMP._to_number(hi))))
+
     print()
     if failures:
         print(f"{len(failures)} FAILED")

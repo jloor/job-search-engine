@@ -149,6 +149,18 @@ CREATE TABLE IF NOT EXISTS scan_candidate (
   -- prompts over ~1024 tokens automatically, so this column answers whether that redundancy
   -- is already nearly free or is being paid for on every single posting. Nobody can answer
   -- that from the code: only the bill knows, and this is how the bill gets read.
+  -- ⚠️ THESE SEVEN EXISTED IN PRODUCTION ONLY AS HAND-RUN ALTER TABLE STATEMENTS from a
+  -- one-off backfill tool, and were absent here. A column the service writes but never
+  -- declares is a column that disappears the next time the database is built from this
+  -- file. comp_min/max/basis/evidence are filled at INSERT now, for free, so a fresh
+  -- install missing them would break the sweep rather than merely lose a field.
+  remote_verdict    TEXT,
+  remote_evidence   TEXT,
+  comp_min          INTEGER,
+  comp_max          INTEGER,
+  comp_basis        TEXT,                       -- base | ote | total_cash | unclear, +'/hour'
+  comp_evidence     TEXT,                       -- the verbatim span both numbers came from
+  comp_source       TEXT,                       -- board | body_regex | model
   model             TEXT,
   input_tokens      INTEGER,
   output_tokens     INTEGER,

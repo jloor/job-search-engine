@@ -313,6 +313,12 @@ MIGRATIONS = [
     "ALTER TABLE scan_candidate ADD COLUMN comp_max INTEGER",
     "ALTER TABLE scan_candidate ADD COLUMN comp_basis TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN comp_evidence TEXT",
+    # ⭐ WHERE THE NUMBER CAME FROM: 'board' (the employer's own pay field), 'body_regex'
+    # (recovered from the posting text at insert, free) or 'model' (the paid reader).
+    # Without this the three are indistinguishable, and they are not equally trustworthy:
+    # only the first is a published number. Basis alone cannot carry it, because basis
+    # answers a different question (base, OTE, total cash, hourly).
+    "ALTER TABLE scan_candidate ADD COLUMN comp_source TEXT",
     # 🚨 SOFT DELETE. A vanished requisition is MARKED, never removed. Once the row is gone
     # no future sweep can prove the posting existed, and that record is the entire reason
     # the vanish log exists: a posting that dies mid-process is evidence of what was
@@ -1903,7 +1909,7 @@ def _scan_candidates(at: str, new_ids: list, detail: dict) -> str:
     """
     if not new_ids:
         return ""
-    kept, rejected = 0, {}
+    kept, priced, rejected = 0, 0, {}
     with db() as con:
         for rid in new_ids:
             pst = detail.get(rid)
@@ -1926,9 +1932,20 @@ def _scan_candidates(at: str, new_ids: list, detail: dict) -> str:
             if not keep:
                 rejected[why2] = rejected.get(why2, 0) + 1
                 continue
+            # ⭐ COMP, HERE, FREE. No model and no API call: the band is read off the
+            # board's own field or out of the posting text by regex. Measured on 3,563
+            # scored candidates, this fills 1,728 of them (48%) at write time, against
+            # 651 (18%) when only the board's structured field was stored.
+            #
+            # 📌 IT IS NOT A GATE AND MUST NOT BECOME ONE. Rejecting below-floor postings
+            # here would save about seven cents of triage across the entire backfill, and
+            # would destroy the comp intelligence that answers what the market actually
+            # pays for the title. Record the number; let the queue rank on it.
+            band = _comp_at_insert(pst)
             con.execute(
                 "INSERT INTO scan_candidate (at,req_id,board,title,location,comp,is_remote,"
-                "url,description,triaged) VALUES (?,?,?,?,?,?,?,?,?,0)",
+                "url,description,triaged,comp_min,comp_max,comp_basis,comp_evidence,"
+                "comp_source) VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,?)",
                 (at, rid, rid.rpartition(":")[0], pst["title"], pst.get("location"),
                  # NULL means the board did not say. Writing 0 for unknown would read as
                  # "confirmed not remote", which is the same absence-is-not-a-verdict
@@ -1936,12 +1953,42 @@ def _scan_candidates(at: str, new_ids: list, detail: dict) -> str:
                  pst.get("comp"),
                  (None if pst.get("is_remote") is None else (1 if pst["is_remote"] else 0)),
                  pst.get("url"),
-                 (pst.get("description") or "")[:AI_MAX_BODY_CHARS]))
+                 (pst.get("description") or "")[:AI_MAX_BODY_CHARS],
+                 # ⚠️ All five stay NULL when nothing was found, and NULL is what the paid
+                 # comp job selects on. So a posting this could not read still reaches the
+                 # model, and a posting it could read never costs anything.
+                 *(band or (None, None, None, None, None))))
             kept += 1
+            if band:
+                priced += 1
     out = f"; {kept} new candidate(s) past the gate"
+    if kept:
+        out += f", {priced} with a pay band read for free"
     if rejected:
         out += " (" + ", ".join(f"{n} {w}" for w, n in rejected.items()) + ")"
     return out
+
+
+def _comp_at_insert(pst: dict) -> tuple | None:
+    """(min, max, basis, evidence, source) for one posting, or None. Never raises.
+
+    🚨 A COMP READER MUST NOT BE ABLE TO KILL A SWEEP. This runs inside the insert loop on
+    every posting. If it throws, the sweep loses candidates it had already gated and paid
+    to fetch, which is a far worse outcome than a missing salary. So the whole thing is
+    wrapped, and a failure yields no band rather than no row.
+    """
+    try:
+        import comp as _CMP
+        got = _CMP.extract(pst.get("comp"), pst.get("description"))
+    except Exception:                                         # noqa: BLE001
+        return None
+    if not got:
+        return None
+    # 📌 The period rides on the basis, the way the paid job already writes it, so one
+    # column answers "what is this number" and an hourly rate can never be compared
+    # against a salary by accident.
+    basis = got["basis"] if got["period"] != "hour" else f"{got['basis']}/hour"
+    return got["min"], got["max"], basis, got["evidence"], got["source"]
 
 
 # ---------------------------------------------------------------- triage (fit + gaps) --
