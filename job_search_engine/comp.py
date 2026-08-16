@@ -93,9 +93,23 @@ def _to_number(tok):
         return None
 
 
+# ⭐ A BAND THIS WIDE IS A PLACEHOLDER, NOT A RANGE, and the threshold is measured rather
+# than guessed. Across 3,075 stored annual bands the ratio of max to min has a median of
+# 1.33x, p98 of 2.11x and p99 of 2.82x. 5x is p99.5. Above it sit things like Rain's
+# "$50,000 - $999,999" straight out of an Ashby comp field, which means the employer filled
+# the box without saying anything. Below it sit real wide bands ($100,000 - $300,000 at a
+# startup spanning levels), and those are kept.
+#
+# ⚠️ These sort to the TOP of any list ranked by pay, so 16 junk rows out of 3,075 did
+# damage far out of proportion to their number.
+MAX_SPREAD = 5
+
+
 def _plausible(lo, hi, hourly):
-    """Could these two numbers be pay? Without this, '$40 billion' and '$5 - $10 off' pass."""
+    """Could these two numbers be pay for ONE role? '$40 billion' and '$5 - $10 off' fail."""
     if lo is None or hi is None or lo > hi:
+        return False
+    if lo > 0 and hi / lo >= MAX_SPREAD:
         return False
     return (10 <= lo <= 500 and 10 <= hi <= 500) if hourly else \
            (15_000 <= lo <= 2_000_000 and 15_000 <= hi <= 2_000_000)

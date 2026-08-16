@@ -1567,6 +1567,20 @@ On Wed, Aug 12, 2026 the candidate wrote:
 
     check("K notation", (lambda r: (r["min"], r["max"]))(
         CMP.from_body("Base salary: $95K - $120K.")), (95000, 120000))
+
+    # 🚨 A PLACEHOLDER IS NOT A RANGE, and these sort to the top of anything ranked by pay.
+    # "$50,000 - $999,999" came straight out of a real Ashby comp field: the employer filled
+    # the box without saying anything. The 5x threshold is p99.5 of 3,075 measured bands
+    # (median 1.33x, p99 2.82x), so it catches these without touching a real wide band.
+    check("a 20x band is a placeholder, not a range",
+          CMP.from_field("$50,000 - $999,999"), None)
+    check("...and so is one straight out of the posting text",
+          CMP.from_body("Salary range: $65,000 - $800,000."), None)
+    check("a genuinely wide startup band still survives",
+          (lambda r: (r["min"], r["max"]))(
+              CMP.from_body("Base salary: $100,000 - $300,000.")), (100000, 300000))
+    check("an absurd hourly spread is refused too",
+          CMP.from_body("Hourly pay range: $12 - $400 per hour."), None)
     check("a reversed range is refused",
           CMP.from_body("Salary range $120,000 - $95,000."), None)
 
@@ -1623,6 +1637,20 @@ On Wed, Aug 12, 2026 the candidate wrote:
                 lo, _, hi = ref_range.partition(" - ")
                 check(f"drift[{i}] agrees on the numbers", (mine["min"], mine["max"]),
                       (int(CMP._to_number(lo)), int(CMP._to_number(hi))))
+
+        # ⭐ ONE DELIBERATE DIVERGENCE, ASSERTED SO IT CANNOT GO QUIET. The archiver keeps a
+        # placeholder band and this refuses it, because the two tools answer different
+        # questions. The archiver is an EVIDENCE tool: "$50,000 - $999,999" is genuinely
+        # what the employer published and the archive must not edit it. This feeds a RANKED
+        # queue, where a 20x placeholder sorts above every real salary and buries them.
+        #
+        # ⚠️ Without this assertion the divergence is invisible: the corpus above happens to
+        # contain no wide band, so the drift guard would keep passing while the two
+        # implementations quietly disagreed on a whole class of posting.
+        wide = "The salary range for this role is $50,000 - $999,999."
+        check("intentional: the archiver keeps a placeholder band",
+              _ref(wide)[0] is not None, True)
+        check("intentional: the queue refuses it", CMP.from_body(wide), None)
 
     print()
     if failures:
