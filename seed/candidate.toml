@@ -6,9 +6,19 @@
 #  below are the standard fictional-company names. No real person's résumé,
 #  address, salary floor or application history appears anywhere in this tree.
 #
+#  🚨 THE PATHS BELOW ARE RELATIVE TO THIS DIRECTORY, NOT THE REPOSITORY ROOT.
+#  profile_doc is "vault/Career Inventory.md", which means seed/vault/Career Inventory.md.
+#  The engine resolves candidate documents against gitsync.REPO_DIR, so that has to point
+#  HERE. Pointing it at the repository root instead makes the profile and vocabulary load as
+#  empty, the AI jobs decline, and everything still LOOK fine, which is how this was found.
+#
 #  Run against it with:
-#      CANDIDATE_CONFIG=platform/seed/candidate.toml
-#  and point gitsync.REPO_DIR (or a checkout) at platform/seed/.
+#      CANDIDATE_CONFIG=seed/candidate.toml
+#  and gitsync.REPO_DIR set to the seed/ directory:
+#
+#      import types, pathlib, sys
+#      gs = types.ModuleType("gitsync"); gs.REPO_DIR = pathlib.Path("seed").resolve()
+#      sys.modules["gitsync"] = gs
 # ─────────────────────────────────────────────────────────────────────────────
 
 [candidate]
