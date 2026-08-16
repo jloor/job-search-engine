@@ -1398,10 +1398,9 @@ SCAN_TIMEOUT    = int(os.environ.get("SCAN_TIMEOUT", "45"))
 # the whole sweep is optional. SCAN_CHUNK bounds peak memory, not concurrency.
 SCAN_WORKERS    = int(os.environ.get("SCAN_WORKERS", "12"))
 SCAN_CHUNK      = int(os.environ.get("SCAN_CHUNK", "200"))
-# A board losing this fraction of its requisitions at once is treated as a broken upstream
-# until a second sweep agrees. The floor keeps small boards out of it: two requisitions
-# losing one is 50% and completely normal.
-MASS_VANISH_RATIO = float(os.environ.get("MASS_VANISH_RATIO", "0.5"))
+# ⚠️ ALARM ONLY, not a gate. Every vanish is confirmed over two sweeps regardless, so this
+# no longer decides anything: it just makes "a board that had requisitions returned zero"
+# visible in the note without reading counts.
 MASS_VANISH_FLOOR = int(os.environ.get("MASS_VANISH_FLOOR", "5"))
 
 
@@ -1725,19 +1724,28 @@ def _job_scan_locked() -> str:
                 # forever, which is a silent failure wearing the costume of caution.
                 gone = (set(was) | held_before) - now_ids
 
-                # 🚨 A BOARD LOSING MOST OF ITS REQUISITIONS AT ONCE IS A BROKEN UPSTREAM
-                # UNTIL PROVEN OTHERWISE. Measured on 2026-08-16: greenhouse|infuse had
-                # logged 122 vanishes and was serving 374 jobs; carvana 129 vanishes and
-                # 1,752 jobs. Those boards FLAP. A `200 {"jobs": []}` is indistinguishable
-                # from a genuine mass delisting, and the old code believed it every time.
+                # 🚨 EVERY DISAPPEARANCE IS CONFIRMED OVER TWO SWEEPS. Missing once is a
+                # suspicion; missing twice is a fact.
                 #
-                # ⚠️ A partial return (5 of 87) has the same cause as a total one (0 of 87),
-                # so the rule is proportional rather than a zero check. The floor exists
-                # because a board with two requisitions losing one is 50% and entirely
-                # normal.
-                mass = (len(was) >= MASS_VANISH_FLOOR
-                        and len(gone) >= len(was) * MASS_VANISH_RATIO)
-                emptied = mass and not now_ids
+                # ⚠️ THIS REPLACED A PROPORTIONAL RULE THAT DID NOT WORK, and the numbers are
+                # why. The first version held a board only when it lost more than half its
+                # requisitions at once. Measured against production on 2026-08-16:
+                #     infuse      lost  57 of ~431 = 13.2%   not held
+                #     infuse      lost  65 of ~439 = 14.8%   not held
+                #     carvana     lost 118 of ~1870 =  6.3%  not held
+                #     signalfire  lost  87 of ~87  =  100%   held
+                # The rule was justified by infuse and carvana and caught NEITHER. It only
+                # caught total emptying, which was the one case the old code got right.
+                #
+                # ⭐ Universal confirmation costs a uniform one-sweep delay on genuine
+                # vanishes, which is the same trade already accepted, applied consistently
+                # instead of above a line picked without checking the data. A posting that
+                # dies mid-process is still recorded; it is recorded a day later.
+                #
+                # Many-to-zero survives ONLY as an alarm now, not as a gate: it is the shape
+                # of a broken upstream and deserves a human glance, but it no longer decides
+                # anything, because the confirmation already covers it.
+                emptied = (len(was) >= MASS_VANISH_FLOOR and not now_ids)
 
                 for pst in reqs:
                     rid = pst["req_id"]
@@ -1768,10 +1776,10 @@ def _job_scan_locked() -> str:
                 for rid in sorted(gone):
                     if rid in confirmed_before:
                         continue          # already reported; nothing new to say
-                    if mass and rid not in held_before:
-                        # First sighting of a mass disappearance. Record it, do NOT report
-                        # it, and wait for the next sweep to agree. infuse and carvana never
-                        # agree twice; a genuinely emptied board does.
+                    if rid not in held_before:
+                        # First sweep that did not see it. Record the suspicion, report
+                        # nothing, and wait for the next sweep to agree. A flapping board
+                        # never agrees twice; a genuinely closed requisition always does.
                         con.execute("UPDATE board_state SET vanished_at = ? "
                                     "WHERE board = ? AND req_id = ? AND vanished_at IS NULL",
                                     (at, key, rid))

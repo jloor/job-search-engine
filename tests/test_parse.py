@@ -650,7 +650,10 @@ On Wed, Aug 12, 2026 the candidate wrote:
         n3 = _sweep([{"id": 1, "title": "A", "location": {"name": "Remote"}},
                      {"id": 3, "title": "Support Engineer", "location": {"name": "Remote"}}])
         st3, ch3, _, cand3 = _counts()
-        check("one appeared + one vanished are both logged", ch3, 2)
+        # ⚠️ ONE, NOT TWO. The appearance is reported at once; the disappearance is HELD
+        # until a second sweep agrees. A requisition missing once is a suspicion, and
+        # believing it is what let two flapping boards write false history for days.
+        check("the appearance is logged, the disappearance is held", ch3, 1)
         # ⚠️ THREE ROWS, NOT TWO. The vanished requisition is MARKED, never deleted, so the
         # archive can still prove it existed. Two rows are currently on the board.
         check("the vanished row is kept, not destroyed", st3, 3)
@@ -662,13 +665,26 @@ On Wed, Aug 12, 2026 the candidate wrote:
               _cv.execute("SELECT count(*) FROM board_state "
                           "WHERE vanished_at IS NULL").fetchone()[0], 2)
         _cv.close()
-        check("the vanish is reported out loud", "VANISHED" in n3, True)
+        check("the first sweep does NOT announce a vanish", "VANISHED" in n3, False)
+        check("...but says the disappearance is held", "held for confirmation" in n3, True)
         check("only the genuinely new posting reaches triage", cand3, 1)
         c = _s3.connect(_d3); c.row_factory = _s3.Row
         kinds = {r["change"]: r["req_id"] for r in c.execute("SELECT change,req_id FROM scan_change")}
-        check("the right req vanished", kinds.get("vanished"), "2")
         check("the right req appeared", kinds.get("appeared"), "3")
+        check("...and nothing is recorded as vanished yet", kinds.get("vanished"), None)
+        check("the right req is the one being held",
+              c.execute("SELECT req_id FROM board_state "
+                        "WHERE vanished_at IS NOT NULL").fetchone()["req_id"], "2")
         c.close()
+        # The second sweep agrees, so now it is a fact.
+        n3b = _sweep([{"id": 1, "title": "A", "location": {"name": "Remote"}},
+                      {"id": 3, "title": "Support Engineer", "location": {"name": "Remote"}}])
+        c = _s3.connect(_d3); c.row_factory = _s3.Row
+        check("a second agreeing sweep confirms it",
+              c.execute("SELECT req_id FROM scan_change "
+                        "WHERE change='vanished'").fetchone()["req_id"], "2")
+        c.close()
+        check("...and NOW it is announced", "VANISHED" in n3b, True)
 
         # \u2b50 The watch list is a SECOND registry, and `enabled` is what stages the
         # expansion. A disabled row must not be swept, or "load 2,060 boards disabled"
@@ -1069,6 +1085,117 @@ On Wed, Aug 12, 2026 the candidate wrote:
         _msweep([])
         check("a third sweep does NOT re-report the same vanish",
               _mcount("scan_change WHERE change='vanished'"), 10)
+
+        # ⭐ THE INFUSE SHAPE, which the proportional rule missed entirely. Losing 13% of a
+        # board is far under any sane mass threshold, and it was still a false vanish that
+        # destroyed rows. Universal confirmation is the only rule that catches it.
+        _c5b = _s5.connect(_d5); _c5b.execute("DELETE FROM board_state")
+        _c5b.execute("DELETE FROM scan_change"); _c5b.execute("DELETE FROM board_seeded")
+        _c5b.commit(); _c5b.close()
+        _big = [{"id": i, "title": f"R{i}", "location": {"name": "Remote"}} for i in range(100)]
+        _msweep(_big)                                   # seed 100
+        _msweep(_big[:87])                              # lose 13, a 13% dip
+        check("a 13% dip is held, not reported (the infuse case)",
+              _mcount("scan_change WHERE change='vanished'"), 0)
+        check("...and the 13 are marked",
+              _mcount("board_state WHERE vanished_at IS NOT NULL"), 13)
+        _msweep(_big)                                   # they come back
+        check("...and a flap of that size self-corrects too",
+              _mcount("board_state WHERE vanished_at IS NULL"), 100)
+        check("...still having reported nothing",
+              _mcount("scan_change WHERE change='vanished'"), 0)
+
+        # A SINGLE requisition closing is the ordinary case and must still be reported,
+        # just one sweep later. Confirmation must not mean "never".
+        _msweep(_big[:99]); _msweep(_big[:99])
+        check("one ordinary closure is confirmed on the second sweep",
+              _mcount("scan_change WHERE change='vanished'"), 1)
+
+        # ⚠️ FLAP ACROSS THE HOLD: gone, back, gone again. The cycle has to reset, or the
+        # second disappearance inherits the first one's suspicion and is confirmed early.
+        _msweep(_big[:98])                              # #98 goes missing (first sighting)
+        _msweep(_big[:99])                              # it returns before confirmation
+        _msweep(_big[:98])                              # missing again: a FRESH suspicion
+        check("a flap across the hold resets, it does not confirm early",
+              _mcount("scan_change WHERE change='vanished'"), 1)
+
+        # ⚠️ A FAILED FETCH MUST NOT CONFIRM ANYTHING. A board that cannot answer is not a
+        # board with no jobs, and a held row must survive the outage rather than being
+        # promoted by silence.
+        _held_before_err = _mcount("board_state WHERE vanished_at IS NOT NULL")
+        def _boom(req, *a, **k): raise OSError("upstream down")
+        _u5.urlopen = _boom
+        _app5.job_scan()
+        check("an outage confirms nothing",
+              _mcount("scan_change WHERE change='vanished'"), 1)
+        check("...and leaves held rows exactly as they were",
+              _mcount("board_state WHERE vanished_at IS NOT NULL"), _held_before_err)
+
+        # ⚠️ CROSS-BOARD LEAKAGE. `emptied`, `held_before` and the accumulators are shared
+        # across boards in one sweep. A board that empties must not affect a healthy board
+        # swept alongside it, and per-board state must not bleed. Two boards, one dying.
+        _u5.urlopen = _real5
+        _c5c = _s5.connect(_d5)
+        _c5c.execute("DELETE FROM board_state"); _c5c.execute("DELETE FROM scan_change")
+        _c5c.execute("DELETE FROM board_seeded"); _c5c.execute("DELETE FROM company")
+        _c5c.execute("INSERT INTO company (name,ats_platform,ats_token,api_url) "
+                     "VALUES ('Dies','greenhouse','dies','https://example.invalid/a')")
+        _c5c.execute("INSERT INTO company (name,ats_platform,ats_token,api_url) "
+                     "VALUES ('Lives','greenhouse','lives','https://example.invalid/b')")
+        _c5c.commit(); _c5c.close()
+
+        def _two(dies, lives):
+            def _f(req, *a, **k):
+                url = req.full_url if hasattr(req, "full_url") else str(req)
+                jobs = dies if "/a" in url else lives
+                body = _j5.dumps({"jobs": jobs}).encode()
+                class R:
+                    def read(self): return body
+                    def __enter__(self): return self
+                    def __exit__(self, *e): return False
+                return R()
+            _u5.urlopen = _f
+            return _app5.job_scan()
+
+        _six = [{"id": i, "title": f"D{i}", "location": {"name": "Remote"}} for i in range(6)]
+        _two(_six, _six)                      # seed both
+        _n_leak = _two([], _six)              # one empties, one is untouched
+        _cl = _s5.connect(_d5)
+        check("the healthy board keeps every row",
+              _cl.execute("SELECT count(*) FROM board_state WHERE board='greenhouse|lives' "
+                          "AND vanished_at IS NULL").fetchone()[0], 6)
+        check("...and none of its rows were marked",
+              _cl.execute("SELECT count(*) FROM board_state WHERE board='greenhouse|lives' "
+                          "AND vanished_at IS NOT NULL").fetchone()[0], 0)
+        check("the dying board has all six held",
+              _cl.execute("SELECT count(*) FROM board_state WHERE board='greenhouse|dies' "
+                          "AND vanished_at IS NOT NULL").fetchone()[0], 6)
+        _cl.close()
+        check("the zero alarm names only the board that emptied",
+              _n_leak.count("greenhouse|dies"), 1)
+        check("...and does not name the healthy one", "greenhouse|lives" in _n_leak, False)
+
+        # 📌 A requisition that comes back is NOT a discovery, so it must not be re-triaged.
+        # It is the same posting, already scored, and re-scoring it would pay a model twice
+        # for a board hiccup.
+        # Measured before and after, because the seed sweep announces nothing at all: an
+        # absolute count of 0 would pass whether or not the reappearance was silent.
+        _cl = _s5.connect(_d5)
+        _appeared_before = _cl.execute(
+            "SELECT count(*) FROM scan_change WHERE change='appeared'").fetchone()[0]
+        _cand_before = _cl.execute("SELECT count(*) FROM scan_candidate").fetchone()[0]
+        _cl.close()
+        _two(_six, _six)
+        _cl = _s5.connect(_d5)
+        check("a reappearance announces nothing new",
+              _cl.execute("SELECT count(*) FROM scan_change "
+                          "WHERE change='appeared'").fetchone()[0], _appeared_before)
+        check("...and the six held rows are cleared, not re-inserted",
+              _cl.execute("SELECT count(*) FROM board_state "
+                          "WHERE board='greenhouse|dies' AND vanished_at IS NULL").fetchone()[0], 6)
+        check("...and no requisition was queued for scoring a second time",
+              _cl.execute("SELECT count(*) FROM scan_candidate").fetchone()[0], _cand_before)
+        _cl.close()
     finally:
         _u5.urlopen = _real5
         if _p5 is None: _o5.environ.pop("DB_PATH", None)
