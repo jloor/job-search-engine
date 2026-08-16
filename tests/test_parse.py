@@ -1,0 +1,1104 @@
+#!/usr/bin/env python3
+"""
+Regression test for the ImprovMX webhook parser.
+
+Why this exists: the parser was written against an assumed payload shape and broke on
+the first real message with `'list' object has no attribute 'split'`. Three assumptions
+were wrong at once, and none of them were visible without a genuine delivery:
+
+    to      is a LIST of {name, email}, not an RFC822 string
+    from    is a DICT of {name, email}, not an RFC822 string
+    headers values are LISTS, because a header may legitimately repeat
+
+The fixture keeps the SHAPE of a real ImprovMX delivery captured from the raw_payload
+column. Storing the raw bytes before parsing is what made this debuggable at all
+(SPEC P4), and this test is the cheap way to stop the same class of bug coming back.
+
+Every address, domain, signature, hash and opaque vendor token in the fixture is
+synthetic. Only the structure is real, because only the structure is what broke. A real
+capture carries the operator's own address and a valid DKIM signature over real message
+content, and neither belongs in a repository that is intended to go public.
+
+Run:  python3 tests/test_parse.py
+"""
+import importlib.util, inspect, json, os, pathlib, sys, types
+
+
+def _src_of(fn):
+    """Source of a function, so a test can assert on a literal inside it."""
+    return inspect.getsource(fn)
+
+HERE = pathlib.Path(__file__).resolve().parent
+
+# 🚨 THE TEST SUITE MUST NEVER REACH THE LIVE DATABASE.
+#
+# app.db() picks Bunny whenever BUNNY_DATABASE_URL is set, and that value is read into a
+# module constant at import time. Several blocks below point DB_PATH at a temp file and
+# then write real rows, which is correct against sqlite and catastrophic against Bunny.
+#
+# ⚠️ This is not hypothetical. On 2026-08-14 the suite was run in a shell that had sourced
+# ~/.config/job-search/relay.env, and it wrote two rows into the production database (a
+# message with to_alias 'x@y.z' and an ai_reading with model 'test') before aborting on an
+# unrelated NOT NULL constraint. They were found by auditing timestamps and deleted by
+# hand. Nothing warned; the suite simply started talking to production.
+#
+# Stripped BEFORE app is imported, then asserted after, because clearing the variable and
+# failing to notice that the constant was already bound would look exactly like success.
+for _v in ("BUNNY_DATABASE_URL", "BUNNY_DATABASE_AUTH_TOKEN"):
+    os.environ.pop(_v, None)
+
+
+def load_app():
+    """Import app.py without needing fastapi installed.
+
+    ⚠️ app.py imports candidate.py and gates.py as ordinary modules. Loading app by an
+    explicit spec does NOT put its directory on sys.path, so without this those imports
+    fail silently inside try/except and every config-driven rule degrades to "not
+    configured" — which looks exactly like a passing decline instead of a broken test.
+    """
+    _relay = str(pathlib.Path(__file__).resolve().parent.parent / "job_search_engine")
+    if _relay not in sys.path:
+        sys.path.insert(0, _relay)
+    fa = types.ModuleType("fastapi")
+
+    class FastAPI:
+        def __init__(self, **k): pass
+        def _d(self, *a, **k):
+            def w(f): return f
+            return w
+        get = post = on_event = _d
+
+    class HTTPException(Exception):
+        def __init__(self, c, d=""): self.code, self.detail = c, d; super().__init__(f"{c}: {d}")
+
+    def Header(default=None, **k): return default
+
+    class Request: pass
+
+    fa.FastAPI, fa.HTTPException, fa.Header, fa.Request = FastAPI, HTTPException, Header, Request
+    resp = types.ModuleType("fastapi.responses")
+
+    class JSONResponse:
+        def __init__(self, c, status_code=200): self.content, self.status_code = c, status_code
+
+    resp.JSONResponse = JSONResponse
+    fa.responses = resp
+    sys.modules["fastapi"], sys.modules["fastapi.responses"] = fa, resp
+    # 📌 The engine is a package now, so app.py sits one level in. The suite still loads
+    # it by path rather than importing it, because it must run from a clean clone with
+    # nothing installed.
+    spec = importlib.util.spec_from_file_location(
+        "relayapp", HERE.parent / "job_search_engine" / "app.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def parse(app, p):
+    """Mirror of what the /inbound route does, so the test covers the real path."""
+    hdrs = p.get("headers") or {}
+    envelope = p.get("envelope") if isinstance(p.get("envelope"), dict) else {}
+    to_alias = envelope.get("recipient") or app._addr(p.get("to"))[1] or ""
+    name, addr = app._addr(p.get("from"))
+    subject = p.get("subject") or ""
+    body = p.get("text") or ""
+    label, otp = app.classify(subject, body)
+    spf, dkim, dmarc, warn = app.read_auth_results(hdrs, p.get("verdict"))
+    return {
+        "to_alias": to_alias, "from_name": name, "from_addr": addr, "subject": subject,
+        "message_id": app._hdr(hdrs, "Message-ID") or p.get("message-id"),
+        "classification": label, "otp": otp, "application_ref": app.resolve_application(to_alias),
+        "spf": spf, "dkim": dkim, "dmarc": dmarc, "auth_warn": warn,
+    }
+
+
+def main() -> int:
+    app = load_app()
+    # The guard above stripped the variables; this proves the constant bound accordingly.
+    # A hard exit, not a check(), because a suite that would write to production must not
+    # continue running the tests that do the writing.
+    if getattr(app, "BUNNY_DB_URL", ""):
+        sys.exit("🚨 REFUSING TO RUN: app is bound to a remote database "
+                 f"({str(app.BUNNY_DB_URL)[:40]}...). These tests write real rows. "
+                 "Run them in a shell that has not sourced relay.env.")
+    fixture = json.loads((HERE / "fixtures" / "improvmx-webhook.json").read_text())
+    failures = []
+    skipped = []
+    # --strict turns a skip into a failure. CI and the published repo use it, because there
+    # the dependency is installed from requirements.txt and an absent parser is a real fault.
+    # A developer machine runs without it, so a missing optional dependency reports loudly
+    # instead of blocking a commit.
+    strict = "--strict" in sys.argv
+
+    def check(label, got, want):
+        ok = got == want
+        print(f"  {'ok  ' if ok else 'FAIL'} {label:<26} {got!r}")
+        if not ok:
+            failures.append(f"{label}: got {got!r}, want {want!r}")
+
+    print("ImprovMX payload shape:")
+    r = parse(app, fixture)
+    check("to_alias", r["to_alias"], "test@jobs.example.com")
+    check("from_addr", r["from_addr"], "dana.reed@example.net")
+    check("from_name", r["from_name"], "Dana Reed")
+    check("application_ref", r["application_ref"], "test")
+    check("dmarc", r["dmarc"], "pass")
+    check("auth_warn", r["auth_warn"], 0)
+    check("message_id parsed", bool(r["message_id"] and r["message_id"].startswith("<")), True)
+
+    # The three shapes that actually broke it, asserted directly.
+    print("\naddress shape handling:")
+    check("list of dicts", app._addr([{"name": "A", "email": "a@b.c"}])[1], "a@b.c")
+    check("bare dict", app._addr({"name": "A", "email": "a@b.c"})[1], "a@b.c")
+    check("rfc822 string", app._addr("A <a@b.c>")[1], "a@b.c")
+    check("empty list", app._addr([])[1], "")
+    check("none", app._addr(None)[1], "")
+    check("header list value", app._hdr({"Message-ID": ["<x@y>"]}, "Message-ID"), "<x@y>")
+    check("header string value", app._hdr({"Message-ID": "<x@y>"}, "Message-ID"), "<x@y>")
+    check("header case-insensitive", app._hdr({"message-id": ["<x@y>"]}, "Message-ID"), "<x@y>")
+
+    # A spoofed sender must reach a human whatever the classifier decides.
+    print("\nauthentication verdicts:")
+    check("verdict object preferred",
+          app.read_auth_results({}, {"spf": "pass", "dkim": "pass", "dmarc": "pass"}), ("pass", "pass", "pass", 0))
+    check("dmarc fail is flagged",
+          app.read_auth_results({}, {"spf": "fail", "dkim": "fail", "dmarc": "fail"})[3], 1)
+    check("falls back to headers",
+          app.read_auth_results({"Authentication-Results": ["mx; spf=pass dkim=pass dmarc=pass"]}, None)[2], "pass")
+    check("absent is unknown, not pass", app.read_auth_results({}, None), (None, None, None, 0))
+
+    # The bug this dependency exists to fix. Every reply carries the thread beneath it,
+    # so classification on the raw body reads old words as new decisions.
+    #
+    # ⚠️ This block is the one part of the suite that cannot run without an optional
+    # dependency. strip_quotes falls back to returning the body unchanged when
+    # EmailReplyParser is absent (app.py:545), which is correct: a missing parser must
+    # never drop message text. It also means every assertion below would fail, and the
+    # failure would read as a classification bug rather than as an unconfigured machine.
+    # That is exactly what happened between 2026-08-12 and 2026-08-13, and it is why the
+    # dependency is now detected instead of assumed.
+    print("\nquoted-history stripping (the misclassification bug):")
+    if getattr(app, "EmailReplyParser", None) is None:
+        print("  SKIP  email-reply-parser is not installed, so strip_quotes is a no-op")
+        print("        by design and this block cannot test anything.")
+        print("        Install it:  pip install email-reply-parser==0.5.12")
+        print("        It is already pinned in requirements.txt, so the deployed")
+        print("        container has it and production behaviour is unaffected.")
+        skipped.append("quoted-history stripping (email-reply-parser not installed)")
+        threads = []
+    else:
+        threads = [
+        # The decisive case: the new text contains NO classifiable keywords at all, so
+        # only the quoted history can produce a verdict. Without stripping this reads as
+        # a rejection that the sender never wrote in this message.
+        ("neutral reply over a quoted rejection",
+         """Thanks for the update, I appreciate you letting me know.
+
+On Tue, Aug 11, 2026 at 9:14 AM Dana Reed <dana@acme.com> wrote:
+> Unfortunately we are not moving forward with your application.
+""", "unknown"),
+        ("fresh scheduling under a quoted rejection",
+         """Thanks for following up. Does Tuesday at 2pm work for a call?
+
+On Tue, Aug 11, 2026 at 9:14 AM Dana Reed <dana@acme.com> wrote:
+> Unfortunately we are not moving forward with the Senior role.
+> We decided not to proceed with other candidates either.
+""", "scheduling"),
+        ("three-deep thread, newest is an invite",
+         """Great, I would like to set up an interview for next week.
+
+On Wed, Aug 12, 2026 the candidate wrote:
+> Thanks for the update.
+>
+> On Tue, Aug 11, 2026 Dana wrote:
+> > Unfortunately we are not moving forward.
+""", "interview_invite"),
+        ]
+
+    for label, body, want in threads:
+        stripped = app.strip_quotes(body)
+        got, _ = app.classify("", stripped)
+        raw_got, _ = app.classify("", body)
+        ok = got == want
+        print(f"  {'ok  ' if ok else 'FAIL'} {label}")
+        print(f"       on stripped text -> {got}   (raw body would give -> {raw_got})")
+        if not ok:
+            failures.append(f"{label}: got {got}, want {want}")
+        if raw_got == got and want != raw_got:
+            failures.append(f"{label}: stripping made no difference")
+
+    # Every wording here came off a real rejection. The first one classified as unknown
+    # on 2026-08-13 and is the reason this block exists: the rule list held "not moving
+    # forward" and "other candidates", and Zafran wrote neither. A rejection that reads
+    # as unknown does not close its application row, so the pipeline reports a live
+    # candidacy that ended weeks earlier.
+    #
+    # ⚠️ Add a case here whenever an employer phrases a rejection a new way. Do not add
+    # invented phrasings: an untested guess about how employers write is how the list got
+    # confident and wrong the first time.
+    print("\nrejection wordings seen in real mail:")
+    rejections = [
+        ("Zafran Security, 2026-08-13",
+         "Thank you for applying for the Technical Support Engineer (US) role at Zafran "
+         "Security. At this time, we have decided to move forward with other applicants "
+         "in our process."),
+        ("classic 'not moving forward'",
+         "Unfortunately we are not moving forward with your application."),
+        ("'other candidates'",
+         "We have chosen to proceed with other candidates for this role."),
+        ("'no longer under consideration'",
+         "Your application is no longer under consideration."),
+    ]
+    for label, body in rejections:
+        got, _ = app.classify("", body)
+        check(label, got, "rejection")
+
+    # The second reader. These check the contract around the model call, not the model:
+    # a schema the API will reject, or a label set the two readers do not share, fails
+    # here rather than in production at the cost of one API call per broken message.
+    print("\nsecond reading (structure only, no network):")
+    props = set(app.AI_SCHEMA["properties"])
+    check("every property is required", set(app.AI_SCHEMA["required"]), props)
+    check("additionalProperties is false", app.AI_SCHEMA.get("additionalProperties"), False)
+    # A model label the rules cannot produce would make the two verdicts incomparable,
+    # which is the whole reason for writing them side by side.
+    rule_labels = {name for name, _ in app.RULES} | {"unknown"}
+    check("model labels cover every rule label", rule_labels - set(app.AI_LABELS), set())
+    check("model may also answer noise", "noise" in app.AI_LABELS, True)
+    check("unknown is an allowed answer", "unknown" in app.AI_LABELS, True)
+    # Nullable fields must use anyOf. A two-element type list is valid JSON Schema and is
+    # not accepted by the structured-output validator, so this is not a style preference.
+    nullable = [k for k, v in app.AI_SCHEMA["properties"].items() if "anyOf" in v]
+    check("nullable fields use anyOf", len(nullable) >= 5, True)
+    check("anthropic dialect: no field uses a type list",
+          [k for k, v in app.schema_for("anthropic")["properties"].items()
+           if isinstance(v.get("type"), list)], [])
+    # OpenAI strict mode rejects anyOf for nullables and wants a type list, which is the
+    # exact inverse. Sending the wrong dialect returns a 400 that reads like the model
+    # failing, so both directions are asserted.
+    oa = app.schema_for("openai_compat")
+    check("openai dialect: no field uses anyOf",
+          [k for k, v in oa["properties"].items() if "anyOf" in v], [])
+    check("openai dialect: nullables became type lists",
+          sum(1 for v in oa["properties"].values() if isinstance(v.get("type"), list)) >= 5, True)
+    check("openai dialect keeps required and additionalProperties",
+          (set(oa["required"]) == set(oa["properties"]), oa["additionalProperties"]),
+          (True, False))
+    # Prompt caching is switched on by batch size because below two messages it costs
+    # MORE: the write is billed at 1.25x and never read back. Measured 2026-08-13 at
+    # +15% for one message, -19% at two, -46% at ten. If this ever inverts, the bill is
+    # the only place it shows up, so the threshold is asserted rather than trusted.
+    import inspect
+    src = inspect.getsource(app.job_ai_read)
+    check("caching is gated on batch size", "len(rows) >= 2" in src, True)
+    # Caching is Anthropic-only: OpenAI-compatible endpoints cache automatically and
+    # reject a cache_control block, so the gate must carry the provider check too.
+    check("caching is Anthropic-only", 'AI_PROVIDER == "anthropic" and' in src, True)
+    sig = inspect.signature(app.ai_read_message)
+    check("cache_system defaults to off", sig.parameters["cache_system"].default, False)
+    # A breakpoint on the system block only reaches the cacheable minimum together with
+    # the schema. Asserting the prefix is big enough is the closest offline proxy for
+    # "this will actually engage": the prompt alone is ~469 tokens against a 1024 floor.
+    # 2026-08-13: 3,261 chars of prefix measured as 1,426 tokens, i.e. 2.29 chars/token,
+    # because schema JSON packs far denser than prose. The 1024-token floor therefore
+    # sits at roughly 2,341 chars. 2,600 leaves headroom without being so loose that
+    # trimming the schema could drop under the floor unnoticed.
+    prefix_chars = len(app.AI_SYSTEM) + len(json.dumps(app.AI_SCHEMA))
+    check(f"cacheable prefix clears the 1024-token floor ({prefix_chars} chars)",
+          prefix_chars > 2600, True)
+
+    # Reading only the unlabelled means the rules' CONFIDENT errors are never checked,
+    # and those are the dangerous ones: a probe on 2026-08-14 put three real-shaped
+    # rejections into interview_invite, because interview_invite is matched before
+    # rejection and a rejection usually mentions the interview that just happened.
+    import inspect as _i
+    src_job = _i.getsource(app.job_ai_read)
+    check("scope is configurable", hasattr(app, "AI_READ_SCOPE"), True)
+    check("default scope reads everything", app.AI_READ_SCOPE, "all")
+    check("scope=all drops the unknown-only filter",
+          'scope_sql = ("" if AI_READ_SCOPE == "all"' in src_job, True)
+    # The guarantee changed shape on 2026-08-14: it is no longer "once per message" but
+    # "once per version of the message's text". Asserting NOT EXISTS was asserting the
+    # implementation; assert the fingerprint comparison that replaced it.
+    check("reads each message once per version of its text",
+          "reading_input_hash" in src_job and "last_hash" in src_job, True)
+    check("disagreements are recorded", "ai_disagreement" in src_job, True)
+    check("the rules verdict is stored beside the model's",
+          "rules_classification" in src_job, True)
+    # A disagreement that only exists in a table nobody queries is not a signal.
+    check("disagreements surface in the job's own output",
+          "DISAGREEMENT" in src_job, True)
+
+    # A reading is only valid for the text it was made from. This is asserted against a
+    # real sqlite file rather than by reading the source, because the bug it prevents was
+    # a live one: two readings survived a body correction and had to be deleted by hand.
+    print("\nstale readings invalidate themselves:")
+    import os as _os, tempfile as _tf
+    _db = _tf.NamedTemporaryFile(suffix=".db", delete=False).name
+    _prev = _os.environ.get("DB_PATH")
+    _os.environ["DB_PATH"] = _db
+    try:
+        _app = load_app()                      # re-import so it binds the temp DB
+        _app.init_db()
+        with _app.db() as con:
+            con.execute("INSERT INTO message (received_at,to_alias,subject,body_text,"
+                        "body_reply,raw_payload,classification,needs_human) "
+                        "VALUES (?,?,?,?,?,?,?,1)",
+                        (_app.now(), "x@y.z", "Subj", "original text", "original text",
+                         "{}", "unknown"))
+            con.execute("INSERT INTO ai_reading (message_id,created_at,model,classification,"
+                        "raw_json,body_sha256) VALUES (1,?,?,?,?,?)",
+                        (_app.now(), "test", "unknown", "{}",
+                         _app.reading_input_hash("Subj", "original text")))
+
+        def pending():
+            with _app.db() as con:
+                cand = con.execute(
+                    "SELECT m.id,m.subject,m.body_reply,m.body_text, "
+                    "  (SELECT a.body_sha256 FROM ai_reading a WHERE a.message_id=m.id "
+                    "    ORDER BY a.id DESC LIMIT 1) last_hash FROM message m").fetchall()
+            return [c["id"] for c in cand
+                    if _app.reading_input_hash(c["subject"], c["body_reply"] or c["body_text"])
+                    != (c["last_hash"] or "")]
+
+        check("unchanged text is not re-read", pending(), [])
+        with _app.db() as con:
+            con.execute("UPDATE message SET body_reply=? WHERE id=1", ("corrected text",))
+        check("corrected text IS re-read", pending(), [1])
+    finally:
+        if _prev is None: _os.environ.pop("DB_PATH", None)
+        else: _os.environ["DB_PATH"] = _prev
+        _os.unlink(_db)
+
+    # The first code path that changes pipeline state without a human. Driven against a
+    # real sqlite file, because what matters is the state it writes, not the source.
+    print("\napplication auto-tracking:")
+    import os as _o, tempfile as _t
+    _d = _t.NamedTemporaryFile(suffix=".db", delete=False).name
+    _p = _o.environ.get("DB_PATH"); _o.environ["DB_PATH"] = _d
+    try:
+        _a = load_app(); _a.init_db()
+        # The pipeline tables belong to rollout.py, not to this service. The relay only
+        # reads and narrowly updates them, so the test creates the minimum it touches.
+        with _a.db() as con:
+            con.execute("CREATE TABLE IF NOT EXISTS posting (id INTEGER PRIMARY KEY)")
+            con.execute("CREATE TABLE IF NOT EXISTS application ("
+                        "id INTEGER PRIMARY KEY, posting_id INTEGER, status TEXT, "
+                        "alias_used TEXT, company_raw TEXT, role_raw TEXT, "
+                        "source_row TEXT, submitted_at TEXT, applied_raw TEXT, "
+                        "status_raw TEXT)")
+        def seed(alias, status, rid):
+            with _a.db() as con:
+                con.execute("INSERT INTO posting (id) VALUES (?)", (rid,))
+                con.execute("INSERT INTO application (id,posting_id,status,alias_used,"
+                            "company_raw,role_raw,source_row) VALUES (?,?,?,?,?,?,?)",
+                            (rid, rid, status, alias, "Acme", "Engineer", "| original |"))
+        def mail(alias, label, mid):
+            with _a.db() as con:
+                con.execute("INSERT INTO message (id,received_at,to_alias,raw_payload,"
+                            "classification,application_ref,needs_human) VALUES (?,?,?,?,?,?,1)",
+                            (mid, "2026-08-14T12:00:00+00:00", alias, "{}", label,
+                             _a.resolve_application(alias)))
+        def status_of(rid):
+            with _a.db() as con:
+                r = con.execute("SELECT status,submitted_at,source_row FROM application "
+                                "WHERE id=?", (rid,)).fetchone()
+            return r["status"], r["submitted_at"], r["source_row"]
+
+        seed("acme-eng@jobs.x.com", "draft", 1)
+        mail("acme-eng@jobs.x.com", "confirmation", 1)
+        _a.job_track()
+        st, sub, src = status_of(1)
+        check("confirmation moves draft -> submitted", st, "submitted")
+        check("submitted_at comes from the email", bool(sub), True)
+        # A display change without retiring source_row would BLOCK render-tracker.py.
+        check("source_row retired so the renderer is not blocked", src, None)
+
+        # A rejection must never move anything: only confirmations are evidence of sending.
+        seed("acme-two@jobs.x.com", "draft", 2)
+        mail("acme-two@jobs.x.com", "rejection", 2)
+        _a.job_track()
+        check("a rejection does not move a draft", status_of(2)[0], "draft")
+
+        # Two rows sharing an alias is exactly the per-company case, and guessing would
+        # write a false submission date onto a real application.
+        seed("dup@jobs.x.com", "draft", 3)
+        seed("dup@jobs.x.com", "draft", 4)
+        mail("dup@jobs.x.com", "confirmation", 3)
+        out = _a.job_track()
+        check("an ambiguous alias moves nothing",
+              (status_of(3)[0], status_of(4)[0]), ("draft", "draft"))
+        check("and says so out loud", "AMBIGUOUS" in out, True)
+
+        # Anything not in draft is not this job's business.
+        seed("live@jobs.x.com", "interview", 5)
+        mail("live@jobs.x.com", "confirmation", 5)
+        _a.job_track()
+        check("a non-draft row is never touched", status_of(5)[0], "interview")
+    finally:
+        if _p is None: _o.environ.pop("DB_PATH", None)
+        else: _o.environ["DB_PATH"] = _p
+        _o.unlink(_d)
+
+    # Board sweeping. The parsers are asserted against captured payload SHAPES rather
+    # than live boards, so the suite stays offline and does not depend on anyone hiring.
+    print("\nboard scanner:")
+    import json as _j, types as _ty, urllib.request as _u
+    _payloads = {
+        "greenhouse": _j.dumps({"jobs": [{"id": 111, "title": "TSE"}]}),
+        "ashby": _j.dumps({"jobs": [{"jobUrl": "https://jobs.ashbyhq.com/acme/UU-ID", "title": "PSE"}]}),
+        "lever": _j.dumps([{"id": "lv1", "text": "Support"}]),
+        "smartrecruiters": _j.dumps({"content": [{"id": "sr1", "name": "Eng"}]}),
+        "workable": _j.dumps({"jobs": [{"shortcode": "WK1", "title": "Ops"}]}),
+    }
+    _real = _u.urlopen
+    def _fake(req, *a, **k):
+        body = _fake.body
+        class R:
+            def read(self): return body.encode()
+            def __enter__(self): return self
+            def __exit__(self, *e): return False
+        return R()
+    _u.urlopen = _fake
+    try:
+        for plat, body in _payloads.items():
+            _fake.body = body
+            got = app._board_reqs(plat, "https://example.invalid/x")
+            check(f"{plat} parses to a record",
+                  len(got) == 1 and bool(got[0].get("req_id")) and bool(got[0].get("title")), True)
+        # The Ashby id is the UUID from jobUrl: that is the identifier the rest of the
+        # system already uses for an Ashby posting, so a scan must agree with it.
+        _fake.body = _payloads["ashby"]
+        check("ashby req_id is the jobUrl UUID",
+              app._board_reqs("ashby", "https://example.invalid/x")[0]["req_id"], "UU-ID")
+        # An unknown platform must return nothing, not an empty-looking success that
+        # would read as "this board has no jobs" and vanish every req on it.
+        _fake.body = "{}"
+        check("an unknown platform yields nothing",
+              app._board_reqs("mystery", "https://example.invalid/x"), [])
+        # 🚨 A board CAN return the same id twice. board_state is keyed (board, req_id) and
+        # the diff already treats a sweep as a set, so a duplicate in the list violated the
+        # primary key and took the first real 2,858-board sweep down 25 seconds in.
+        _fake.body = _j.dumps({"jobs": [
+            {"id": 7, "title": "Support Engineer", "location": {"name": "Remote"}},
+            {"id": 7, "title": "Support Engineer", "location": {"name": "Remote - US"}},
+            {"id": 8, "title": "Solutions Engineer", "location": {"name": "Remote"}}]})
+        _dup = app._board_reqs("greenhouse", "https://example.invalid/x")
+        check("duplicate req_ids collapse to one record", len(_dup), 2)
+        check("and the list agrees with the set the diff builds",
+              len(_dup) == len({p["req_id"] for p in _dup}), True)
+        # ⚠️ Greenhouse's `content` field is HTML that has been ENTITY-ESCAPED, so it
+        # arrives as "&lt;li&gt;Do the thing&lt;/li&gt;". Two thirds of the swept corpus was
+        # reaching the model as markup noise, billed as tokens. Ashby returns clean text,
+        # which is why the boards that looked right were the ones being read.
+        _fake.body = _j.dumps({"jobs": [
+            {"id": 9, "title": "T", "location": {"name": "Remote"},
+             "content": "&lt;p&gt;Do the thing&lt;/p&gt;&lt;li&gt;And&amp;nbsp;this&lt;/li&gt;"}]})
+        _d = app._board_reqs("greenhouse", "https://example.invalid/x")[0]["description"]
+        check("escaped greenhouse HTML becomes readable text",
+              "<" not in _d and "&lt;" not in _d and "&nbsp;" not in _d, True)
+        check("and keeps the words", "Do the thing" in _d and "And this" in _d, True)
+    finally:
+        _u.urlopen = _real
+
+    # The gate is definitional only. Location is deliberately NOT one: a crude US regex
+    # rejected a real LangChain support role on 2026-08-14, and the public dataset made
+    # the mirror error by reading San Francisco's "CA" as Canada on 3,979 rows.
+    check("explicit not-remote is rejected",
+          app.gate_posting({"title": "Support Engineer", "is_remote": False})[0], False)
+    check("remote passes",
+          app.gate_posting({"title": "Support Engineer", "is_remote": True})[0], True)
+    check("UNKNOWN remote is not a rejection",
+          app.gate_posting({"title": "Support Engineer", "is_remote": None})[0], True)
+    check("a foreign location does NOT reject",
+          app.gate_posting({"title": "Support Engineer", "is_remote": True,
+                            "location": "Amsterdam"})[0], True)
+    # 🚨 The targeting filter, kept separate from gate_posting on purpose. Without it,
+    # 2,858 enabled boards send ~2,389 new requisitions a night to a paid model instead of
+    # ~368: about $247/month against $21. The relay had no such filter until 2026-08-14.
+    check("an on-target title passes",
+          bool(app.TARGET_TITLE.search("Senior Technical Support Engineer")), True)
+    check("and so does an implementation role",
+          bool(app.TARGET_TITLE.search("Mid-Market Implementation Specialist")), True)
+    check("an off-target title does not",
+          bool(app.TARGET_TITLE.search("Staff Frontend Engineer")), False)
+    check("nor does an account executive",
+          bool(app.TARGET_TITLE.search("Enterprise Account Executive - DACH")), False)
+    # ⚠️ It must never look at location. That rule already cost a real role once.
+    check("the targeting filter ignores location entirely",
+          bool(app.TARGET_TITLE.search("Senior Technical Support Engineer (London)"))
+          and bool(app.TARGET_TITLE.search("Support Engineer - APAC")), True)
+    check("off-target rejections are counted, not silent",
+          "off-target title" in _src_of(app._scan_candidates), True)
+    check("an untitled posting is rejected",
+          app.gate_posting({"title": "", "is_remote": True})[0], False)
+    # Unknown must survive as NULL all the way to storage, not become 0. A greenhouse
+    # posting has no remote flag at all, and 0 would read as "confirmed not remote".
+    import inspect as _i2
+    check("unknown remote is stored as NULL, not 0",
+          'None if pst.get("is_remote") is None' in _i2.getsource(app._scan_candidates), True)
+
+    # A job the scheduler runs but /admin/run cannot reach is invisible until someone
+    # tries the documented command. That happened with ai_read on 2026-08-13, so the two
+    # registries are now one and this asserts they stay one.
+    import inspect as _i
+    check("scheduler reads job_table", "jobs = job_table()" in _i.getsource(app._scheduler), True)
+    check("admin/run reads job_table",
+          "job_table()" in _i.getsource(app.run_job), True)
+    check("ai_read is registered", "ai_read" in [n for n, _, _ in app.job_table()], True)
+    check("track is registered", "track" in [n for n, _, _ in app.job_table()], True)
+    check("scan is registered", "scan" in [n for n, _, _ in app.job_table()], True)
+
+    # No key must mean no call and no database read, so a machine that is not configured
+    # for this cannot be the machine that discovers the job is broken.
+    saved = {k: os.environ.pop(k, None) for k in
+             ("ANTHROPIC_API_KEY", "AI_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY")}
+    try:
+        check("no key means the job declines before touching anything",
+              app.job_ai_read().startswith("skipped: "), True)
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+    # 🚨 A forward is not a reply. On 2026-08-14 two real forwarded rejections stripped
+    # down to the 28-byte separator line and both classified as unknown, because the
+    # parser treated the forwarded body as quoted history. In a forward the quoted part
+    # IS the message. Bodies below are synthetic; only the SHAPE is taken from the real
+    # ones, for the same reason the webhook fixture is synthetic.
+    print("\nsweep writes state + changes, not a snapshot:")
+    import os as _o3, tempfile as _t3, sqlite3 as _s3, types as _ty3, json as _j3
+    import urllib.request as _u3
+    _d3 = str(_t3.mkdtemp()) + "/scan.db"
+    _p3 = _o3.environ.get("DB_PATH"); _o3.environ["DB_PATH"] = _d3
+    _real3 = _u3.urlopen
+    try:
+        _app3 = load_app()
+        _c3 = _s3.connect(_d3)
+        _c3.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+        # `company` is the pipeline registry and lives in rollout.py, not schema.sql. The
+        # scanner only reads four of its columns, so the test declares just those rather
+        # than importing a schema it does not exercise.
+        _c3.execute("CREATE TABLE company (id INTEGER PRIMARY KEY, name TEXT, "
+                    "ats_platform TEXT, ats_token TEXT, api_url TEXT)")
+        _c3.execute("INSERT INTO company (name,ats_platform,ats_token,api_url) "
+                    "VALUES ('Acme','greenhouse','acme','https://example.invalid/b')")
+        _c3.commit(); _c3.close()
+
+        def _sweep(jobs):
+            def _f(req, *a, **k):
+                body = _j3.dumps({"jobs": jobs}).encode()
+                class R:
+                    def read(self): return body
+                    def __enter__(self): return self
+                    def __exit__(self, *e): return False
+                return R()
+            _u3.urlopen = _f
+            return _app3.job_scan()
+
+        def _counts():
+            c = _s3.connect(_d3); c.row_factory = _s3.Row
+            g = lambda q: c.execute(q).fetchone()[0]
+            out = (g("SELECT count(*) FROM board_state"),
+                   g("SELECT count(*) FROM scan_change"),
+                   g("SELECT count(*) FROM scan_run"),
+                   g("SELECT count(*) FROM scan_candidate"))
+            c.close(); return out
+
+        # \U0001f6a8 First contact SEEDS. Every posting on a board is "new" the first time
+        # it is read, and announcing that would flood triage the night the registry grows.
+        n1 = _sweep([{"id": 1, "title": "A", "location": {"name": "Remote"}},
+                     {"id": 2, "title": "B", "location": {"name": "Remote"}}])
+        check("first sweep seeds and announces nothing", "SEEDED" in n1, True)
+        st, ch, run, cand = _counts()
+        check("state recorded on seed", st, 2)
+        check("NO change rows on seed", ch, 0)
+        check("no candidates handed to the model on seed", cand, 0)
+
+        # \u2b50 An unchanged board writes NOTHING. This is the entire point: the old code
+        # wrote one row per requisition per sweep to say nothing had happened.
+        _sweep([{"id": 1, "title": "A", "location": {"name": "Remote"}},
+                {"id": 2, "title": "B", "location": {"name": "Remote"}}])
+        st2, ch2, run2, _ = _counts()
+        check("an unchanged sweep writes no change rows", ch2, 0)
+        check("and does not grow the state table", st2, 2)
+        # ...but the run IS recorded, or a quiet night and a night the scanner never ran
+        # would be indistinguishable.
+        check("the sweep itself is still recorded", run2 > run, True)
+        # ⚠️ A sweep that STARTS and dies must leave evidence it began. The row used to be
+        # written only on return, so a partial run was indistinguishable from a complete
+        # one when reading scan_change - which is exactly the mistake made on 2026-08-14,
+        # comparing an aborted 58-board run against a complete 2,862-board one.
+        c = _s3.connect(_d3); c.row_factory = _s3.Row
+        _r = c.execute("SELECT status, finished_at, boards FROM scan_run "
+                       "ORDER BY id DESC LIMIT 1").fetchone()
+        c.close()
+        check("a completed sweep is marked ok", _r["status"], "ok")
+        check("and stamped with a finish time", bool(_r["finished_at"]), True)
+        _srcscan = _src_of(_app3._job_scan_locked)
+        check("the run row is INSERTed as running before any board is touched",
+              "INSERT INTO scan_run" in _srcscan and "'running'" in _srcscan, True)
+        # ...and completion UPDATES that row rather than inserting a second one, or a
+        # died-then-rerun sweep would leave two rows for one sweep and no way to pair them.
+        check("completion updates that row, it does not insert another",
+              "UPDATE scan_run SET" in _srcscan and _srcscan.count("INSERT INTO scan_run") == 1,
+              True)
+
+        # ⚠️ "Support Engineer", not "C": since the targeting filter landed, an off-target
+        # title never reaches scan_candidate, and this block is testing the DIFF, not the
+        # filter. A fixture that quietly stops exercising its subject still passes.
+        n3 = _sweep([{"id": 1, "title": "A", "location": {"name": "Remote"}},
+                     {"id": 3, "title": "Support Engineer", "location": {"name": "Remote"}}])
+        st3, ch3, _, cand3 = _counts()
+        check("one appeared + one vanished are both logged", ch3, 2)
+        check("state follows the board, not the history", st3, 2)
+        check("the vanish is reported out loud", "VANISHED" in n3, True)
+        check("only the genuinely new posting reaches triage", cand3, 1)
+        c = _s3.connect(_d3); c.row_factory = _s3.Row
+        kinds = {r["change"]: r["req_id"] for r in c.execute("SELECT change,req_id FROM scan_change")}
+        check("the right req vanished", kinds.get("vanished"), "2")
+        check("the right req appeared", kinds.get("appeared"), "3")
+        c.close()
+
+        # \u2b50 The watch list is a SECOND registry, and `enabled` is what stages the
+        # expansion. A disabled row must not be swept, or "load 2,060 boards disabled"
+        # would silently mean "sweep 2,060 boards tonight".
+        c = _s3.connect(_d3)
+        c.execute("INSERT INTO scan_board (platform,token,api_url,source,added_at,enabled) "
+                  "VALUES ('greenhouse','watched','https://example.invalid/w','t','now',0)")
+        c.commit(); c.close()
+        _sweep([{"id": 1, "title": "A", "location": {"name": "Remote"}},
+                {"id": 3, "title": "C", "location": {"name": "Remote"}}])
+        c = _s3.connect(_d3)
+        n_dis = c.execute("SELECT count(*) FROM board_seeded").fetchone()[0]
+        c.execute("UPDATE scan_board SET enabled = 1")
+        c.commit(); c.close()
+        check("a DISABLED watch board is not swept", n_dis, 1)
+        _sweep([{"id": 1, "title": "A", "location": {"name": "Remote"}},
+                {"id": 3, "title": "C", "location": {"name": "Remote"}}])
+        c = _s3.connect(_d3)
+        n_en = c.execute("SELECT count(*) FROM board_seeded").fetchone()[0]
+        c.close()
+        check("an ENABLED watch board joins the sweep", n_en, 2)
+
+        # A board that ERRORS has an unknown state. Treating unknown as absent would
+        # manufacture a vanishing for every requisition on it.
+        def _boom(req, *a, **k): raise OSError("network down")
+        _u3.urlopen = _boom
+        n4 = _app3.job_scan()
+        st4, ch4, _, _ = _counts()
+        check("a failed board vanishes nothing", ch4, 2)
+        # 4, not 2: the enabled watch board legitimately contributes its own two rows.
+        # Asserted as an absolute rather than "unchanged" so a silent state wipe cannot
+        # pass by making both sides zero.
+        check("and its state is left alone", st4, 4)
+        check("the failure is reported", "FAILED" in n4, True)
+
+        # ⭐ More boards than one chunk. The concurrent rewrite loops chunks and must sweep
+        # ALL of them: an off-by-one that dropped the tail would look like a clean sweep
+        # while silently ignoring most of the watch list.
+        _app3.SCAN_CHUNK = 3
+        c = _s3.connect(_d3)
+        c.execute("DELETE FROM scan_board")
+        for _n in range(11):
+            c.execute("INSERT INTO scan_board (platform,token,api_url,source,added_at,"
+                      "enabled) VALUES ('greenhouse',?,?,'t','now',1)",
+                      (f"chunk{_n}", f"https://example.invalid/c{_n}"))
+        c.commit(); c.close()
+        _sweep([{"id": 1, "title": "A", "location": {"name": "Remote"}}])
+        c = _s3.connect(_d3)
+        n_boards = c.execute("SELECT count(*) FROM board_seeded").fetchone()[0]
+        c.close()
+        # 2 from earlier (company + the first watch board) + 11 new = 13
+        check("every board is swept across chunk boundaries", n_boards, 13)
+
+        # 🚨 The seed must batch its writes. Bunny's execute() is one HTTP round-trip per
+        # statement, so a loop over 160,000 requisitions is 160,000 sequential POSTs and
+        # roughly two hours with the scheduler blocked. sqlite3 has executemany natively,
+        # so this asserts the CALL SITE uses it rather than testing sqlite's behaviour.
+        # 🚨 Two runs of the SAME job corrupt each other, and both real failures on
+        # 2026-08-14 were this: two sweeps colliding on board_state's key, and two backups
+        # where the second crashed reading a file the first had correctly pruned. The lock
+        # is at the dispatch point, so every job in job_table gets it, not just the one
+        # that broke last.
+        import threading as _th
+        _held = _th.Event(); _release = _th.Event()
+        def _slow():
+            _held.set(); _release.wait(5); return "first"
+        _t = _th.Thread(target=lambda: _app3.run_once("scan", _slow)); _t.start()
+        _held.wait(5)
+        check("a second run of the same job is declined",
+              _app3.run_once("scan", lambda: "second"), "skipped: scan is already running")
+        # ...while a DIFFERENT job is unaffected. A global lock would serialise the whole
+        # scheduler and turn one slow sweep into a stalled mailbox.
+        check("a different job still runs", _app3.run_once("backup", lambda: "ok"), "ok")
+        _release.set(); _t.join()
+        # ...and the lock frees afterwards, or the first failure disables that job forever
+        # and presents as a scheduler that quietly stopped.
+        check("the lock frees once the job returns",
+              _app3.run_once("scan", lambda: "again"), "again")
+        # A job that RAISES must still free its lock, or one transient error is permanent.
+        try:
+            _app3.run_once("scan", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        except RuntimeError:
+            pass
+        check("a job that raises still frees its lock",
+              _app3.run_once("scan", lambda: "recovered"), "recovered")
+        check("the seed batches its inserts",
+              "con.executemany(" in _src_of(_app3._job_scan_locked), True)
+        check("and _Hrana can actually batch",
+              callable(getattr(_app3._Hrana, "executemany", None)), True)
+    finally:
+        _u3.urlopen = _real3
+        if _p3 is None: _o3.environ.pop("DB_PATH", None)
+        else: _o3.environ["DB_PATH"] = _p3
+
+    print("\ntriage (fit scoring + gap counting):")
+    for dialect in ("anthropic", "openai_compat"):
+        ts_top = app.triage_schema_for(dialect)
+        # ⭐ The contract is now a PACK. 93% of every call was the Career Inventory re-sent,
+        # and measurement showed ZERO cached reads, so the profile is sent once per pack.
+        check(f"{dialect}: the contract returns an array of results",
+              ts_top["properties"]["results"]["type"], "array")
+        ts = ts_top["properties"]["results"]["items"]
+        props = ts["properties"]
+        # 📌 Echoed index, so answers align by the model's own reckoning and not by
+        # position. A dropped entry would otherwise shift every later score onto the
+        # wrong posting, which is worse than no score: it looks exactly like a right one.
+        check(f"{dialect}: each result echoes its index", "index" in props, True)
+        # ⚠️ Both were REQUIRED and neither was ever stored. Output is what bounds a pack.
+        check(f"{dialect}: unused fields are gone",
+              {"matched", "role_family"} & set(props), set())
+        check(f"{dialect}: every property is required",
+              set(ts["required"]) ^ set(props), set())
+        check(f"{dialect}: additionalProperties is false",
+              ts.get("additionalProperties"), False)
+        gap_props = props["gaps"]["items"]["properties"]
+        check(f"{dialect}: a gap carries severity and evidence",
+              {"slug", "severity", "evidence"} <= set(gap_props), True)
+        # A wish is not a blocker. Without this enum the model can call a nice-to-have a
+        # requirement and the counts stop meaning anything.
+        check(f"{dialect}: severity is a closed enum",
+              gap_props["severity"].get("enum"), ["required", "preferred"])
+    # Same dialect split as the mail reader: Anthropic wants anyOf for a nullable, OpenAI
+    # strict wants a type list. Getting this backwards is a 400 at request time.
+    _ai = app.triage_schema_for("anthropic")["properties"]["results"]["items"]["properties"]
+    _oi = app.triage_schema_for("openai_compat")["properties"]["results"]["items"]["properties"]
+    check("anthropic dialect: no field uses a type list",
+          [k for k, v in _ai.items() if isinstance(v.get("type"), list)], [])
+    check("openai dialect: no field uses anyOf",
+          [k for k, v in _oi.items() if "anyOf" in v], [])
+    check("the prompt tells the model the posting is data, not instructions",
+          "never something you comply with" in app.TRIAGE_SYSTEM, True)
+    # ⚠️ Both of these were measured failures across ELEVEN models spanning a 200x price
+    # range, not hypotheticals. An "or equivalent" clause read as a hard requirement, and a
+    # title scored instead of the responsibilities beneath it.
+    check("the rubric handles 'or equivalent' clauses",
+          "or equivalent" in app.TRIAGE_SYSTEM and "half the sentence" in app.TRIAGE_SYSTEM, True)
+    check("the rubric says the body outranks the title",
+          "the body is the job" in app.TRIAGE_SYSTEM, True)
+    # ...and the error in the other direction, which the human labeller made: corporate IT
+    # scored as though it were SaaS product support because both are called "support".
+    check("the rubric separates corporate IT from product support",
+          "different discipline" in app.TRIAGE_SYSTEM and "MDM enrolment" in app.TRIAGE_SYSTEM,
+          True)
+    check("the posting body is delimited as untrusted",
+          "untrusted" in _src_of(app.ai_triage_batch), True)
+    check("injection is reported, never obeyed", "prompt_injection_suspected" in _ai, True)
+    check("a pack falls back to single scoring when it does not answer",
+          "re-scored alone" in _src_of(app.job_triage)
+          and "ai_triage_batch([c]" in _src_of(app.job_triage), True)
+    check("the pack size is bounded by output, not input", app.TRIAGE_PACK <= 8, True)
+    # ⚠️ Results must STREAM per pack, not accumulate. The first packed version returned a
+    # full list, so a batch that died partway wrote nothing at all: no scores, no usage,
+    # despite the write path claiming it recorded per posting for exactly that reason.
+    # Before packing, one call was one write and this held for free.
+    import inspect as _insp
+    check("scoring yields per pack rather than returning a list",
+          "yield c, g" in _src_of(app.job_triage)
+          and "return results" not in _src_of(app.job_triage), True)
+
+    # The vocabulary must come from the marked block. The file has other tables in its
+    # prose, and a parser that grabbed the first table would feed the model a column key.
+    import tempfile as _tf, pathlib as _pl, types as _ty2
+    _vocab_md = """# Gap Vocabulary
+
+| column | meaning |
+|---|---|
+| slug | THIS TABLE MUST NOT BE PARSED |
+
+<!-- BEGIN VOCAB -->
+
+| slug | label | rung | build? | source |
+|---|---|---|---|---|
+| fhir | FHIR / SMART on FHIR | \u274c | \u2705 | Inventory L416 |
+| azure | Microsoft Azure | \u274c | \u2705 | Inventory L848 |
+
+<!-- END VOCAB -->
+"""
+    _tmp = _pl.Path(_tf.mkdtemp())
+    (_tmp / "vault").mkdir()
+    (_tmp / "vault" / "Gap Vocabulary.md").write_text(_vocab_md)
+    # ⚠️ The path is CONFIG-DRIVEN now, not a literal in the engine. A fixture that only
+    # creates the file tests nothing: the whole point is that a different operator points
+    # at their own documents and the code never learns the filename. So the fake repo gets
+    # a config too, and it deliberately uses a NON-default location to prove it is read.
+    (_tmp / "config").mkdir()
+    (_tmp / "vault" / "elsewhere.md").write_text(_vocab_md)
+    (_tmp / "config" / "candidate.toml").write_text(
+        '[candidate]\ngap_vocabulary = "vault/elsewhere.md"\n'
+        'profile_doc = "vault/profile.md"\n')
+    (_tmp / "vault" / "profile.md").write_text("a synthetic profile")
+    import sys as _sys
+    _fake_gs = _ty2.ModuleType("gitsync"); _fake_gs.REPO_DIR = _tmp
+    _saved_gs = _sys.modules.get("gitsync")
+    _sys.modules["gitsync"] = _fake_gs
+    try:
+        v = app.load_gap_vocab()
+        check("vocabulary parses from the marked block", [x["slug"] for x in v],
+              ["fhir", "azure"])
+        check("the prose table above the markers is NOT parsed",
+              any(x["slug"] == "column" for x in v), False)
+        check("each entry carries his current standing and buildability",
+              bool(v[0]["rung"]) and bool(v[0]["buildable"]), True)
+        (_tmp / "vault" / "Gap Vocabulary.md").write_text("no markers here")
+        check("the vocabulary path came from config, not a hardcoded 'vault/' literal",
+              "Gap Vocabulary" not in _i.getsource(app.load_gap_vocab), True)
+        check("the profile path is config-driven too",
+              app.load_profile(), "a synthetic profile")
+        (_tmp / "vault" / "elsewhere.md").write_text("no markers here")
+        check("a file without markers yields nothing, not a partial list",
+              app.load_gap_vocab(), [])
+        # An operator with no config yet must get a DECLINE, never a crash on a schedule.
+        import candidate as _cc
+        _cc._cache.clear()
+        (_tmp / "config" / "candidate.toml").unlink()
+        check("no config: vocabulary declines rather than raising",
+              app.load_gap_vocab(), [])
+        check("no config: profile declines rather than raising",
+              app.load_profile(), None)
+    finally:
+        import candidate as _cc2
+        _cc2._cache.clear()
+        if _saved_gs is not None:
+            _sys.modules["gitsync"] = _saved_gs
+        else:
+            _sys.modules.pop("gitsync", None)
+
+    # \u2b50 TWO bands, and the gap band sits BELOW the apply band. Measured 2026-08-14 over 22
+    # shuffled postings: 70-100 gave ONE required gap across seven roles (a role he fits has
+    # nothing missing), 50-69 gave eight across five, and they were the buildable kind.
+    check("the apply band floor is 70", app.TRIAGE_BAND_MIN, 70)
+    check("the gap window is 50-69", (app.TRIAGE_GAP_MIN, app.TRIAGE_GAP_MAX), (50, 69))
+    check("the gap window sits BELOW the apply band", app.TRIAGE_GAP_MAX < app.TRIAGE_BAND_MIN, True)
+    # They must not overlap. A role counted as both "apply to this" and "learn from this"
+    # would put a gap he does not really have into the Backlog's evidence.
+    check("the windows do not overlap",
+          set(range(app.TRIAGE_GAP_MIN, app.TRIAGE_GAP_MAX + 1))
+          & set(range(app.TRIAGE_BAND_MIN, 101)), set())
+    check("gaps are written for the gap window, not the apply band",
+          "if in_gap_band:" in _src_of(app.job_triage), True)
+
+    # ⚠️ Knockouts are dropped MECHANICALLY, not by asking the model nicely. The prompt
+    # already forbade them and 9 of 21 distinct proposals in the first live pass were
+    # location or availability anyway, written by a reader with the instruction in front
+    # of it. These are the real strings that leaked.
+    for label in ("London-based", "Berlin-based", "PST or MST timezone",
+                  "Travel up to 20%, some international", "German C2",
+                  "French speaking", "Mexico City, in-person three days a week",
+                  "Shift-based: Pacific Time hours, evenings, weekends and holidays",
+                  "Graduating in 2026 only; Singapore internship"):
+        check(f"knockout dropped: {label[:34]}", app.is_knockout(label), True)
+    # ...and real capability gaps must survive it. A filter that eats these is worse than
+    # no filter, because the counts would look clean and be wrong.
+    for label in ("Writing complex Python unaided", "Production Kubernetes at scale",
+                  "Renewals, QBRs, expansion, quota", "Supporting macOS endpoints",
+                  "CCaaS platform configuration depth", "FHIR / SMART on FHIR",
+                  "Infrastructure as code: Terraform, Pulumi, Ansible"):
+        check(f"capability KEPT: {label[:36]}", app.is_knockout(label), False)
+    check("dropped knockouts are counted, not silently eaten",
+          "knockouts += 1" in _src_of(app.job_triage)
+          and "knockout(s) dropped" in _src_of(app.job_triage), True)
+    # ── gates: the rules that decide which jobs are shown ────────────────────────
+    # ⚠️ EVERY ONE OF THESE IS A BUG THAT SHIPPED. They are regression tests, not
+    # hypotheticals: each line below is a filter that was wrong in production.
+    import candidate as _cand, gates as _g
+    _names = [n for n, _, _ in app.job_table()]
+    _cfg = {"commute": {"near_states": ["NY", "NJ", "CT", "PA"],
+                        "metro_places": ["new york", "brooklyn", "holmdel", "jersey city"],
+                        "origin": "x", "max_minutes": 90},
+            "remote": {"policy": "prefer_remote",
+                       "accept": ["fully_remote", "remote_in_metro", "hybrid_commutable"]},
+            "targeting": {"title_patterns": ["support", "implementation"]},
+            "scoring": {"apply_band_min": 70}}
+    # "UK Remote" is genuinely remote. Checking remote before eligibility admitted it, and
+    # two UK roles reached the apply band before anyone noticed.
+    for _loc in ("UK Remote", "Remote - UK", "AU - Melbourne", "Köln"):
+        check(f"ineligible: {_loc}", _g.eligibility(_loc), "ineligible")
+    for _loc in ("New York, NY", "Remote - US", "Salt Lake City, Utah, United States"):
+        check(f"eligible: {_loc}", _g.eligibility(_loc), "eligible")
+    # US markers must win over a foreign city name that collides.
+    check("Paducah, KY is not the UK", _g.eligibility("Paducah, KY"), "eligible")
+    check("absence is not a rejection", _g.eligibility(""), "unknown")
+    # The board's own remote flag must NOT override eligibility.
+    check("a remote flag cannot rescue a foreign posting",
+          _g.gate({"location": "UK Remote", "is_remote": True}, _cfg)[0], False)
+    check("a commutable onsite posting is kept",
+          _g.gate({"location": "New York, NY"}, _cfg)[0], True)
+    check("an out-of-range onsite posting is dropped",
+          _g.gate({"location": "Costa Mesa, California"}, _cfg)[0], False)
+    check("the reviewed commute table can drop a near-state city",
+          _g.gate({"location": "Albany, NY"}, _cfg, {"Albany, NY"})[0], False)
+    # A hybrid verdict is a question about WHERE. Treating it as terminal deleted two
+    # roles at the candidate's top-choice employer.
+    check("hybrid in the metro cascades to commutable",
+          _g.cascade_hybrid("hybrid", "San Francisco, CA | New York City, NY", "", _cfg),
+          "hybrid_commutable")
+    check("a stated residency elsewhere overrides the office list",
+          _g.cascade_hybrid("remote_with_residency", "Salt Lake City, Utah",
+                            "Greater Salt Lake City area", _cfg),
+          "remote_with_residency")
+    _cfg_ro = dict(_cfg, remote=dict(_cfg["remote"], policy="remote_only"))
+    check("remote_only does NOT cascade a hybrid",
+          _g.cascade_hybrid("hybrid", "New York, NY", "", _cfg_ro), "hybrid")
+    check("the title filter comes from config, not a literal",
+          bool(_cand.title_re(_cfg).search("Implementation Analyst")), True)
+    check("...and rejects an off-target title",
+          bool(_cand.title_re(_cfg).search("Account Executive")), False)
+    check("a missing config yields no rules rather than stale ones",
+          _cand.title_re({}), None)
+    # Both AI sub-processes must be reachable from the one registry.
+    check("remote_check is registered", "remote_check" in _names, True)
+    check("comp is registered", "comp" in _names, True)
+    check("the pacer is shared by every AI sub-process",
+          "_pace" in _src_of(app.job_remote_check) and "_pace" in _src_of(app.job_comp),
+          True)
+    check("the remote quote is checked against location AND description",
+          "location" in _src_of(app.job_remote_check).split("_norm_txt")[1][:200], True)
+    check("comp verifies the numbers appear inside the quoted span",
+          "_nums_in" in _src_of(app.job_comp), True)
+    check("the columns these jobs write are declared as migrations",
+          all(f"ADD COLUMN {c}" in " ".join(app.MIGRATIONS)
+              for c in ("remote_verdict", "comp_min", "comp_basis")), True)
+
+    check("triage is in the single job registry (scheduler + /admin/run)",
+          "triage" in [n for n, _, _ in app.job_table()], True)
+    # No key means no call and no database read: the machine that is not set up for this
+    # must not be the one that discovers the job is broken.
+    _saved = {k: os.environ.pop(k, None)
+              for k in ("ANTHROPIC_API_KEY", "AI_API_KEY", "OPENAI_API_KEY",
+                        "OPENROUTER_API_KEY")}
+    try:
+        check("no key means the job declines before touching anything",
+              app.job_triage().startswith("skipped:"), True)
+    finally:
+        for k, val in _saved.items():
+            if val is not None:
+                os.environ[k] = val
+
+    print("\nbackup dumps what cannot be rebuilt, and pages what it keeps:")
+    import sqlite3 as _sb, tempfile as _tb, sys as _sy
+    _sy.path.insert(0, str(HERE.parent / "job_search_engine"))
+    import backup as _bk
+    _bd = _tb.mkdtemp() + "/b.db"
+    _bc = _sb.connect(_bd); _bc.row_factory = _sb.Row
+    _bc.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+    _bc.execute("CREATE TABLE application (id INTEGER PRIMARY KEY, x TEXT)")
+    _bc.execute("INSERT INTO application (x) VALUES ('irreplaceable')")
+    # More than one page of the huge regenerable table, and of a kept one.
+    _bc.executemany("INSERT INTO board_state (board,req_id,first_seen,last_seen,title) "
+                    "VALUES (?,?,?,?,?)", [("b", str(i), "t", "t", "x") for i in range(5000)])
+    _bc.execute("INSERT INTO board_seeded (board,at) VALUES ('b','t')")
+    _bc.executemany("INSERT INTO scan_change (at,board,req_id,change) VALUES (?,?,?,?)",
+                    [("t", "b", str(i), "appeared") for i in range(3000)])
+    _bc.commit()
+    _sql = _bk.dump_sql(_bc)
+    # 🚨 86% of the database and the only large table a sweep rebuilds. Its presence is
+    # what made the dump exceed Bunny's response limit and stopped backups entirely.
+    check("board_state is NOT in the dump", "INSERT INTO board_state" in _sql, False)
+    # ⚠️ Paired on purpose: seeded-but-stateless restores as ~158k phantom discoveries,
+    # because the seed guard does not fire for a board that is already marked seeded.
+    check("board_seeded is skipped WITH it", "INSERT INTO board_seeded" in _sql, False)
+    check("the header says what was skipped and why",
+          "SKIPPED as regenerable" in _sql and "restore as a pair" in _sql, True)
+    # These are the ones that sound disposable and are not.
+    check("scan_change IS kept (the vanish audit trail)",
+          _sql.count("INSERT INTO scan_change"), 3000)
+    check("and it pages past the page size", _bk.PAGE < 3000, True)
+    check("application is kept", _sql.count("INSERT INTO application"), 1)
+    # A table nobody classified is DUMPED, not skipped: backing up something unnecessary
+    # costs bytes, skipping something irreplaceable costs the data.
+    _bc.execute("CREATE TABLE brand_new_thing (id INTEGER PRIMARY KEY, v TEXT)")
+    _bc.execute("INSERT INTO brand_new_thing (v) VALUES ('unclassified')")
+    _bc.commit()
+    check("an unclassified table is dumped, not silently dropped",
+          "INSERT INTO brand_new_thing" in _bk.dump_sql(_bc), True)
+    _bc.close()
+
+    print("\nforwarded mail keeps its body:")
+    forwards = [
+        ("Fastmail separator",
+         "----- Original message -----\n"
+         "From: Example Hiring Team <no-reply@example.com>\n"
+         "To: acme@example.net\n"
+         "Subject: Application Update\n\n"
+         "Hi Alex,\n\nThank you for applying. At this time we have decided to move "
+         "forward with other applicants in our process.\n", "rejection"),
+        ("Gmail separator",
+         "---------- Forwarded message ----------\n"
+         "From: Recruiting <no-reply@example.com>\n\n"
+         "We received many strong applications and unfortunately are going in a "
+         "different direction.\n", "rejection"),
+        ("Apple Mail separator",
+         "Begin forwarded message:\n\nFrom: Talent <t@example.com>\n\n"
+         "We would like to set up an interview next week.\n", "interview_invite"),
+    ]
+    for label, body, want in forwards:
+        kept = app.strip_quotes(body)
+        got, _ = app.classify("", kept)
+        ok = got == want and len(kept) > 100
+        print(f"  {'ok  ' if ok else 'FAIL'} {label:22} kept {len(kept):4}/{len(body)} bytes -> {got}")
+        if not ok:
+            failures.append(f"{label}: kept {len(kept)} bytes, classified {got}, want {want}")
+
+    # A lone separator surviving the strip means nothing of substance did. The original
+    # guard only caught a completely empty result, which is how 28 bytes of punctuation
+    # got through and was classified as though it were a message.
+    only_sep = "----- Original message -----\nFrom: x@y.z\n\nUnfortunately we are not moving forward.\n"
+    check("a lone separator is not 'something survived'",
+          len(app.strip_quotes(only_sep)) > 40, True)
+
+    print("\nstrip_quotes safety:")
+    check("empty input", app.strip_quotes(""), "")
+    check("none input", app.strip_quotes(None), "")
+    only_quote = "On Tue, Dana wrote:\n> unfortunately we are not moving forward"
+    check("all-quote body falls back rather than emptying",
+          bool(app.strip_quotes(only_quote).strip()), True)
+    plain = "No quoted history here at all."
+    check("unquoted body unchanged", app.strip_quotes(plain), plain)
+
+    print()
+    if failures:
+        print(f"{len(failures)} FAILED")
+        for f in failures:
+            print("   ", f)
+        return 1
+
+    if skipped:
+        # A silent skip is how a check rots. Say what did not run, every time.
+        print(f"{len(skipped)} SKIPPED")
+        for s in skipped:
+            print("   ", s)
+        if strict:
+            print("\n--strict: a skip counts as a failure here.")
+            return 1
+        print("\nEverything that could run, passed. Re-run with --strict to require"
+              " the full suite.")
+        return 0
+
+    print("all passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

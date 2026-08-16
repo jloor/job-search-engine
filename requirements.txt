@@ -1,0 +1,6 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+email-reply-parser==0.5.12
+cryptography==44.0.0
+anthropic==0.122.0

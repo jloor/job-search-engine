@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "job-search-engine"
+version = "0.1.0"
+description = "A single-tenant job-search engine: board scanner, fit triage, and a mail relay with a human approval gate."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn>=0.27",
+]
+
+[project.optional-dependencies]
+# The suite runs without these; it detects the missing dependency and skips with the
+# install command rather than reporting a failure a stranger would read as "broken".
+dev = ["httpx"]
+
+[tool.setuptools]
+packages = ["job_search_engine"]
+
+[tool.setuptools.package-data]
+job_search_engine = ["schema.sql"]

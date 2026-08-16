@@ -1,0 +1,88 @@
+{
+ "_synthetic": "Structure captured from a real ImprovMX delivery. All addresses, domains, signatures, hashes and opaque vendor tokens are synthetic. Do not treat any value here as a valid signature.",
+ "headers": {
+  "DKIM-Signature": [
+   "v=1; a=rsa-sha256; c=relaxed/relaxed; d=improvmx.net; i=@improvmx.net; q=dns/txt; s=dkimprovmx2; t=1786546382; h=date : from : to : subject : content-type : feedback-id : message-id; bh=U1lOVEhFVElDQk9EWUhBU0hGT1JURVNUSU5HT05MWQAAAAA=; b=U1lOVEhFVElDU0lHTkFUVVJFRk9SVEVTVElOR09OTFlOT1RBUkVBTFNJR05BVFVSRQAAAAAAAAAA U1lOVEhFVElDU0lHTkFUVVJFRk9SVEVTVElOR09OTFlOT1RBUkVBTFNJR05BVFVSRQAAAAAAAAAA U1lOVEhFVElDU0lHTkFUVVJFRk9SVEVTVElOR09OTFlOT1RBUkVBTFNJR05BVFVSRQ=="
+  ,
+   "v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.net; s=20251104; t=1786546377; x=1787151177; darn=jobs.example.com; h=content-type:to:subject:message-id:date:from:mime-version:from:to :cc:subject:date:message-id:reply-to:content-type; bh=U1lOVEhFVElDQk9EWUhBU0hGT1JURVNUSU5HT05MWQAAAAA=; b=U1lOVEhFVElDU0VOREVSU0lHTkFUVVJFRk9SVEVTVElOR09OTFlOT1RSRUFMAAAAAAAAAAAAAA U1lOVEhFVElDU0VOREVSU0lHTkFUVVJFRk9SVEVTVElOR09OTFlOT1RSRUFMAAAAAAAAAAAAAA U1lOVEhFVElDU0VOREVSU0lHTkFUVVJFRk9SVEVTVElOR09OTFlOT1RSRUFM"
+  ],
+  "X-Received": [
+   "by 2001:db8:6402:4550::1 with SMTP id synthetic-received-id-0001.11.1786546376981; Wed, 12 Aug 2026 07:52:56 -0700 (PDT)"
+  ],
+  "Delivered-To": {
+   "name": null,
+   "email": "test@jobs.example.com"
+  },
+  "X-Mailer-Opaque-A": [
+   "U1lOVEhFVElDT1BBUVVFVkVORE9SVE9LRU5B\tU1lOVEhFVElDT1BBUVVFVkVORE9SVE9LRU5C\tU1lOVEhFVElDT1BBUVVFVkVORE9SVE9LRU5D"
+  ],
+  "Mime-Version": "1.0",
+  "X-Improvmx-Session-Id": [
+   "00000000-0000-4000-8000-000000000001"
+  ],
+  "Feedback-Id": "forward-000000:cust-jobs.example.com:orig-example.net:improvmx",
+  "X-Mailer-Opaque-B": [
+   "U1lOVEhFVElDRkVBVFVSRVRPS0VORk9SVEVTVElOR09OTFk"
+  ],
+  "Authentication-Results": [
+   "mx1.improvmx.com; spf=pass (improvmx.com: domain of example.net designates 2001:db8:4864:20::52b as permitted sender) smtp.mailfrom=example.net; dkim=pass (signature was verified) header.i=@example.net header.s=20251104 header.b=U1lOVEhF; dmarc=pass (p=NONE sp=QUARANTINE dis=NONE) header.from=example.net"
+  ],
+  "X-Provider-DKIM-Signature": [
+   "v=1; a=rsa-sha256; c=relaxed/relaxed; d=mail.example.net; s=20251104; t=1786546377; x=1787151177; h=content-type:to:subject:message-id:date:from:mime-version:from:to:cc:subject:date:message-id:reply-to:content-type; bh=U1lOVEhFVElDQk9EWUhBU0hGT1JURVNUSU5HT05MWQAAAAA=; b=U1lOVEhFVElDUFJPVklERVJTSUdOQVRVUkVGT1JURVNUSU5HT05MWU5PVFJFQUwAAAAAAAAAAA U1lOVEhFVElDUFJPVklERVJTSUdOQVRVUkVGT1JURVNUSU5HT05MWU5PVFJFQUwAAAAAAAAAAA U1lOVEhFVElDUFJPVklERVJTSUdOQVRVUkU="
+  ],
+  "ARC-Message-Signature": [
+   "i=1; a=rsa-sha256; c=relaxed/relaxed; d=mail.example.net; s=arc-20260327; h=to:subject:message-id:date:from:mime-version:dkim-signature; bh=U1lOVEhFVElDQk9EWUhBU0hGT1JURVNUSU5HT05MWQAAAAA=; fh=U1lOVEhFVElDRkhWQUxVRUZPUlRFU1RJTkdPTkxZAAAAAAA=; b=U1lOVEhFVElDQVJDTUVTU0FHRVNJR05BVFVSRUZPUlRFU1RJTkdPTkxZTk9UUkVBTAAAAAAAAA U1lOVEhFVElDQVJDTUVTU0FHRVNJR05BVFVSRUZPUlRFU1RJTkdPTkxZTk9UUkVBTAAAAAAAAA U1lOVEhFVElDQVJDTUVTU0FHRVNJR05BVFVSRQ==; darn=jobs.example.com"
+  ],
+  "X-Improvmx-Server-Id": [
+   "0000000"
+  ],
+  "ARC-Seal": [
+   "i=1; a=rsa-sha256; t=1786546377; cv=none; d=mail.example.net; s=arc-20260327; b=U1lOVEhFVElDQVJDU0VBTFNJR05BVFVSRUZPUlRFU1RJTkdPTkxZTk9UUkVBTAAAAAAAAAAAAA U1lOVEhFVElDQVJDU0VBTFNJR05BVFVSRUZPUlRFU1RJTkdPTkxZTk9UUkVBTAAAAAAAAAAAAA U1lOVEhFVElDQVJDU0VBTFNJR05BVFVSRQ=="
+  ],
+  "X-Forwarding-Service": "ImprovMX v3.0.0",
+  "ARC-Authentication-Results": [
+   "i=1; mx.example.net; arc=none"
+  ],
+  "Received": [
+   "from mail-out-01.example.net (mail-out-01.example.net. [2001:db8:4864:20::52b]) by mx1.improvmx.com with ESMTPS (version=TLSv1.3 cipher=TLS_AES_256_GCM_SHA384 bits=256/256) for <test@jobs.example.com>; Wed, 12 Aug 2026 14:53:01 -0000",
+   "by mail-out-01.example.net with SMTP id synthetic-smtp-id-0002 for <test@jobs.example.com>; Wed, 12 Aug 2026 07:53:00 -0700 (PDT)"
+  ],
+  "X-Mailer-Opaque-C": [
+   "U1lOVEhFVElDTUVTU0FHRVNUQVRFVE9LRU4x\tU1lOVEhFVElDTUVTU0FHRVNUQVRFVE9LRU4y\tU1lOVEhFVElDTUVTU0FHRVNUQVRFVE9LRU4z"
+  ],
+  "Received-SPF": [
+   "pass (improvmx.com: domain of example.net designates 2001:db8:4864:20::52b as permitted sender) receiver=mx1.improvmx.com; client-ip=2001:db8:4864:20::52b; helo=mail-out-01.example.net;"
+  ]
+ },
+ "text": "Test 1009",
+ "html": "<div dir=\"auto\">Test 1009</div>",
+ "return-path": {
+  "name": null,
+  "email": "dana.reed@example.net"
+ },
+ "to": [
+  {
+   "name": null,
+   "email": "test@jobs.example.com"
+  }
+ ],
+ "from": {
+  "name": "Dana Reed",
+  "email": "dana.reed@example.net"
+ },
+ "date": "Wed, 12 Aug 2026 10:52:45 -0400",
+ "subject": "Test 1009",
+ "message-id": "<SYNTHETIC0000000000000000000000000000@mail.example.net>",
+ "timestamp": 1786546365,
+ "envelope": {
+  "return_path": null,
+  "recipient": "test@jobs.example.com",
+  "hostname": "mail-out-01.example.net",
+  "remote_ip": "2001:db8:4864:20::52b"
+ },
+ "verdict": {
+  "spf": "pass",
+  "dkim": "pass",
+  "dmarc": "pass"
+ }
+}

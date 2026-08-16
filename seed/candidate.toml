@@ -1,0 +1,74 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  SEED PROFILE — a fictional candidate, so the engine can be run end to end
+#  without inventing content and without any private repo present.
+#
+#  🚨 EVERYTHING HERE IS INVENTED. "Alex Rivera" does not exist. The employers
+#  below are the standard fictional-company names. No real person's résumé,
+#  address, salary floor or application history appears anywhere in this tree.
+#
+#  Run against it with:
+#      CANDIDATE_CONFIG=platform/seed/candidate.toml
+#  and point gitsync.REPO_DIR (or a checkout) at platform/seed/.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[candidate]
+name = "Alex Rivera"
+profile_doc = "vault/Career Inventory.md"
+gap_vocabulary = "vault/Gap Vocabulary.md"
+tracker_doc = "vault/Application Tracker.md"
+
+[work_authorization]
+country = "US"
+eligible_countries = ["US"]
+
+[commute]
+# A real street address, because require_street_address is on by default and a
+# centroid's error scales with the size of the place. This one is a public
+# landmark, not anybody's home.
+origin = "233 S Wacker Dr, Chicago, IL 60606"
+origin_context = "downtown Chicago, the Loop"
+max_minutes = 75
+require_street_address = true
+# ⚠️ Origin-specific facts a model cannot derive from a distance. A new origin
+# needs its own, or the filter degrades to distance guessing. Real routing
+# supersedes these; they are the fallback before anything is measured.
+travel_notes = [
+  "The Loop is served by eight CTA rail lines, so downtown-to-downtown is fast and driving is usually slower than the train.",
+  "The suburbs along a Metra line are far quicker than their mileage suggests. Anything requiring a car transfer is not.",
+  "Northwest Indiana and Milwaukee are outside the ceiling despite looking close on a map.",
+]
+near_states = ["IL", "IN", "WI"]
+metro_places = [
+  "chicago", "the loop", "river north", "west loop", "evanston", "oak park",
+  "skokie", "naperville", "schaumburg", "oak brook", "elmhurst", "des plaines",
+]
+
+[remote]
+policy = "prefer_remote"
+accept = ["fully_remote", "remote_in_metro", "hybrid_commutable"]
+keep_unclear = true
+
+[targeting]
+title_patterns = [
+  "support", "integration", "implementation", "solutions?", "deployment",
+  "technical account", "onboarding", "escalation",
+]
+exclude_title_patterns = ["intern", "director", "vice president"]
+
+[compensation]
+floor = 90000
+currency = "USD"
+rangeless = "rank_last"
+
+[scoring]
+apply_band_min = 70
+gap_band_min = 50
+gap_band_max = 69
+
+[models]
+triage = "openai/gpt-5.6-luna"
+subprocess = "openai/gpt-5.6-luna"
+base_url = "https://openrouter.ai/api/v1"
+requests_per_minute = 9
+pack_size = 5
+cost_per_posting = 0.000678
