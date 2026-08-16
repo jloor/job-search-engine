@@ -22,4 +22,4 @@ _HERE = str(pathlib.Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"

@@ -2861,20 +2861,95 @@ def get_backup(name: str, request: Request, authorization: str | None = Header(N
                     headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
+# ---------------------------------------------------------------- manual job runs --
+#
+# 🚨 A CDN CUTS THE CONNECTION LONG BEFORE A SWEEP FINISHES. Bunny's edge closes at 60
+# seconds and a full board sweep takes about ten minutes, so a synchronous endpoint CANNOT
+# answer for the jobs that most need triggering. The request fails while the job runs on
+# perfectly well inside the container, and a caller reading the reply as the verdict marks a
+# healthy sweep as broken. That is exactly what an end-to-end check did on its first run.
+#
+# ⭐ Batching the sweep to fit the window was considered and rejected. The scheduler calls
+# these jobs IN-PROCESS and never touches HTTP, so the limit applies to one caller only, and
+# splitting a logically atomic diff for a transport constraint is the tail wagging the dog.
+# The sweep also already persists board_state and scan_change per board inside its loop, so
+# an interrupted run keeps everything it had done: batching would buy resumability that
+# already exists.
+#
+# So: long jobs return 202 with a ticket, and the caller polls. Short ones still answer
+# inline, because making every caller poll for "nothing to track" is worse than a timeout.
+
+# Jobs that routinely outlive an HTTP request. Everything else answers synchronously.
+ASYNC_JOBS = {"scan", "backup"}
+_RUNS: dict = {}
+_RUNS_GUARD = threading.Lock()
+
+
+def _record_run(ticket: str, **fields) -> None:
+    with _RUNS_GUARD:
+        _RUNS.setdefault(ticket, {}).update(fields)
+        # ⚠️ Bounded, because this is process memory and a container that runs for months
+        # would otherwise keep every ticket it ever issued.
+        if len(_RUNS) > 200:
+            for k in sorted(_RUNS, key=lambda k: _RUNS[k].get("started", ""))[:50]:
+                _RUNS.pop(k, None)
+
+
 @app.post("/admin/run/{job}")
 def run_job(job: str, request: Request, authorization: str | None = Header(None)):
-    """Run a scheduled job now, so it can be tested without waiting for its interval."""
+    """Run a scheduled job now. Long jobs return 202 and a ticket; short ones answer inline."""
     require_admin(authorization, request)
     fns = {name: fn for name, _, fn in job_table()}
     if job not in fns:
         raise HTTPException(404, f"unknown job. known: {', '.join(fns)}")
-    try:
-        detail = run_once(job, fns[job])
-        audit(f"job_{job}", f"manual: {detail}", client_ip(request))
-        return {"ok": True, "job": job, "detail": detail}
-    except Exception as e:
-        audit(f"job_{job}_error", f"manual: {type(e).__name__}: {e}", client_ip(request))
-        raise HTTPException(500, f"{type(e).__name__}: {e}")
+
+    if job not in ASYNC_JOBS:
+        try:
+            detail = run_once(job, fns[job])
+            audit(f"job_{job}", f"manual: {detail}", client_ip(request))
+            return {"ok": True, "job": job, "detail": detail}
+        except Exception as e:
+            audit(f"job_{job}_error", f"manual: {type(e).__name__}: {e}", client_ip(request))
+            raise HTTPException(500, f"{type(e).__name__}: {e}")
+
+    ticket = f"{job}-{int(time.time())}-{secrets.token_hex(3)}"
+    _record_run(ticket, job=job, state="running", started=now(), detail=None)
+
+    def _bg():
+        try:
+            d = run_once(job, fns[job])
+            _record_run(ticket, state="done", detail=d, finished=now())
+            audit(f"job_{job}", f"manual/{ticket}: {d}")
+        except Exception as e:                                # noqa: BLE001
+            _record_run(ticket, state="error", detail=f"{type(e).__name__}: {e}",
+                        finished=now())
+            audit(f"job_{job}_error", f"manual/{ticket}: {type(e).__name__}: {e}")
+
+    # ⚠️ Daemon, so a container shutdown is never blocked by a ten-minute sweep. The work
+    # that was already persisted survives; run_once's lock still prevents a second copy.
+    threading.Thread(target=_bg, name=f"run-{ticket}", daemon=True).start()
+    audit(f"job_{job}_started", f"manual/{ticket}", client_ip(request))
+    return JSONResponse(status_code=202, content={
+        "ok": True, "job": job, "ticket": ticket, "state": "running",
+        "poll": f"/admin/run-status/{ticket}",
+        "note": "long job; poll the ticket. The connection cannot be held open for it."})
+
+
+@app.get("/admin/run-status/{ticket}")
+def run_status(ticket: str, request: Request,
+               authorization: str | None = Header(None)):
+    """The outcome of a job started with 202, or 404 if this process never issued it.
+
+    ⚠️ Tickets live in PROCESS MEMORY. A container restart forgets them, which is honest:
+    the run it described did not survive either. Durable state for a sweep is scan_run, and
+    that is where a caller should look if a ticket has vanished.
+    """
+    require_admin(authorization, request)
+    with _RUNS_GUARD:
+        rec = _RUNS.get(ticket)
+    if not rec:
+        raise HTTPException(404, "unknown ticket. If the container restarted, read scan_run.")
+    return {"ok": rec["state"] != "error", "ticket": ticket, **rec}
 
 
 @app.get("/diag/mailports")

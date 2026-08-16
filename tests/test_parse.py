@@ -981,6 +981,39 @@ On Wed, Aug 12, 2026 the candidate wrote:
           all(f"ADD COLUMN {c}" in " ".join(app.MIGRATIONS)
               for c in ("remote_verdict", "comp_min", "comp_basis")), True)
 
+    # ── manual runs: long jobs answer 202, short ones inline ──────────────────────
+    # 🚨 A CDN closes the connection at 60 seconds and a full sweep takes about ten minutes.
+    # A synchronous endpoint therefore CANNOT answer for scan, and a caller reading the
+    # failed request as the verdict marks a healthy sweep as broken. That happened.
+    check("scan is async, because it outlives any request",
+          "scan" in app.ASYNC_JOBS, True)
+    check("backup too", "backup" in app.ASYNC_JOBS, True)
+    # ⚠️ NOT everything. Making a caller poll for "nothing to track" is worse than a timeout,
+    # so a short job must keep answering inline.
+    check("short jobs stay synchronous",
+          any(j not in app.ASYNC_JOBS for j in ("track", "ai_read", "comp")), True)
+    check("the async path returns 202, not 200",
+          "status_code=202" in _src_of(app.run_job), True)
+    check("...and hands back a ticket to poll",
+          "ticket" in _src_of(app.run_job) and "poll" in _src_of(app.run_job), True)
+    check("the worker thread is a daemon, so shutdown is never blocked by a sweep",
+          "daemon=True" in _src_of(app.run_job), True)
+    check("a status endpoint exists", callable(getattr(app, "run_status", None)), True)
+    # The ticket table is process memory. Unbounded, a long-lived container keeps every
+    # ticket it ever issued.
+    check("the ticket table is bounded", "len(_RUNS) > " in _src_of(app._record_run), True)
+    _t = "scan-1-abc"
+    app._record_run(_t, job="scan", state="running", started="x")
+    check("a ticket records its state", app._RUNS[_t]["state"], "running")
+    app._record_run(_t, state="done", detail="swept 2862 boards")
+    check("...and is updated in place, not duplicated", app._RUNS[_t]["detail"],
+          "swept 2862 boards")
+    check("the ticket kept its job through the update", app._RUNS[_t]["job"], "scan")
+    for _i in range(260):
+        app._record_run(f"filler-{_i}", job="x", state="done", started=f"{_i:04d}")
+    check("...and old tickets are evicted rather than accumulating",
+          len(app._RUNS) <= 260, True)
+
     check("triage is in the single job registry (scheduler + /admin/run)",
           "triage" in [n for n, _, _ in app.job_table()], True)
     # No key means no call and no database read: the machine that is not set up for this
