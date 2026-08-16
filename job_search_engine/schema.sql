@@ -208,6 +208,17 @@ CREATE TABLE IF NOT EXISTS board_state (
   first_seen TEXT NOT NULL,
   last_seen  TEXT NOT NULL,
   title      TEXT,
+  -- 🚨 SOFT DELETE. NULL means currently on the board. A timestamp means it was not seen,
+  -- and the row STAYS. Deleting it means no future sweep can prove the posting existed,
+  -- which destroys the one thing the vanish log is for: a requisition that dies mid-process
+  -- is evidence of what was applied to.
+  -- ⚠️ It is also how a flapping board self-corrects. Measured 2026-08-16: greenhouse|infuse
+  -- had logged 122 vanishes while serving 374 jobs. A reappearance clears this back to NULL.
+  vanished_at TEXT,
+  -- Set only when a SECOND sweep agreed and the disappearance was reported.
+  -- Without this a held row and a confirmed one look identical, so a vanish is
+  -- either never reported or reported again on every sweep.
+  vanish_confirmed_at TEXT,
   PRIMARY KEY (board, req_id)
 );
 

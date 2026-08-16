@@ -651,7 +651,17 @@ On Wed, Aug 12, 2026 the candidate wrote:
                      {"id": 3, "title": "Support Engineer", "location": {"name": "Remote"}}])
         st3, ch3, _, cand3 = _counts()
         check("one appeared + one vanished are both logged", ch3, 2)
-        check("state follows the board, not the history", st3, 2)
+        # ⚠️ THREE ROWS, NOT TWO. The vanished requisition is MARKED, never deleted, so the
+        # archive can still prove it existed. Two rows are currently on the board.
+        check("the vanished row is kept, not destroyed", st3, 3)
+        _cv = _s3.connect(_d3)
+        check("...and exactly one is marked as gone",
+              _cv.execute("SELECT count(*) FROM board_state "
+                          "WHERE vanished_at IS NOT NULL").fetchone()[0], 1)
+        check("...while the board's current state is two",
+              _cv.execute("SELECT count(*) FROM board_state "
+                          "WHERE vanished_at IS NULL").fetchone()[0], 2)
+        _cv.close()
         check("the vanish is reported out loud", "VANISHED" in n3, True)
         check("only the genuinely new posting reaches triage", cand3, 1)
         c = _s3.connect(_d3); c.row_factory = _s3.Row
@@ -688,10 +698,11 @@ On Wed, Aug 12, 2026 the candidate wrote:
         n4 = _app3.job_scan()
         st4, ch4, _, _ = _counts()
         check("a failed board vanishes nothing", ch4, 2)
-        # 4, not 2: the enabled watch board legitimately contributes its own two rows.
+        # 5, not 4: the enabled watch board contributes two rows, and the requisition that
+        # vanished in the previous step is still present as a marked row rather than gone.
         # Asserted as an absolute rather than "unchanged" so a silent state wipe cannot
         # pass by making both sides zero.
-        check("and its state is left alone", st4, 4)
+        check("and its state is left alone", st4, 5)
         check("the failure is reported", "FAILED" in n4, True)
 
         # ⭐ More boards than one chunk. The concurrent rewrite loops chunks and must sweep
@@ -985,6 +996,84 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # 🚨 A CDN closes the connection at 60 seconds and a full sweep takes about ten minutes.
     # A synchronous endpoint therefore CANNOT answer for scan, and a caller reading the
     # failed request as the verdict marks a healthy sweep as broken. That happened.
+    # ── mass vanishes are held for confirmation ───────────────────────────────────
+    # 🚨 MEASURED, NOT HYPOTHETICAL. On 2026-08-16 greenhouse|infuse had logged 122 vanishes
+    # while serving 374 jobs, and carvana 129 against 1,752. Those boards FLAP, and under the
+    # old code every flap DESTROYED a row. A `200 {"jobs": []}` is indistinguishable from a
+    # real mass delisting, so the first sighting is held and only a SECOND agreeing sweep
+    # confirms it.
+    print("\nmass vanishes are held until a second sweep agrees:")
+    import os as _o5, tempfile as _t5, sqlite3 as _s5, json as _j5
+    import urllib.request as _u5
+    _d5 = str(_t5.mkdtemp()) + "/mass.db"
+    _p5 = _o5.environ.get("DB_PATH"); _o5.environ["DB_PATH"] = _d5
+    _real5 = _u5.urlopen
+    try:
+        _app5 = load_app()
+        _c5 = _s5.connect(_d5)
+        _c5.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+        _c5.execute("CREATE TABLE company (id INTEGER PRIMARY KEY, name TEXT, "
+                    "ats_platform TEXT, ats_token TEXT, api_url TEXT)")
+        _c5.execute("INSERT INTO company (name,ats_platform,ats_token,api_url) "
+                    "VALUES ('Flaky','greenhouse','flaky','https://example.invalid/b')")
+        _c5.commit(); _c5.close()
+
+        def _msweep(jobs):
+            def _f(req, *a, **k):
+                body = _j5.dumps({"jobs": jobs}).encode()
+                class R:
+                    def read(self): return body
+                    def __enter__(self): return self
+                    def __exit__(self, *e): return False
+                return R()
+            _u5.urlopen = _f
+            return _app5.job_scan()
+
+        def _mcount(where):
+            c = _s5.connect(_d5)
+            n = c.execute(f"SELECT count(*) FROM {where}").fetchone()[0]
+            c.close(); return n
+
+        _all = [{"id": i, "title": f"R{i}", "location": {"name": "Remote"}}
+                for i in range(10)]
+        _msweep(_all)                       # seed: 10 requisitions, nothing announced
+        check("seeded with a full board", _mcount("board_state"), 10)
+
+        _n1 = _msweep([])                   # the board returns NOTHING
+        check("a board emptying marks every requisition",
+              _mcount("board_state WHERE vanished_at IS NOT NULL"), 10)
+        check("...and reports NONE of them on the first sweep",
+              _mcount("scan_change WHERE change='vanished'"), 0)
+        check("...but the note says the board returned zero",
+              "returned ZERO" in _n1, True)
+        check("...and that the disappearance is held",
+              "held for confirmation" in _n1, True)
+
+        # It comes back. This is infuse and carvana, and nothing may be lost.
+        _msweep(_all)
+        check("a flapping board self-corrects on reappearance",
+              _mcount("board_state WHERE vanished_at IS NULL"), 10)
+        check("...having never reported a vanish at all",
+              _mcount("scan_change WHERE change='vanished'"), 0)
+
+        # Genuinely gone: empty twice. This is SignalFire, which really does serve zero.
+        _msweep([]); _msweep([])
+        check("a second agreeing sweep confirms the vanish",
+              _mcount("scan_change WHERE change='vanished'"), 10)
+        # ⚠️ THE WHOLE POINT. Confirmed or not, the row survives. A deleted row means no
+        # future sweep can prove the posting ever existed.
+        check("...and every row still exists afterwards", _mcount("board_state"), 10)
+        # ⚠️ A THIRD EMPTY SWEEP MUST SAY NOTHING NEW. Without a separate confirmed marker a
+        # held row and a reported one look identical, and the vanish gets re-announced every
+        # night forever, which trains a reader to ignore the one signal that matters.
+        _msweep([])
+        check("a third sweep does NOT re-report the same vanish",
+              _mcount("scan_change WHERE change='vanished'"), 10)
+    finally:
+        _u5.urlopen = _real5
+        if _p5 is None: _o5.environ.pop("DB_PATH", None)
+        else: _o5.environ["DB_PATH"] = _p5
+
     check("scan is async, because it outlives any request",
           "scan" in app.ASYNC_JOBS, True)
     check("backup too", "backup" in app.ASYNC_JOBS, True)

@@ -313,6 +313,16 @@ MIGRATIONS = [
     "ALTER TABLE scan_candidate ADD COLUMN comp_max INTEGER",
     "ALTER TABLE scan_candidate ADD COLUMN comp_basis TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN comp_evidence TEXT",
+    # 🚨 SOFT DELETE. A vanished requisition is MARKED, never removed. Once the row is gone
+    # no future sweep can prove the posting existed, and that record is the entire reason
+    # the vanish log exists: a posting that dies mid-process is evidence of what was
+    # applied to. Measured cost: 2,504 vanishes against 157,867 rows.
+    "ALTER TABLE board_state ADD COLUMN vanished_at TEXT",
+    # ⚠️ TWO COLUMNS, NOT ONE. vanished_at is "first noticed missing" and is only a
+    # suspicion; vanish_confirmed_at is "a second sweep agreed, and it was reported". With
+    # a single column a held row is indistinguishable from a confirmed one, so it either
+    # never gets reported or gets reported on every sweep forever.
+    "ALTER TABLE board_state ADD COLUMN vanish_confirmed_at TEXT",
 ]
 
 
@@ -1388,6 +1398,11 @@ SCAN_TIMEOUT    = int(os.environ.get("SCAN_TIMEOUT", "45"))
 # the whole sweep is optional. SCAN_CHUNK bounds peak memory, not concurrency.
 SCAN_WORKERS    = int(os.environ.get("SCAN_WORKERS", "12"))
 SCAN_CHUNK      = int(os.environ.get("SCAN_CHUNK", "200"))
+# A board losing this fraction of its requisitions at once is treated as a broken upstream
+# until a second sweep agrees. The floor keeps small boards out of it: two requisitions
+# losing one is 50% and completely normal.
+MASS_VANISH_RATIO = float(os.environ.get("MASS_VANISH_RATIO", "0.5"))
+MASS_VANISH_FLOOR = int(os.environ.get("MASS_VANISH_FLOOR", "5"))
 
 
 
@@ -1628,6 +1643,8 @@ def _job_scan_locked() -> str:
     # to be new AND gated are written, which is a tiny fraction.
     detail: dict = {}
     appeared, vanished, seeded_boards = [], [], []
+    unconfirmed: list = []
+    emptied_boards: list = []
     # ⭐ FETCHED IN CHUNKS, CONCURRENTLY. The scheduler runs jobs sequentially (one
     # asyncio.to_thread at a time), so an hour-long sweep is an hour in which mail
     # classification, auto-tracking, triage and backup do not run. Sequentially, 3,290
@@ -1667,8 +1684,23 @@ def _job_scan_locked() -> str:
             # snapshot every sweep; this reads the previous state, writes only the difference,
             # and leaves an unchanged board completely untouched.
             with db() as con:
+                # ⚠️ Only rows NOT already marked gone count as "was present". Without this
+                # a soft-deleted row would be re-reported as vanishing on every later sweep.
                 was = {r["req_id"]: r["title"] for r in con.execute(
-                    "SELECT req_id, title FROM board_state WHERE board = ?", (key,)).fetchall()}
+                    "SELECT req_id, title FROM board_state "
+                    " WHERE board = ? AND vanished_at IS NULL", (key,)).fetchall()}
+                # Requisitions this board already flagged as gone but never confirmed. A
+                # second sweep that agrees promotes them from suspicion to fact.
+                # Suspected but not yet confirmed: a second agreeing sweep promotes these.
+                held_before = {r["req_id"] for r in con.execute(
+                    "SELECT req_id FROM board_state WHERE board = ? "
+                    "  AND vanished_at IS NOT NULL AND vanish_confirmed_at IS NULL",
+                    (key,)).fetchall()}
+                # Already confirmed and reported. Never report twice.
+                confirmed_before = {r["req_id"] for r in con.execute(
+                    "SELECT req_id FROM board_state WHERE board = ? "
+                    "  AND vanish_confirmed_at IS NOT NULL", (key,)).fetchall()}
+                gone_before = held_before | confirmed_before
                 seeded = con.execute("SELECT 1 s FROM board_seeded WHERE board = ?",
                                      (key,)).fetchone() is not None
                 if not seeded:
@@ -1687,22 +1719,79 @@ def _job_scan_locked() -> str:
                     seeded_boards.append(key)
                     continue
                 new = now_ids - set(was)
-                gone = set(was) - now_ids
+                # 🚨 THE MISSING SET MUST INCLUDE ROWS ALREADY HELD. Once a whole board is
+                # marked, `was` is empty, so a naive `set(was) - now_ids` is empty too and a
+                # held disappearance could NEVER be confirmed. It would sit suspected
+                # forever, which is a silent failure wearing the costume of caution.
+                gone = (set(was) | held_before) - now_ids
+
+                # 🚨 A BOARD LOSING MOST OF ITS REQUISITIONS AT ONCE IS A BROKEN UPSTREAM
+                # UNTIL PROVEN OTHERWISE. Measured on 2026-08-16: greenhouse|infuse had
+                # logged 122 vanishes and was serving 374 jobs; carvana 129 vanishes and
+                # 1,752 jobs. Those boards FLAP. A `200 {"jobs": []}` is indistinguishable
+                # from a genuine mass delisting, and the old code believed it every time.
+                #
+                # ⚠️ A partial return (5 of 87) has the same cause as a total one (0 of 87),
+                # so the rule is proportional rather than a zero check. The floor exists
+                # because a board with two requisitions losing one is 50% and entirely
+                # normal.
+                mass = (len(was) >= MASS_VANISH_FLOOR
+                        and len(gone) >= len(was) * MASS_VANISH_RATIO)
+                emptied = mass and not now_ids
+
                 for pst in reqs:
-                    if pst["req_id"] in new:
-                        con.execute("INSERT INTO board_state (board,req_id,first_seen,last_seen,"
-                                    "title) VALUES (?,?,?,?,?)",
-                                    (key, pst["req_id"], at, at, pst["title"]))
-                        con.execute("INSERT INTO scan_change (at,board,req_id,change,title) "
-                                    "VALUES (?,?,?,'appeared',?)",
-                                    (at, key, pst["req_id"], pst["title"]))
-                        appeared.append(f"{key}:{pst['req_id']}")
+                    rid = pst["req_id"]
+                    if rid not in new:
+                        continue
+                    if rid in gone_before:
+                        # 🚨 BACK FROM THE DEAD, AND NOT A DISCOVERY. Because `was` counts
+                        # only unmarked rows, a soft-deleted requisition looks new. It is not:
+                        # the row still exists, so an INSERT here fails the primary key, which
+                        # is how this was found. Clear the mark instead.
+                        #
+                        # 📌 Deliberately silent. This is the flapping-board case (infuse,
+                        # carvana) and announcing it would just move the noise from the
+                        # vanish column to the appeared column. scan_change still holds the
+                        # history if the disappearance was ever confirmed.
+                        con.execute("UPDATE board_state SET vanished_at = NULL, "
+                                    "vanish_confirmed_at = NULL, last_seen = ?, title = ? "
+                                    "WHERE board = ? AND req_id = ?",
+                                    (at, pst["title"], key, rid))
+                        continue
+                    con.execute("INSERT INTO board_state (board,req_id,first_seen,"
+                                "last_seen,title) VALUES (?,?,?,?,?)",
+                                (key, rid, at, at, pst["title"]))
+                    con.execute("INSERT INTO scan_change (at,board,req_id,change,title) "
+                                "VALUES (?,?,?,'appeared',?)", (at, key, rid, pst["title"]))
+                    appeared.append(f"{key}:{rid}")
+
                 for rid in sorted(gone):
-                    con.execute("DELETE FROM board_state WHERE board = ? AND req_id = ?",
-                                (key, rid))
+                    if rid in confirmed_before:
+                        continue          # already reported; nothing new to say
+                    if mass and rid not in held_before:
+                        # First sighting of a mass disappearance. Record it, do NOT report
+                        # it, and wait for the next sweep to agree. infuse and carvana never
+                        # agree twice; a genuinely emptied board does.
+                        con.execute("UPDATE board_state SET vanished_at = ? "
+                                    "WHERE board = ? AND req_id = ? AND vanished_at IS NULL",
+                                    (at, key, rid))
+                        unconfirmed.append(f"{key}:{rid}")
+                        continue
+                    # 🚨 SOFT DELETE, ALWAYS. The row is never destroyed. Once a requisition
+                    # is deleted no future sweep can prove it existed, and that record is the
+                    # whole reason the vanish log exists: a posting that dies mid-process is
+                    # evidence. Growth is negligible: 2,504 vanishes against 157,867 rows.
+                    con.execute("UPDATE board_state SET vanished_at = COALESCE(vanished_at, ?), "
+                                "vanish_confirmed_at = ? WHERE board = ? AND req_id = ?",
+                                (at, at, key, rid))
                     con.execute("INSERT INTO scan_change (at,board,req_id,change,title) "
                                 "VALUES (?,?,?,'vanished',?)", (at, key, rid, was.get(rid)))
                     vanished.append(f"{key}:{rid}")
+
+                if emptied:
+                    # Its own signal, because "many to zero" is the exact shape of an
+                    # upstream failure and it should be visible without reading counts.
+                    emptied_boards.append(f"{key} ({len(was)})")
                 # One statement to record that everything still present was still present. No
                 # row is written for it; last_seen is what makes "seen recently" answerable
                 # without a row per sighting.
@@ -1713,6 +1802,14 @@ def _job_scan_locked() -> str:
                         (at, key, *sorted(now_ids)))
 
     note = f"swept {swept}/{len(boards)} boards"
+    if emptied_boards:
+        # 🚨 Loudest signal in the note. A board going from many to zero is what a broken
+        # upstream looks like, and it is the one case worth a human glance.
+        note += (f"; 🚨 {len(emptied_boards)} board(s) returned ZERO after having "
+                 f"requisitions: " + ", ".join(emptied_boards[:4]))
+    if unconfirmed:
+        note += (f"; {len(unconfirmed)} mass disappearance(s) held for confirmation "
+                 f"(not reported until a second sweep agrees)")
     if failed:
         note += f"; FAILED {len(failed)}: " + "; ".join(failed[:4])
     if vanished:
