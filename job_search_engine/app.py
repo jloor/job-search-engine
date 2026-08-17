@@ -3087,6 +3087,8 @@ def resolve_office(company: str, location: str) -> dict:
     if not GOOGLE_MAPS_KEY:
         return {"status": "no_key"}
     import urllib.error, urllib.request
+    if not _target_city(location):
+        return {"status": "location_too_vague", "wanted": location}
     q = f"{company} office {location}"
     req = urllib.request.Request(
         TEXTSEARCH_API, json.dumps({"textQuery": q, "maxResultCount": 5}).encode(),
@@ -3110,6 +3112,17 @@ def resolve_office(company: str, location: str) -> dict:
                 "place_id": p.get("id", "")} for p in raw]
 
     want_state, want_city = _target_state(location), _target_city(location)
+    # 🚨 NO CITY MEANS NO LOOKUP. A state-level location like "New Jersey, United States"
+    # yields no city, and the city check then silently degrades to a state check, which the
+    # comment on _target_city says is not a check at all. Measured on the first production
+    # run: board token "kong" against "New Jersey, United States" resolved to the "Law
+    # Offices of Nelson Kong, P.C" in Fort Lee, and flipped that posting's verdict from
+    # too_far to commutable at 29 minutes. Right state, right token, wrong company, wrong
+    # answer, and confident about it.
+    #
+    # ⚠️ Refusing BEFORE the request also means a vague location costs nothing.
+    if not want_city:
+        return {"status": "location_too_vague", "wanted": location}
 
     def in_right_place(r_):
         a = r_["address"]

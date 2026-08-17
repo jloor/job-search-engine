@@ -1366,6 +1366,20 @@ On Wed, Aug 12, 2026 the candidate wrote:
             _places({"places": [_mk("Nashville, TN, USA", "Acmesoft")]})
             check("an address with no street number is refused",
                   _app7.resolve_office("acmesoft", "Nashville, TN")["status"], "not_street_level")
+            # 🚨 THE ONE THAT ESCAPED. A state-level location has no city, so the city
+            # check degrades to a state check. On the first production run the token "kong"
+            # against "New Jersey, United States" resolved to "Law Offices of Nelson Kong,
+            # P.C" and flipped a verdict from too_far to commutable. Refused before the
+            # request now, so a vague location also costs nothing.
+            _blew_up = {"called": False}
+            def _boom(*a, **k):
+                _blew_up["called"] = True
+                raise AssertionError("a vague location must not reach the API")
+            _ureq.urlopen = _boom
+            check("a state-level location is refused outright",
+                  _app7.resolve_office("kong", "New Jersey, United States")["status"],
+                  "location_too_vague")
+            check("...without spending a request", _blew_up["called"], False)
             _places({"places": []})
             check("no results is reported, not guessed",
                   _app7.resolve_office("acmesoft", "Nashville, TN")["status"], "no_match")
