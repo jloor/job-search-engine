@@ -2621,6 +2621,17 @@ _JOB_LOCKS: dict = {}
 _JOB_LOCKS_GUARD = threading.Lock()
 
 
+# When each currently-running job started. Set under its lock, cleared in the finally.
+#
+# 🚨 WHY THIS EXISTS. run_once takes a non-blocking lock with NO TIMEOUT, so a job that wedges
+# holds its lock forever and every later attempt answers "skipped: <name> is already running".
+# That is also the correct, healthy answer while a long job is legitimately mid-run, so a
+# permanently stuck job and a busy one are indistinguishable from the outside. /diag/jobs could
+# only ever call it stale, which says nothing about why. A start time lets it say "running for
+# 4 hours", which is the difference between a puzzle and a diagnosis.
+_JOB_STARTED: dict = {}
+
+
 def run_once(name: str, fn) -> str:
     """Run a job unless it is already running. Declines rather than queues."""
     with _JOB_LOCKS_GUARD:
@@ -2629,9 +2640,13 @@ def run_once(name: str, fn) -> str:
         # Declined, not queued. A second run that waits would act on state the first just
         # changed and answer a question it did not start with.
         return f"skipped: {name} is already running"
+    with _JOB_LOCKS_GUARD:
+        _JOB_STARTED[name] = time.time()
     try:
         return fn()
     finally:
+        with _JOB_LOCKS_GUARD:
+            _JOB_STARTED.pop(name, None)
         lock.release()
 
 
@@ -3135,7 +3150,7 @@ def diag_jobs(request: Request, authorization: str | None = Header(None)):
     """
     require_admin(authorization, request)
     uptime = time.time() - BOOTED_AT
-    jobs, stale = [], []
+    jobs, stale, stuck = [], [], []
     with db() as con:
         for name, interval, _fn in job_table():
             last_ok = con.execute("SELECT max(at) a FROM event WHERE kind=?",
@@ -3158,15 +3173,131 @@ def diag_jobs(request: Request, authorization: str | None = Header(None)):
             # to have been due, otherwise every deploy alarms on the 24-hour jobs.
             limit = interval * STALE_FACTOR
             is_stale = (age is None and uptime > limit) or (age is not None and age > limit)
-            if is_stale:
+            # ⚠️ STUCK IS NOT STALE, and it is the more urgent of the two. A wedged job holds
+            # its lock forever, so it never records a success, and staleness alone would blame
+            # the schedule when the real answer is "it started four hours ago and never
+            # returned". A job legitimately mid-run is not stuck until it outlives its window.
+            started = _JOB_STARTED.get(name)
+            running_for = int(time.time() - started) if started else None
+            is_stuck = running_for is not None and running_for > limit
+            if is_stuck:
+                stuck.append(name)
+            elif is_stale:
                 stale.append(name)
             jobs.append({"job": name, "interval_s": interval, "last_ok": last_ok,
                          "age_s": age, "last_error": last_err, "error_age_s": _age(last_err),
-                         "stale": is_stale})
-    # `ok` is the single field a monitor should read. It is false when ANY job is stale,
-    # because one dead job and eight dead jobs are both something a human must look at.
+                         "running_for_s": running_for, "stuck": is_stuck,
+                         "stale": is_stale and not is_stuck})
+    # `ok` is the single field a monitor should read. It is false when ANY job is stale or
+    # stuck, because one dead job and eight dead jobs are both something a human must look at.
     return {"at": now(), "version": ENGINE_VERSION, "uptime_s": int(uptime),
-            "stale_factor": STALE_FACTOR, "ok": not stale, "stale": stale, "jobs": jobs}
+            "stale_factor": STALE_FACTOR, "ok": not (stale or stuck),
+            "stale": stale, "stuck": stuck, "jobs": jobs}
+
+
+@app.get("/diag/config")
+def diag_config(request: Request, authorization: str | None = Header(None)):
+    """
+    Fingerprints of the configuration THIS PROCESS is actually using.
+
+    🚨 WHY. On 2026-08-17 the deployment API accepted a new STORAGE_KEY, reported it stored,
+    and a 43-minute-old container went on serving with the OLD value in its environment.
+    /health was green throughout. Nothing anywhere could compare "what the platform says is
+    configured" against "what the running process holds", so a half-applied change was
+    invisible. The same shape produced the v0.7.0 dependency outage and the version number
+    that no route reported.
+
+    ⭐ FINGERPRINTS, NOT VALUES. A sha256 prefix answers "is this the same string I just
+    deployed?" and is useless to anyone who intercepts it. Comparing is the whole job.
+
+    ⚠️ `unset` and set-but-empty are reported differently on purpose. Several jobs decline
+    politely when their key is empty, and that decline reads as "nothing to do".
+    """
+    require_admin(authorization, request)
+
+    def fp(v):
+        if v is None:
+            return "unset"
+        if v == "":
+            return "empty"
+        return "sha256:" + hashlib.sha256(v.encode()).hexdigest()[:12]
+
+    # Secrets are fingerprinted. Non-secret settings are shown outright, because their VALUE
+    # is what you need when the question is "why did this job decline".
+    secret = ["BUNNY_DATABASE_AUTH_TOKEN", "ADMIN_TOKEN", "READ_TOKEN", "API_TOKEN",
+              "INBOUND_TOKEN", "APPROVAL_PUBKEY", "BACKUP_PUBKEY", "SMTP_PASS",
+              "STORAGE_KEY", "GIT_DEPLOY_KEY_B64", "ANTHROPIC_API_KEY", "AI_API_KEY",
+              "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GOOGLE_MAPS_API_KEY", "RESEND_API_KEY"]
+    plain = ["MAIL_DOMAIN", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "STORAGE_ZONE",
+             "STORAGE_HOST", "AI_PROVIDER", "AI_MODEL", "AI_BASE_URL", "AI_READ_ENABLED",
+             "AI_READ_SCOPE", "TRUSTED_PROXY_HOPS", "GIT_REPO_SSH", "GIT_AUTHOR_EMAIL",
+             "RESTART_MARKER", "ALLOW_INBOUND_IPS", "DATA_DIR", "APPLICATIONS_DIR"]
+    return {
+        "at": now(), "version": ENGINE_VERSION, "uptime_s": int(time.time() - BOOTED_AT),
+        "secrets": {k: fp(os.environ.get(k)) for k in secret},
+        "settings": {k: os.environ.get(k, "(unset)") for k in plain},
+        # The database HOST, never the token. This is what proves a repoint actually landed.
+        "database_host": (BUNNY_DB_URL or DB_PATH).split("//")[-1].split("/")[0],
+        "inbound_tokens_configured": len(INBOUND_TOKENS),
+        "jobs_registered": [n for n, _, _ in job_table()],
+    }
+
+
+@app.get("/diag/ai")
+def diag_ai(request: Request, authorization: str | None = Header(None), live: bool = False):
+    """
+    Whether the model this deployment is configured for can actually be reached.
+
+    🚨 WHY THIS IS NOT OPTIONAL. job_triage, job_remote_check and job_comp answer
+    "nothing to triage" / "nothing to check" / "nothing to extract" when there is no work,
+    and every check treats that as success. An expired key, a dead endpoint, a renamed model
+    or an exhausted quota produce EXACTLY those strings, because the jobs return before they
+    call anything. The paid path can be broken for weeks while every light stays green. It is
+    the same shape as the backup job that had not run for a day: silence read as health.
+
+    ⚠️ `?live=true` SPENDS MONEY. It sends a few tokens through the real provider, with the
+    real key and the real schema, which is the only thing that proves the whole path. Without
+    it this reports configuration only, and configuration cannot tell a valid key from a
+    revoked one.
+    """
+    require_admin(authorization, request)
+    need = ("ANTHROPIC_API_KEY",) if AI_PROVIDER == "anthropic" else (
+        "AI_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY")
+    have = [k for k in need if os.environ.get(k, "").strip()]
+    out: dict = {"at": now(), "provider": AI_PROVIDER, "model": AI_MODEL,
+                 "base_url": AI_BASE_URL if AI_PROVIDER == "openai_compat" else None,
+                 "read_enabled": AI_READ_ENABLED,
+                 "key_names_checked": list(need), "key_present": bool(have),
+                 "live_called": False}
+    if not have:
+        out["result"] = "NO KEY CONFIGURED — every AI job will decline and report 'skipped'"
+        return out
+    if not live:
+        out["result"] = "configured; pass ?live=true to actually call the model"
+        return out
+
+    t0 = time.time()
+    try:
+        # The real entry point with a synthetic message, so this exercises the provider
+        # dispatch, the key, the schema contract and the JSON extraction, rather than a
+        # simplified imitation that could pass while the real path fails.
+        r = ai_read_message("Interview scheduling",
+                            "Hi, are you free Tuesday at 10am to talk about the role?",
+                            to_alias="diag@" + (MAIL_DOMAIN or "example.com"))
+        out.update(live_called=True, ok=True, elapsed_ms=int((time.time() - t0) * 1000),
+                   label=r.get("label"), usage=r.get("_usage"),
+                   result="the configured model answered and its reply parsed")
+    except Exception as e:                                        # noqa: BLE001
+        out.update(live_called=True, ok=False, elapsed_ms=int((time.time() - t0) * 1000),
+                   error_type=type(e).__name__, error=str(e)[:300],
+                   result="THE AI PATH IS BROKEN — jobs will keep reporting 'nothing to do'")
+    try:
+        with db() as con:
+            log_event(con, "diag_ai", json.dumps(
+                {k: v for k, v in out.items() if k != "usage"})[:2000])
+    except Exception:                                             # noqa: BLE001
+        pass
+    return out
 
 
 @app.get("/admin/backups")

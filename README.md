@@ -218,6 +218,43 @@ and the silence looks exactly like a quiet night.
   deploy and would call a container that has run nothing for a week perfectly healthy.
 - A freshly booted container does not alarm on jobs that were never due. That is why
   `uptime_s` is in the response.
+- ⚠️ **`stuck` is not `stale`, and it is the more urgent of the two.** `run_once` takes a
+  non-blocking lock with no timeout, so a wedged job holds it forever and answers
+  `skipped: <name> is already running` to everything — which is also the correct answer while
+  a long job is legitimately mid-run. `running_for_s` is what separates them.
+
+### Is the configuration I deployed the configuration that is running
+
+```bash
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" https://<host>/diag/config | python3 -m json.tool
+```
+
+🚨 **This exists because a deploy can half-apply and nothing notices.** On 2026-08-17 the
+platform API accepted a new `STORAGE_KEY`, reported it stored, and a 43-minute-old container
+kept the old value in its environment. `/health` was green the whole time.
+
+- Secrets come back as `sha256:<12 hex>`, never as values. Comparing is the whole job.
+- ⚠️ `unset` and `empty` are reported separately. Several jobs decline politely on an empty
+  key, and that decline reads as "nothing to do".
+- `database_host` is the host only, never the token. It is what proves a repoint landed.
+- ⚠️ **A Magic Containers env PATCH does not reliably restart the pod.** Bump `RESTART_MARKER`,
+  then confirm `uptime_s` actually dropped before believing any config change took effect.
+
+### Can the model actually be reached
+
+```bash
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" "https://<host>/diag/ai"             # config only
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" "https://<host>/diag/ai?live=true"   # SPENDS MONEY
+```
+
+🚨 **`triage`, `remote_check` and `comp` all return `nothing to …` when there is no work, and
+an expired key, a dead endpoint, a renamed model or an exhausted quota produce exactly those
+same strings** — the jobs return before they call anything. The paid path can therefore be
+broken for weeks while every green light stays green.
+
+`?live=true` sends a few tokens through the real provider with the real key and the real
+schema, which is the only thing that distinguishes a valid key from a revoked one. The result
+is written to the `event` table as `diag_ai`.
 
 ## Sending: two paths, and when to use each
 

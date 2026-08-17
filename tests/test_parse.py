@@ -1494,6 +1494,85 @@ On Wed, Aug 12, 2026 the candidate wrote:
         check("...but its last error is reported beside its last success",
               bool(_brow9["last_error"]), True)
 
+        # Case 6: 🚨 STUCK IS NOT STALE. A wedged job holds its lock forever, never records a
+        # success, and answers "skipped: already running" to every later attempt — which is
+        # also the correct answer while a long job is legitimately mid-run. Staleness alone
+        # would blame the schedule; the start time is what turns it into a diagnosis.
+        _app9._JOB_STARTED["scan"] = _tm9.time() - 30
+        _r9f = _app9.diag_jobs(_Req9(), "Bearer admin-tok")
+        _srow = next(j for j in _r9f["jobs"] if j["job"] == "scan")
+        check("a job mid-run reports how long it has been running",
+              20 <= (_srow["running_for_s"] or 0) <= 90, True)
+        check("...and is NOT called stuck while inside its window", _srow["stuck"], False)
+
+        _app9._JOB_STARTED["scan"] = _tm9.time() - (_iv9["scan"] * _app9.STALE_FACTOR + 600)
+        _r9g = _app9.diag_jobs(_Req9(), "Bearer admin-tok")
+        _srow = next(j for j in _r9g["jobs"] if j["job"] == "scan")
+        check("a job running past its window is stuck", _srow["stuck"], True)
+        check("...and is reported as stuck, not merely stale", _srow["stale"], False)
+        check("...it appears in the stuck list", "scan" in _r9g["stuck"], True)
+        check("...and ok is false", _r9g["ok"], False)
+        _app9._JOB_STARTED.clear()
+        check("a job that finished reports no running time",
+              next(j for j in _app9.diag_jobs(_Req9(), "Bearer admin-tok")["jobs"]
+                   if j["job"] == "scan")["running_for_s"], None)
+
+        # ── /diag/config: what the PROCESS holds, not what the platform stored ────
+        # 🚨 On 2026-08-17 the deployment API accepted a new STORAGE_KEY, reported it stored,
+        # and a 43-minute-old container kept the old value in its environment while /health
+        # stayed green. Nothing could compare the two. Now something can.
+        _o9.environ["SMTP_PASS"] = "a-secret-value"
+        _o9.environ["AI_MODEL"] = "some-model"
+        _o9.environ.pop("RESEND_API_KEY", None)
+        _appc = load_app()
+        _appc.ADMIN_TOKEN, _appc.READ_TOKEN = "admin-tok", "read-tok"
+        _appc.TRUSTED_PROXY_HOPS = 0
+        _cfg9 = _appc.diag_config(_Req9(), "Bearer admin-tok")
+        _fp = _cfg9["secrets"]["SMTP_PASS"]
+        check("a secret is fingerprinted, never returned",
+              _fp.startswith("sha256:") and "a-secret-value" not in _j8.dumps(_cfg9), True)
+        check("...and the fingerprint is stable for the same value",
+              _fp, "sha256:" + __import__("hashlib").sha256(b"a-secret-value").hexdigest()[:12])
+        # ⚠️ unset and empty must not look alike: a job that declines on an empty key reports
+        # "nothing to do", which is the exact ambiguity this endpoint exists to remove.
+        check("an unset secret says so", _cfg9["secrets"]["RESEND_API_KEY"], "unset")
+        _o9.environ["RESEND_API_KEY"] = ""
+        _appe = load_app(); _appe.ADMIN_TOKEN = "admin-tok"; _appe.TRUSTED_PROXY_HOPS = 0
+        check("...and an EMPTY one is distinguishable from unset",
+              _appe.diag_config(_Req9(), "Bearer admin-tok")["secrets"]["RESEND_API_KEY"],
+              "empty")
+        check("a non-secret setting is shown outright", _cfg9["settings"]["AI_MODEL"], "some-model")
+        check("the registered jobs are listed", _cfg9["jobs_registered"], _names9)
+        check("no secret VALUE appears anywhere in the response",
+              "a-secret-value" in _j8.dumps(_cfg9), False)
+        try:
+            _appc.diag_config(_Req9(), "Bearer read-tok")
+            check("a read token cannot read the config", "allowed", "refused")
+        except Exception as _e9:
+            check("a read token cannot read the config", getattr(_e9, "code", 0), 403)
+
+        # ── /diag/ai: prove the paid path, because "nothing to do" hides a dead key ───
+        # 🚨 triage / remote_check / comp all return "nothing to X" when there is no work, and
+        # an expired key produces the identical string. Without this the paid path can be dead
+        # for weeks behind green checks.
+        for _k in ("ANTHROPIC_API_KEY", "AI_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
+            _o9.environ.pop(_k, None)
+        _appa = load_app(); _appa.ADMIN_TOKEN = "admin-tok"; _appa.TRUSTED_PROXY_HOPS = 0
+        _ai0 = _appa.diag_ai(_Req9(), "Bearer admin-tok")
+        check("with no key it says so plainly", _ai0["key_present"], False)
+        check("...and does not pretend to have called anything", _ai0["live_called"], False)
+        check("...and names which variables it looked at",
+              bool(_ai0["key_names_checked"]), True)
+        _o9.environ["ANTHROPIC_API_KEY"] = "sk-not-a-real-key"
+        _o9.environ["AI_PROVIDER"] = "anthropic"
+        _appa = load_app(); _appa.ADMIN_TOKEN = "admin-tok"; _appa.TRUSTED_PROXY_HOPS = 0
+        _ai1 = _appa.diag_ai(_Req9(), "Bearer admin-tok")
+        check("a present key alone is NOT proof of reachability", _ai1["live_called"], False)
+        check("...it says a live call is what would prove it",
+              "live=true" in _ai1["result"], True)
+        check("the key value never appears in the response",
+              "sk-not-a-real-key" in _j8.dumps(_ai1), False)
+
         # A read token is not an admin token. This route names every job and its schedule.
         try:
             _app9.diag_jobs(_Req9(), "Bearer read-tok")
