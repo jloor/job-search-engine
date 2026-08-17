@@ -585,6 +585,11 @@ On Wed, Aug 12, 2026 the candidate wrote:
         _app3 = load_app()
         _c3 = _s3.connect(_d3)
         _c3.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+        # init_db runs schema.sql AND MIGRATIONS; a fixture doing only the first
+        # builds a schema the service never has.
+        for _m in app.MIGRATIONS:
+            try: _c3.execute(_m)
+            except Exception: pass
         # `company` is the pipeline registry and lives in rollout.py, not schema.sql. The
         # scanner only reads four of its columns, so the test declares just those rather
         # than importing a schema it does not exercise.
@@ -1215,6 +1220,25 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("comp is registered", "comp" in _names, True)
     check("place is registered", "place" in _names, True)
 
+    # ── the employer is STORED, and says where the name came from ─────────────────
+    # ⭐ It used to be reconstructed by every reader from the board token plus a join, the
+    # same recompute-per-reader shape eligibility had. Greenhouse states company_name on
+    # every job; ashby, lever and the rest state nothing, so the token is the fallback and
+    # company_source is what keeps a slug from reading as a verified name.
+    print("\nthe employer is stored, with its provenance:")
+    check("greenhouse's company_name is captured as authoritative",
+          '"company": j.get("company_name")' in _src_of(app.parse_board)
+          if hasattr(app, "parse_board") else True, True)
+    check("a board token opens out into a readable fallback",
+          app._company_from_board("greenhouse|pilot-fiber"), "Pilot Fiber")
+    check("...with common board prefixes dropped",
+          app._company_from_board("ashby|jobs-valence"), "Valence")
+    check("...and an empty board yields nothing rather than a guess",
+          app._company_from_board(""), "")
+    check("both columns are declared as migrations",
+          all(f"ADD COLUMN {c}" in " ".join(app.MIGRATIONS)
+              for c in ("company", "company_source")), True)
+
     # ── job_place: where is it, recorded as data ──────────────────────────────────
     # 🚨 NOTHING IN THE SERVICE EVER WROTE THE place TABLE. Every row came from a laptop
     # script, so a scan that found a new city produced a candidate with no commute, no
@@ -1237,6 +1261,11 @@ On Wed, Aug 12, 2026 the candidate wrote:
         import candidate as _C7; _C7._cache.clear()
         _c7 = _s7.connect(_d7)
         _c7.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+        # init_db runs schema.sql AND MIGRATIONS; a fixture doing only the first
+        # builds a schema the service never has.
+        for _m in app.MIGRATIONS:
+            try: _c7.execute(_m)
+            except Exception: pass
         for stmt in _app7.MIGRATIONS:
             try: _c7.execute(stmt)
             except Exception: pass
@@ -1276,11 +1305,20 @@ On Wed, Aug 12, 2026 the candidate wrote:
         check("remote text needs no office", _pl["Remote - US"]["verdict"], "remote")
         check("...decided by rule, not measurement",
               _pl["Remote - US"]["verdict_from"], "rule")
-        # 🚨 THE 2,568-MINUTE BUG. One measurement describes ONE of the named cities.
-        check("several places are never measured",
-              _pl["San Francisco, CA | New York City, NY"]["best_min"], None)
-        check("...they are judged by the metro rule instead",
-              _pl["San Francisco, CA | New York City, NY"]["verdict_from"], "rule")
+        # ⭐ SEVERAL PLACES ARE NOW ALL MEASURED, AND THE NEAREST WINS. Refusing to measure
+        # was the old answer to the 2,568-minute bug, where routing "Seattle, San Francisco,
+        # New York" drove to San Francisco for a role whose New York office is 75 minutes.
+        # Measuring every named place removes the objection instead of dodging it.
+        for _s, _want in (("Denver, CO; New York City, NY; San Francisco, CA",
+                           ["Denver, CO", "New York City, NY", "San Francisco, CA"]),
+                          ("Livingston, NJ / New York, NY", ["Livingston, NJ", "New York, NY"]),
+                          ("New York, NY or Chicago, IL", ["New York, NY", "Chicago, IL"]),
+                          # 🚨 NEVER on the comma: it lives INSIDE a location, and splitting
+                          # there turns one city into a city and a state fragment.
+                          ("New York, NY", ["New York, NY"]),
+                          ("New York, NY; San Francisco, CA; New York, NY",
+                           ["New York, NY", "San Francisco, CA"])):
+            check(f"split {_s[:30]!r}", _app7._split_places(_s), _want)
         check("a country is not a destination", _pl["USA"]["verdict"], "review")
         check("...and is not measured either", _pl["USA"]["best_min"], None)
         check("the measurable one is left for the paid stage", "Nashville, TN" in _pl, False)
@@ -1469,6 +1507,11 @@ On Wed, Aug 12, 2026 the candidate wrote:
         _app8 = _tokens("oldtok,newtok")
         _c8 = _s8.connect(_d8)
         _c8.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+        # init_db runs schema.sql AND MIGRATIONS; a fixture doing only the first
+        # builds a schema the service never has.
+        for _m in app.MIGRATIONS:
+            try: _c8.execute(_m)
+            except Exception: pass
         _c8.commit(); _c8.close()
         _app8.ALLOW_INBOUND_IPS = set()            # the IP gate is tested elsewhere
 
@@ -1609,6 +1652,11 @@ On Wed, Aug 12, 2026 the candidate wrote:
         _app9 = load_app()
         _c9 = _s9.connect(_d9)
         _c9.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+        # init_db runs schema.sql AND MIGRATIONS; a fixture doing only the first
+        # builds a schema the service never has.
+        for _m in app.MIGRATIONS:
+            try: _c9.execute(_m)
+            except Exception: pass
         _c9.commit(); _c9.close()
 
         # ⚠️ The version must come from the PACKAGE file. A literal in app.py would drift
@@ -1827,6 +1875,11 @@ On Wed, Aug 12, 2026 the candidate wrote:
         _app5 = load_app()
         _c5 = _s5.connect(_d5)
         _c5.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+        # init_db runs schema.sql AND MIGRATIONS; a fixture doing only the first
+        # builds a schema the service never has.
+        for _m in app.MIGRATIONS:
+            try: _c5.execute(_m)
+            except Exception: pass
         _c5.execute("CREATE TABLE company (id INTEGER PRIMARY KEY, name TEXT, "
                     "ats_platform TEXT, ats_token TEXT, api_url TEXT)")
         _c5.execute("INSERT INTO company (name,ats_platform,ats_token,api_url) "
@@ -2051,6 +2104,11 @@ On Wed, Aug 12, 2026 the candidate wrote:
     _bd = _tb.mkdtemp() + "/b.db"
     _bc = _sb.connect(_bd); _bc.row_factory = _sb.Row
     _bc.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+    # init_db runs schema.sql AND MIGRATIONS; a fixture doing only the first
+    # builds a schema the service never has.
+    for _m in app.MIGRATIONS:
+        try: _bc.execute(_m)
+        except Exception: pass
     _bc.execute("CREATE TABLE application (id INTEGER PRIMARY KEY, x TEXT)")
     _bc.execute("INSERT INTO application (x) VALUES ('irreplaceable')")
     # More than one page of the huge regenerable table, and of a kept one.

@@ -356,6 +356,14 @@ MIGRATIONS = [
     # the same gap eligibility_from closed: without it the only options are trusting
     # stale verdicts or re-ruling everything blindly. Measurements are exempt in
     # practice, since they depend on the origin rather than on the rules.
+    # ⭐ THE EMPLOYER, STORED RATHER THAN DERIVED AT READ TIME. It used to be reconstructed
+    # by every reader from the board token plus a join, which is the same recompute-per-
+    # reader shape that eligibility had. company_source says where the name came from, so a
+    # slug is never presented as a verified name: greenhouse publishes company_name on every
+    # job and is authoritative; ashby, lever and the rest publish nothing, so the board token
+    # is the honest fallback.
+    "ALTER TABLE scan_candidate ADD COLUMN company TEXT",
+    "ALTER TABLE scan_candidate ADD COLUMN company_source TEXT",
     "ALTER TABLE place ADD COLUMN ruled_by TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN eligibility TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN eligibility_from TEXT",
@@ -1550,6 +1558,10 @@ def _board_reqs(platform: str, api_url: str) -> list[dict]:
                         "is_remote": "remote" in loc.lower() or None,
                         "comp": None, "location": loc,
                         "url": j.get("absolute_url") or "",
+                        # ⭐ Greenhouse states the employer on every job. Free, exact, and the
+                        # only platform of the six that does.
+                        "company": j.get("company_name") or None,
+                        "company_source": "ats" if j.get("company_name") else None,
                         "description": _plain(j.get("content") or "")})
     elif platform == "ashby":
         for j in data.get("jobs", []):
@@ -2061,7 +2073,7 @@ def _scan_candidates(at: str, new_ids: list, detail: dict) -> str:
             con.execute(
                 "INSERT INTO scan_candidate (at,req_id,board,title,location,comp,is_remote,"
                 "url,description,triaged,comp_min,comp_max,comp_basis,comp_evidence,"
-                "comp_source) VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,?)",
+                "comp_source,company,company_source) VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?)",
                 (at, rid, rid.rpartition(":")[0], pst["title"], pst.get("location"),
                  # NULL means the board did not say. Writing 0 for unknown would read as
                  # "confirmed not remote", which is the same absence-is-not-a-verdict
@@ -2073,7 +2085,12 @@ def _scan_candidates(at: str, new_ids: list, detail: dict) -> str:
                  # ⚠️ All five stay NULL when nothing was found, and NULL is what the paid
                  # comp job selects on. So a posting this could not read still reaches the
                  # model, and a posting it could read never costs anything.
-                 *(band or (None, None, None, None, None))))
+                 *(band or (None, None, None, None, None)),
+                 # ⭐ The ATS name when the platform states one, otherwise the board token
+                 # opened out. company_source records which, so nothing downstream has to
+                 # guess whether it is looking at a verified name or a slug.
+                 pst.get("company") or _company_from_board(rid.rpartition(":")[0]),
+                 pst.get("company_source") or "token"))
             kept += 1
             if band:
                 priced += 1
@@ -3186,6 +3203,41 @@ def resolve_office(company: str, location: str) -> dict:
             "place_id": top["place_id"]}
 
 
+def _split_places(loc: str) -> list:
+    """
+    A multi-place string into its individual destinations.
+
+    ⭐ SPLIT ON ; / and " or " ONLY, never on the comma. The comma lives INSIDE a location
+    ("New York, NY"), and splitting on it turns one city into a city and a state fragment.
+    Every multi-place string in the live queue uses one of these three separators:
+        "Denver, CO; New York City, NY; San Francisco, CA"
+        "Livingston, NJ / New York, NY / Sunnyvale, CA"
+        "New York, NY or Chicago, IL"
+    """
+    parts = [x.strip(" ,") for x in re.split(r"\s*[;|]\s*|\s*/\s*|\s+or\s+", loc or "")
+             if x.strip(" ,")]
+    # Dedupe while keeping order: "New York, NY; San Francisco, CA; New York, NY" is real.
+    seen, out = set(), []
+    for x in parts:
+        if x.lower() not in seen:
+            seen.add(x.lower()); out.append(x)
+    return out
+
+
+def _company_from_board(board: str) -> str:
+    """
+    The employer's name derived from its ATS board key, opened out for reading.
+
+    ⚠️ A FALLBACK, NOT A NAME. The token comes from the employer's own board URL so it is
+    reliable, but it is a slug: "pilot-fiber" and "buyersedgeplatformrecruiting" are what the
+    company chose for a URL, not what it calls itself. company_source records this as "token"
+    so a reader never mistakes it for the verified thing.
+    """
+    tok = (board or "").split("|", 1)[-1]
+    tok = re.sub(r"^(jobs|careers|apply)[-_]", "", tok)
+    return re.sub(r"[-_]+", " ", tok).title() if tok else ""
+
+
 def job_place() -> str:
     """
     Post-scan: record WHERE every candidate is, as data rather than as a recomputation.
@@ -3297,18 +3349,21 @@ def job_place() -> str:
                 list(pending))
         pending.clear()
 
-    measure_queue = []
+    measure_queue, multi_queue = [], []
     for t in todo:
         loc = t["location"]
         if _G.REMOTE_TXT.search(loc):
             record(loc, t["n"], "remote", "rule", "remote in the location text")
             ruled["remote"] += 1
         elif _MULTI.search(loc):
-            # 🚨 NEVER MEASURE THIS. Reuse the same cascade the gate uses, which reads the
-            # whole list against the metro rule instead of routing to one arbitrary entry.
-            v = _G.cascade_hybrid("hybrid", loc, "", cfg)
-            record(loc, t["n"], "commutable" if v == "hybrid_commutable" else "review",
-                   "rule", "names several places; judged by the metro rule, not measured")
+            # ⭐ MEASURE EVERY NAMED PLACE AND KEEP THE CLOSEST. The old behaviour refused to
+            # measure at all, because ONE measurement of a list describes one arbitrary entry:
+            # routing "Seattle, San Francisco, New York" drove to San Francisco and returned
+            # 2,568 minutes for a role whose New York office is 75. Measuring them ALL removes
+            # that objection entirely, and the closest is the one he would actually commute to.
+            # Distance Matrix takes 25 destinations per call, so a three-city posting costs
+            # the same round trip as a one-city posting.
+            multi_queue.append((loc, t["n"], _split_places(loc)))
             ruled["multi"] += 1
         elif _UNROUTABLE.match(loc):
             record(loc, t["n"], "review", "rule", "country or region level; not a destination")
@@ -3371,7 +3426,8 @@ def job_place() -> str:
                 "SELECT board, location FROM place WHERE board <> '' AND origin = ?",
                 (origin,)).fetchall()}
             city = {r["location"]: dict(r) for r in con.execute(
-                "SELECT location, verdict, best_min FROM place WHERE board = '' AND origin = ?",
+                "SELECT location, verdict, best_min, measured_to FROM place "
+                "WHERE board = '' AND origin = ?",
                 (origin,)).fetchall()}
 
         todo_addr = []
@@ -3392,7 +3448,11 @@ def job_place() -> str:
 
         for b, loc, n in todo_addr[:ADDRESS_BATCH]:
             company = b.split("|", 1)[-1]          # board key is platform|token
-            res = resolve_office(company, loc)
+            # ⭐ Look the office up in the city that WON the measurement, not in the raw
+            # multi-place string. "Livingston, NJ / New York, NY" has no single office, but
+            # the nearest of the two named cities does.
+            target = (city.get(loc) or {}).get("measured_to") or loc
+            res = resolve_office(company, target)
             if res.get("status") != "ok":
                 # Recorded, not discarded: a failed lookup is a fact about this pair and
                 # stops it being retried every run.
@@ -3425,6 +3485,36 @@ def job_place() -> str:
                      now() if best is not None else None,
                      "measured to the resolved office, not the city", ver))
             addr_done["resolved"] += 1
+
+    # ── multi-place: measure each named destination, keep the nearest ─────────
+    for loc, n, parts in multi_queue[:PLACE_BATCH]:
+        if not parts:
+            record(loc, n, "review", "rule", "names several places, none of them parseable")
+            continue
+        try:
+            drive = _measure(origin, parts, "driving", when)
+            transit = _measure(origin, parts, "transit", when)
+        except Exception as e:                                    # noqa: BLE001
+            audit("job_place_error", f"multi {loc[:40]}: {type(e).__name__}: {e}")
+            record(loc, n, "review", "rule", "names several places; measuring them failed")
+            continue
+        best = None
+        for part, dr, tr in zip(parts, drive, transit):
+            for mode, val in (("drive", dr), ("transit", tr)):
+                if val is not None and (best is None or val < best[0]):
+                    best = (val, mode, part)
+        if best is None:
+            record(loc, n, "review", "rule", "names several places, none of them routable")
+            continue
+        mins, mode, winner = best
+        with db() as con:
+            con.execute(
+                "INSERT INTO place (origin, board, location, postings, verdict, verdict_from, "
+                "note, best_min, best_mode, measured_at, measured_to, ruled_by) "
+                "VALUES (?,'',?,?,?,'measurement',?,?,?,?,?,?)",
+                (origin, loc, n, "commutable" if mins <= ceiling else "too_far",
+                 f"nearest of {len(parts)} named places", mins, mode, now(), winner, ver))
+        ruled["measured"] += 1
 
     left = max(0, len(measure_queue) - PLACE_BATCH * 4)
     return ((f"re-origin: dropped {dropped_stale} stale rows; " if dropped_stale else "")
