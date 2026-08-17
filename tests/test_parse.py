@@ -1543,6 +1543,11 @@ On Wed, Aug 12, 2026 the candidate wrote:
               "empty")
         check("a non-secret setting is shown outright", _cfg9["settings"]["AI_MODEL"], "some-model")
         check("the registered jobs are listed", _cfg9["jobs_registered"], _names9)
+        # ⚠️ The sqlite backend is a PATH, not a URL. Splitting it like one returns "" and a
+        # local deployment would report no database at all — the exact silence this endpoint
+        # is meant to break. Caught in the pre-deploy smoke test of v0.9.0.
+        check("the sqlite backend reports a database, not an empty string",
+              _cfg9["database_host"].startswith("sqlite:/"), True)
         check("no secret VALUE appears anywhere in the response",
               "a-secret-value" in _j8.dumps(_cfg9), False)
         try:

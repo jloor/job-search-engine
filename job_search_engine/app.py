@@ -3237,7 +3237,12 @@ def diag_config(request: Request, authorization: str | None = Header(None)):
         "secrets": {k: fp(os.environ.get(k)) for k in secret},
         "settings": {k: os.environ.get(k, "(unset)") for k in plain},
         # The database HOST, never the token. This is what proves a repoint actually landed.
-        "database_host": (BUNNY_DB_URL or DB_PATH).split("//")[-1].split("/")[0],
+        # ⚠️ The sqlite backend is a PATH, not a URL. Splitting "/data/relay.db" on "//" and
+        # taking the first segment yields "", so a local deployment reported no database at
+        # all — a diagnostic returning silence, which is the exact failure this endpoint was
+        # written to break. Caught in the pre-deploy smoke test of v0.9.0.
+        "database_host": (BUNNY_DB_URL.split("//")[-1].split("/")[0] if BUNNY_DB_URL
+                          else f"sqlite:{DB_PATH}"),
         "inbound_tokens_configured": len(INBOUND_TOKENS),
         "jobs_registered": [n for n, _, _ in job_table()],
     }
