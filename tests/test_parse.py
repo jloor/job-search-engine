@@ -1215,6 +1215,70 @@ On Wed, Aug 12, 2026 the candidate wrote:
           all(f"ADD COLUMN {c}" in " ".join(app.MIGRATIONS)
               for c in ("remote_verdict", "comp_min", "comp_basis")), True)
 
+    # ── every import the engine makes is a DECLARED dependency ────────────────────
+    # 🚨 MEASURED, NOT HYPOTHETICAL. pyproject declared fastapi and uvicorn while the code
+    # imported cryptography, email_reply_parser and anthropic. That was harmless while the
+    # container built from a local checkout and installed requirements.txt. The moment
+    # deploy/Dockerfile switched to `pip install ...@git+...`, this list became the only one
+    # consulted and requirements.txt stopped being installed at all.
+    #
+    # ⚠️ WHAT IT COST, measured on 2026-08-17. The backup job died with ModuleNotFoundError
+    # on every run and nothing said so: the newest encrypted snapshot was 2026-08-16 04:42
+    # and /health stayed green the whole time. Ed25519 approval verification broke the same
+    # way, and because verify_approval catches Exception broadly, a VALID approval would
+    # have read as a forgery. strip_quotes degraded to a no-op, which is the
+    # misclassification bug fixed on 2026-08-13, back in production.
+    #
+    # ⭐ This compares the CODE against the MANIFEST, not one file against another, so a
+    # newly added import cannot ship undeclared even when both files look tidy.
+    #
+    # ⚠️ ast and tomllib, NOT regular expressions. The first version of this check read the
+    # source with a regex and matched the prose inside docstrings, so "from a local
+    # checkout" contributed an import named `a`. It also read the dependency list with a
+    # non-greedy bracket match, which stopped at the `]` inside `uvicorn[standard]`. Both
+    # parsers are in the standard library, so this still runs with nothing installed.
+    print("\nevery import is a declared dependency:")
+    import ast as _astm, tomllib as _tomlm, re as _rem
+    _pkgm = HERE.parent / "job_search_engine"
+    _localm = {p.stem for p in _pkgm.glob("*.py")}
+    _thirdparty = set()
+    for _srcm in sorted(_pkgm.glob("*.py")):
+        for _nm in _astm.walk(_astm.parse(_srcm.read_text())):
+            if isinstance(_nm, _astm.Import):
+                _namesm = [a.name for a in _nm.names]
+            elif isinstance(_nm, _astm.ImportFrom):
+                # level > 0 is a relative import, which is by definition not third party.
+                _namesm = [] if _nm.level else [_nm.module or ""]
+            else:
+                continue
+            for _one in _namesm:
+                _top = _one.split(".")[0]
+                if _top and _top not in sys.stdlib_module_names and _top not in _localm:
+                    _thirdparty.add(_top.replace("_", "-").lower())
+
+    _pypm = (HERE.parent / "pyproject.toml").read_text()
+    _declared = {_rem.split(r"[\[<>=!~;\s]", d)[0].lower()
+                 for d in _tomlm.loads(_pypm)["project"]["dependencies"]}
+    check("every third-party import is declared in pyproject",
+          sorted(_thirdparty - _declared), [])
+    check("...and the imports found are the ones expected",
+          sorted(_thirdparty),
+          ["anthropic", "cryptography", "email-reply-parser", "fastapi"])
+    # uvicorn and python-multipart are declared and never imported, which is correct: one is
+    # the server the Dockerfile runs, the other is what FastAPI needs to parse a form-encoded
+    # body. Named here so "declared but unused" cannot quietly grow.
+    check("...and the declared-but-not-imported set is exactly the runtime pair",
+          sorted(_declared - _thirdparty), ["python-multipart", "uvicorn"])
+
+    # requirements.txt is what the old container installed. Both files still exist, so they
+    # must agree; a package present in one and not the other is how this bug reappears the
+    # next time someone edits only the file they happen to be reading.
+    _reqm = {_rem.split(r"[\[<>=!~;\s]", l.strip())[0].lower()
+             for l in (HERE.parent / "requirements.txt").read_text().splitlines()
+             if l.strip() and not l.lstrip().startswith("#")}
+    check("requirements.txt and pyproject declare the same packages",
+          sorted(_reqm ^ _declared), [])
+
     # ── manual runs: long jobs answer 202, short ones inline ──────────────────────
     # 🚨 A CDN closes the connection at 60 seconds and a full sweep takes about ten minutes.
     # A synchronous endpoint therefore CANNOT answer for scan, and a caller reading the

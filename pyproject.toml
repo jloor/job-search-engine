@@ -9,9 +9,34 @@ description = "A single-tenant job-search engine: board scanner, fit triage, and
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
+
+# 🚨 THIS LIST WAS WRONG AND IT TOOK PRODUCTION DOWN QUIETLY. It declared fastapi and uvicorn
+# only, while the code imports three more. That did not matter while the container built from
+# a local checkout and installed requirements.txt. The moment deploy/Dockerfile switched to
+# `pip install job-search-engine@git+...`, THIS became the only list that was consulted, and
+# requirements.txt stopped being installed at all.
+#
+# ⚠️ What that actually cost, measured on 2026-08-17:
+#   cryptography        the backup job died with ModuleNotFoundError, so the last encrypted
+#                       snapshot was 2026-08-16 04:42 and NOTHING said so for a day. It also
+#                       verifies Ed25519 approvals, and verify_approval catches Exception
+#                       broadly, so a VALID approval would have been refused as a forgery.
+#   email-reply-parser  strip_quotes silently degrades to a no-op, which is exactly the
+#                       misclassification bug fixed on 2026-08-13, back in production.
+#   anthropic           the AI_PROVIDER=anthropic path raises on first use.
+#
+# ⭐ Every one of these fails at RUNTIME, inside a job, while /health keeps answering ok.
+# Pins match requirements.txt, and a test asserts the two files agree, because the failure
+# mode here is a list that is merely out of date rather than obviously broken.
 dependencies = [
-  "fastapi>=0.110",
-  "uvicorn>=0.27",
+  "fastapi==0.115.6",
+  "uvicorn[standard]==0.34.0",
+  # Not imported directly. FastAPI needs it to parse form-encoded bodies, and the inbound
+  # webhook is form-encoded whenever ImprovMX does not send JSON.
+  "python-multipart==0.0.20",
+  "email-reply-parser==0.5.12",
+  "cryptography==44.0.0",
+  "anthropic==0.122.0",
 ]
 
 [project.optional-dependencies]
