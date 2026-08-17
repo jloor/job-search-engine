@@ -1302,6 +1302,15 @@ On Wed, Aug 12, 2026 the candidate wrote:
         check("the better mode wins", (_n["best_min"], _n["best_mode"]), (40, "transit"))
         check("and the verdict came from the measurement", _n["verdict_from"], "measurement")
         check("...and it is commutable at 40 minutes", _n["verdict"], "commutable")
+        # 🚨 IT MUST NOT WRITE ONE ROW PER ROUND TRIP. The first production run wrote 1,115
+        # eligibility rows one execute() at a time and was still going when the CDN cut the
+        # connection at sixty seconds. Same lesson as the board seeder.
+        _srcp = _i.getsource(_app7.job_place)
+        check("eligibility is written with executemany", "executemany" in _srcp, True)
+        check("...and place rows are batched too", _srcp.count("executemany") >= 2, True)
+        # ⚠️ It walks the whole candidate table, so it outlives a request.
+        check("place is async, so a CDN timeout cannot kill it",
+              "place" in _app7.ASYNC_JOBS, True)
     finally:
         if _p7 is None: _o7.environ.pop("DB_PATH", None)
         else: _o7.environ["DB_PATH"] = _p7

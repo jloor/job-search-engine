@@ -3056,11 +3056,17 @@ def job_place() -> str:
     with db() as con:
         # ── 1. eligibility, free, for everything that lacks it ─────────────────────
         rows = con.execute("SELECT id, location FROM scan_candidate "
-                           "WHERE eligibility IS NULL LIMIT 5000").fetchall()
-        for r in rows:
-            con.execute("UPDATE scan_candidate SET eligibility=?, eligibility_from=? WHERE id=?",
-                        (_G.eligibility(r["location"] or ""), ver, r["id"]))
-            elig_written += 1
+                           "WHERE eligibility IS NULL LIMIT 20000").fetchall()
+        # 🚨 executemany, NOT a loop of execute(). Every execute() is one HTTP round trip to
+        # Bunny. The first run of this job wrote 1,115 rows one at a time and was still
+        # going when the CDN cut the connection at sixty seconds. This is the same lesson
+        # the board seeder learned: 160,000 sequential POSTs is about two hours, batched it
+        # is about 800 calls.
+        if rows:
+            con.executemany(
+                "UPDATE scan_candidate SET eligibility=?, eligibility_from=? WHERE id=?",
+                [(_G.eligibility(r["location"] or ""), ver, r["id"]) for r in rows])
+            elig_written = len(rows)
 
         # ── 2. the locations that still need a WHERE answer ────────────────────────
         cand = con.execute(
@@ -3078,13 +3084,21 @@ def job_place() -> str:
         return (f"eligibility written for {elig_written}; no new locations to rule on"
                 if elig_written else "nothing to do")
 
+    pending = []
+
     def record(loc, n, verdict, frm, note, best=None, mode=None):
+        pending.append((origin, loc, n, verdict, frm, note, best, mode,
+                        now() if best is not None else None))
+
+    def flush():
+        if not pending:
+            return
         with db() as con:
-            con.execute(
+            con.executemany(
                 "INSERT INTO place (origin, board, location, postings, verdict, verdict_from, "
                 "note, best_min, best_mode, measured_at) VALUES (?,'',?,?,?,?,?,?,?,?)",
-                (origin, loc, n, verdict, frm, note, best, mode,
-                 now() if best is not None else None))
+                list(pending))
+        pending.clear()
 
     measure_queue = []
     for t in todo:
@@ -3105,6 +3119,7 @@ def job_place() -> str:
         else:
             measure_queue.append(t)
 
+    flush()
     if measure_queue and not GOOGLE_MAPS_KEY:
         return (f"eligibility {elig_written}; ruled {ruled}; "
                 f"{len(measure_queue)} need measuring but GOOGLE_MAPS_API_KEY is unset")
@@ -3136,6 +3151,7 @@ def job_place() -> str:
                    "measurement", f"best of drive/transit, arrive 09:00", best, mode)
             ruled["measured"] += 1
 
+    flush()
     left = max(0, len(measure_queue) - PLACE_BATCH * 4)
     return (f"eligibility {elig_written}; remote {ruled['remote']}, multi {ruled['multi']}, "
             f"unroutable {ruled['unroutable']}, measured {ruled['measured']}, "
@@ -3553,7 +3569,9 @@ def get_backup(name: str, request: Request, authorization: str | None = Header(N
 # inline, because making every caller poll for "nothing to track" is worse than a timeout.
 
 # Jobs that routinely outlive an HTTP request. Everything else answers synchronously.
-ASYNC_JOBS = {"scan", "backup"}
+# ⚠️ place joins these because it walks the whole candidate table. Its first run
+# was killed by the CDN at sixty seconds while still writing eligibility.
+ASYNC_JOBS = {"scan", "backup", "place"}
 _RUNS: dict = {}
 _RUNS_GUARD = threading.Lock()
 
