@@ -1371,6 +1371,22 @@ On Wed, Aug 12, 2026 the candidate wrote:
             # against "New Jersey, United States" resolved to "Law Offices of Nelson Kong,
             # P.C" and flipped a verdict from too_far to commutable. Refused before the
             # request now, so a vague location also costs nothing.
+            # 🚨 A CITY CAN ALSO BE A STATE NAME. Skipping every part found in the state
+            # table drops the city from "New York, NY" entirely, and under the vague-location
+            # guard that becomes a refusal of the most common location in the queue. It
+            # deleted 19 correctly resolved offices before this was caught.
+            for _loc, _want in (("New York, NY", "New York"),
+                                ("New York, New York", "New York"),
+                                ("New York, NY (HQ)", "New York"),
+                                ("Nashville, TN", "Nashville"),
+                                ("Middletown, NY", "Middletown"),
+                                ("San Francisco, CA", "San Francisco"),
+                                # No second part once the country is stripped: genuinely
+                                # city-less, and the one case that SHOULD refuse.
+                                ("New Jersey, United States", None),
+                                ("New York", None)):
+                check(f"city of {_loc!r}", _app7._target_city(_loc), _want)
+
             _blew_up = {"called": False}
             def _boom(*a, **k):
                 _blew_up["called"] = True

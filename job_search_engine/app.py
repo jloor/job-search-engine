@@ -3073,7 +3073,30 @@ def _target_city(location: str) -> str | None:
     New York, NY" and was correctly stored as a failure.
     """
     loc = re.sub(r"\b(united states|usa|u\.s\.a?\.?|remote)\b", "", location or "", flags=re.I)
-    for part in [x.strip(" ,") for x in loc.split(",") if x.strip(" ,")]:
+    # Parentheticals are annotations, not geography: "New York, NY (HQ)" is still New York.
+    loc = re.sub(r"\s*\(.*?\)", " ", loc)
+    parts = [x.strip(" ,") for x in loc.split(",") if x.strip(" ,")]
+
+    # 🚨 SOME CITIES ARE ALSO STATE NAMES, and New York is the one that matters most. The
+    # loop below skips any part appearing in the state table, which drops the city from
+    # "New York, NY" and returns nothing. Under the vague-location guard that became a
+    # refusal, and it rejected the most common location in the queue: measured, it deleted
+    # 19 correctly resolved offices including Ramp, Alloy and Attentive.
+    #
+    # When a LATER part names the state, the FIRST part is the city whatever else it is also
+    # the name of. "New York, NY" is the city; "New Jersey, United States" has nothing after
+    # the country is stripped and is genuinely city-less, which is the case worth refusing.
+    if len(parts) >= 2:
+        tail = parts[-1]
+        if tail.lower() in _STATE_ABBR or tail.upper() in _STATE_ABBR.values():
+            head = parts[0].strip()
+            # ⚠️ head == tail is legitimate and common: "New York, New York" is the city New
+            # York in New York state. Rejecting the repeat drops it, which is the same bug
+            # one layer along. Only refuse when there is no head at all.
+            if head and re.fullmatch(r"[\w .'-]+", head):
+                return head
+
+    for part in parts:
         low = part.lower()
         if low in _STATE_ABBR or part.upper() in _STATE_ABBR.values() or len(part) <= 2:
             continue
