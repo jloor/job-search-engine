@@ -22,4 +22,7 @@ _HERE = str(pathlib.Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-__version__ = "0.7.0"
+# 🚨 THE ONLY COPY OF THIS NUMBER. app.py reads it out of this file rather than declaring
+# its own, and /health serves it to an authenticated caller. A second literal anywhere is
+# the bug that made a container report 0.4.0 and send someone to debug the wrong code.
+__version__ = "0.8.0"

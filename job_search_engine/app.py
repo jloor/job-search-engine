@@ -87,6 +87,40 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _engine_version() -> str:
+    """
+    The version this process is actually running, read from the package.
+
+    ⭐ WHY THIS IS READ AND NOT IMPORTED. The test suite loads app.py BY PATH from a clean
+    clone with nothing installed, so `from job_search_engine import __version__` raises
+    there. The endpoint that reports the version would then be the one thing unavailable
+    in the situation it exists for.
+
+    ⚠️ AND WHY IT IS NOT A SECOND LITERAL HERE. A copy of the number in this file drifts
+    from the package's, which is exactly the bug the version string was added to prevent:
+    a container that reports 0.4.0 sends a person to debug the wrong code. One number,
+    one file, read at import.
+    """
+    try:
+        m = re.search(r'__version__\s*=\s*"([^"]+)"',
+                      (Path(__file__).parent / "__init__.py").read_text())
+        return m.group(1) if m else "unknown"
+    except Exception:                                         # noqa: BLE001
+        return "unknown"
+
+
+ENGINE_VERSION = _engine_version()
+
+# Process start, so /diag/jobs can tell "this job has stopped running" apart from "this
+# container booted four minutes ago and the job is not due yet". Without it every deploy
+# would raise a false alarm on every job with an interval longer than the uptime.
+BOOTED_AT = time.time()
+
+# How many intervals a job may miss before it counts as stale. Three is deliberately
+# forgiving: a sweep that overruns its window, or one skipped tick, is not an outage.
+STALE_FACTOR = float(os.environ.get("STALE_FACTOR", "3"))
+
+
 # Storage is swappable. Bunny Database is libSQL (a SQLite fork), so the schema and
 # every query in this file are identical either way.
 #   BUNNY_DB_URL set -> managed Bunny Database; the container stays stateless
@@ -2969,14 +3003,25 @@ async def _startup() -> None:
 @app.get("/health")
 def health(authorization: str | None = Header(None)):
     """Unauthenticated callers get liveness only. Message counts and the mail domain
-    tell a prober whether they found something worth attacking, so they need the token."""
+    tell a prober whether they found something worth attacking, so they need the token.
+
+    ⭐ `version` is here because until now NOTHING could answer "which engine is
+    production running". The number lived in the package and no route served it, so
+    `{"ok":true}` looked identical from v0.4.0 and v0.7.0. A deploy that silently did
+    not take was therefore indistinguishable from one that did.
+
+    ⚠️ It sits in the AUTHENTICATED branch on purpose. A version string tells a stranger
+    which published weaknesses to try, and that is the same reason the message count and
+    the mail domain are already gated. The operator has the token; a prober does not.
+    """
     try:
         with db() as con:
             n = con.execute("SELECT count(*) c FROM message").fetchone()["c"]
     except Exception as e:
         return JSONResponse({"ok": False, "error": type(e).__name__}, status_code=500)
     if _scope_of(authorization):
-        return {"ok": True, "messages": n, "mail_domain": MAIL_DOMAIN, "at": now()}
+        return {"ok": True, "version": ENGINE_VERSION, "messages": n,
+                "mail_domain": MAIL_DOMAIN, "at": now()}
     return {"ok": True}
 
 
@@ -3048,6 +3093,61 @@ def diag_repo(request: Request, authorization: str | None = Header(None), sync: 
     with db() as con:
         log_event(con, "diag_repo", json.dumps(out)[:3500])
     return out
+
+
+@app.get("/diag/jobs")
+def diag_jobs(request: Request, authorization: str | None = Header(None)):
+    """
+    When each scheduled job last ran, and whether that is too long ago.
+
+    🚨 WHY THIS EXISTS. Every other check triggers a job BY HAND through /admin/run, which
+    proves the job works and proves nothing about the scheduler that is supposed to call
+    it. If `_scheduler()` dies, all eight jobs stop, /health keeps answering ok, and the
+    silence is indistinguishable from a quiet night: no new postings, no new mail, nothing
+    to report. Absence of news reads as success, which is this codebase's recurring
+    failure shape.
+
+    ⭐ The verdict is computed from the audit log, not from an in-process counter. A
+    counter resets on every deploy and would report a freshly booted container as healthy
+    while it had in fact run nothing for a week.
+
+    ⚠️ `last_error` is reported beside `last_ok` because a job that runs on time and fails
+    every time is NOT stale, and reading staleness alone would call it healthy.
+    """
+    require_admin(authorization, request)
+    uptime = time.time() - BOOTED_AT
+    jobs, stale = [], []
+    with db() as con:
+        for name, interval, _fn in job_table():
+            last_ok = con.execute("SELECT max(at) a FROM event WHERE kind=?",
+                                  (f"job_{name}",)).fetchone()["a"]
+            last_err = con.execute("SELECT max(at) a FROM event WHERE kind=?",
+                                   (f"job_{name}_error",)).fetchone()["a"]
+
+            def _age(ts):
+                if not ts:
+                    return None
+                try:
+                    return int((datetime.now(timezone.utc)
+                                - datetime.fromisoformat(ts)).total_seconds())
+                except Exception:                             # noqa: BLE001
+                    return None
+
+            age = _age(last_ok)
+            # A job is stale when it has not run within STALE_FACTOR intervals. A job that
+            # has NEVER run is stale only once the process has been up long enough for it
+            # to have been due, otherwise every deploy alarms on the 24-hour jobs.
+            limit = interval * STALE_FACTOR
+            is_stale = (age is None and uptime > limit) or (age is not None and age > limit)
+            if is_stale:
+                stale.append(name)
+            jobs.append({"job": name, "interval_s": interval, "last_ok": last_ok,
+                         "age_s": age, "last_error": last_err, "error_age_s": _age(last_err),
+                         "stale": is_stale})
+    # `ok` is the single field a monitor should read. It is false when ANY job is stale,
+    # because one dead job and eight dead jobs are both something a human must look at.
+    return {"at": now(), "version": ENGINE_VERSION, "uptime_s": int(uptime),
+            "stale_factor": STALE_FACTOR, "ok": not stale, "stale": stale, "jobs": jobs}
 
 
 @app.get("/admin/backups")

@@ -1279,6 +1279,132 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("requirements.txt and pyproject declare the same packages",
           sorted(_reqm ^ _declared), [])
 
+    # ── the deployed version is readable, and the scheduler is observable ─────────
+    # 🚨 BOTH OF THESE ANSWER "IT LOOKS FINE AND IS DOING NOTHING".
+    #
+    # The version: {"ok":true} came back identically from v0.4.0 and v0.7.0, so a deploy
+    # that did not take was indistinguishable from one that did, and a person debugging
+    # production could not tell which code they were reading.
+    #
+    # The scheduler: every live check triggers jobs BY HAND through /admin/run, which
+    # proves the job runs and proves nothing about the loop meant to call it. If
+    # _scheduler() dies, all eight jobs stop while /health stays green, and the silence
+    # is indistinguishable from a quiet night.
+    print("\nthe version is readable and the scheduler is observable:")
+    import os as _o9, tempfile as _t9, sqlite3 as _s9, time as _tm9
+    import re as _re9, datetime as _dt9
+    _d9 = str(_t9.mkdtemp()) + "/diag.db"
+    _p9 = _o9.environ.get("DB_PATH"); _o9.environ["DB_PATH"] = _d9
+    try:
+        _app9 = load_app()
+        _c9 = _s9.connect(_d9)
+        _c9.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+        _c9.commit(); _c9.close()
+
+        # ⚠️ The version must come from the PACKAGE file. A literal in app.py would drift
+        # from __init__.py, which is the precise failure the version string exists to stop.
+        _init9 = (HERE.parent / "job_search_engine" / "__init__.py").read_text()
+        _want_v = _re9.search(r'__version__\s*=\s*"([^"]+)"', _init9).group(1)
+        check("the version is read from the package, not copied",
+              _app9.ENGINE_VERSION, _want_v)
+        check("...and it resolved to a real number", _app9.ENGINE_VERSION != "unknown", True)
+
+        # 🚨 pyproject.toml was a THIRD copy of the number. A bump to __init__.py alone
+        # would have installed a distribution whose metadata and whose code disagreed,
+        # which is the same "which version am I actually running" failure one layer down.
+        _pyp9 = (HERE.parent / "pyproject.toml").read_text()
+        check("pyproject declares no static version literal",
+              bool(_re9.search(r'(?m)^\s*version\s*=\s*"\d', _pyp9)), False)
+        check("...it reads the package attribute instead",
+              'attr = "job_search_engine.__version__"' in _pyp9, True)
+
+
+        class _H9(dict):
+            def get(self, k, d=""): return d
+
+        class _Req9:
+            client = None
+            def __init__(self): self.headers = _H9()
+
+        _app9.ADMIN_TOKEN, _app9.READ_TOKEN = "admin-tok", "read-tok"
+        _app9.TRUSTED_PROXY_HOPS = 0
+
+        # An unauthenticated prober learns liveness and nothing else. A version string is
+        # a list of which published weaknesses to try.
+        _anon9 = _app9.health(None)
+        check("anonymous /health does NOT leak the version", "version" in _anon9, False)
+        check("...but still answers liveness", _anon9.get("ok"), True)
+        check("an authenticated /health reports the version",
+              _app9.health("Bearer read-tok").get("version"), _want_v)
+
+        # Now the scheduler view. Events are the source of truth rather than an in-process
+        # counter, because a counter resets on deploy and would report a container that has
+        # run nothing for a week as perfectly healthy.
+        _names9 = [n for n, _, _ in _app9.job_table()]
+        _iv9 = {n: i for n, i, _ in _app9.job_table()}
+
+        def _ev9(kind, ago_s):
+            ts = (_dt9.datetime.now(_dt9.timezone.utc)
+                  - _dt9.timedelta(seconds=ago_s)).isoformat(timespec="seconds")
+            with _app9.db() as c:
+                c.execute("INSERT INTO event(at,kind,detail,source_ip) VALUES (?,?,?,?)",
+                          (ts, kind, "", ""))
+
+        # Case 1: a fresh boot with nothing run yet must NOT alarm, or every deploy would.
+        _app9.BOOTED_AT = _tm9.time() - 5
+        _r9a = _app9.diag_jobs(_Req9(), "Bearer admin-tok")
+        check("a job that never ran is not stale on a fresh boot", _r9a["stale"], [])
+        check("...and the endpoint says the system is ok", _r9a["ok"], True)
+        check("...and it reports every registered job",
+              [j["job"] for j in _r9a["jobs"]], _names9)
+        check("...and carries the version, so one call places the code",
+              _r9a["version"], _want_v)
+
+        # Case 2: uptime now exceeds the allowance and the jobs still have not run. That is
+        # a scheduler that never started, which is the outage this endpoint exists for.
+        _app9.BOOTED_AT = _tm9.time() - (max(_iv9.values()) * _app9.STALE_FACTOR + 60)
+        _r9b = _app9.diag_jobs(_Req9(), "Bearer admin-tok")
+        check("once they were due and did not run, every job is stale",
+              sorted(_r9b["stale"]), sorted(_names9))
+        check("...and ok flips to false", _r9b["ok"], False)
+
+        # Case 3: a recent run clears exactly one job and leaves the rest alarming.
+        _ev9("job_track", 30)
+        _r9c = _app9.diag_jobs(_Req9(), "Bearer admin-tok")
+        check("a recent run clears that job", "track" in _r9c["stale"], False)
+        check("...and does not clear the others", "scan" in _r9c["stale"], True)
+        _trow9 = next(j for j in _r9c["jobs"] if j["job"] == "track")
+        check("...and its age is reported in seconds",
+              20 <= (_trow9["age_s"] or 0) <= 90, True)
+
+        # Case 4: an OLD run is not a run. A "last_ok is not null" check would miss this.
+        _ev9("job_comp", _iv9["comp"] * _app9.STALE_FACTOR + 600)
+        check("a run older than the allowance is still stale",
+              "comp" in _app9.diag_jobs(_Req9(), "Bearer admin-tok")["stale"], True)
+
+        # Case 5: 🚨 THE TRAP. A job that runs exactly on time and FAILS every time is not
+        # stale. Staleness alone would call it healthy, so the last error is reported
+        # beside the last success and a caller can see both.
+        _ev9("job_backup", 10)
+        _ev9("job_backup_error", 10)
+        _brow9 = next(j for j in _app9.diag_jobs(_Req9(), "Bearer admin-tok")["jobs"]
+                      if j["job"] == "backup")
+        check("a job that runs on time is not stale, even when it fails",
+              _brow9["stale"], False)
+        check("...but its last error is reported beside its last success",
+              bool(_brow9["last_error"]), True)
+
+        # A read token is not an admin token. This route names every job and its schedule.
+        try:
+            _app9.diag_jobs(_Req9(), "Bearer read-tok")
+            check("a read token cannot see the job schedule", "allowed", "refused")
+        except Exception as _e9:
+            check("a read token cannot see the job schedule",
+                  getattr(_e9, "code", 0), 403)
+    finally:
+        if _p9 is None: _o9.environ.pop("DB_PATH", None)
+        else: _o9.environ["DB_PATH"] = _p9
+
     # ── manual runs: long jobs answer 202, short ones inline ──────────────────────
     # 🚨 A CDN closes the connection at 60 seconds and a full sweep takes about ten minutes.
     # A synchronous endpoint therefore CANNOT answer for scan, and a caller reading the

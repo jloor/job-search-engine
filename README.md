@@ -154,6 +154,39 @@ curl --resolve mc-eiupu4t7ia.bunny.run:443:138.199.40.58 https://mc-eiupu4t7ia.b
 504 even when it completed. `/diag/smtp` writes its result to the `event` table before
 returning, so read the row instead of re-running the request.
 
+### Which version is running, and is the scheduler alive
+
+Two questions `/health` could not answer until v0.8.0. Both have the same failure shape:
+the service looks fine and is doing nothing.
+
+```bash
+# which code is deployed. Anonymous callers get liveness only; the version needs a token.
+curl -s -H "Authorization: Bearer $API_TOKEN" https://<host>/health | python3 -m json.tool
+
+# when each scheduled job last ran, and whether that is too long ago
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" https://<host>/diag/jobs | python3 -m json.tool
+```
+
+🚨 **`/health` returning `{"ok":true}` was identical from v0.4.0 and v0.7.0.** A deploy that
+silently did not take could not be told apart from one that did, and the number lived in
+the package with no route serving it. It is now in the authenticated response, and it is
+read from `__init__.py` rather than written a second time, because two copies drift.
+
+🚨 **`/diag/jobs` is the only thing that watches the scheduler.** Every other check triggers
+a job by hand through `/admin/run`, which proves the job works and proves nothing about the
+loop meant to call it. If `_scheduler()` dies, all eight jobs stop, `/health` stays green,
+and the silence looks exactly like a quiet night.
+
+- **Read `ok` first.** It is false when any job has missed `STALE_FACTOR` (default 3)
+  intervals. Every job stale at once means the loop, not the job.
+- ⚠️ **`stale` and `last_error` answer different questions.** A job that runs exactly on
+  schedule and fails every time is **not stale**. Read both, or a permanently broken job
+  reports as healthy.
+- The verdict comes from the `event` table, not an in-process counter. A counter resets on
+  deploy and would call a container that has run nothing for a week perfectly healthy.
+- A freshly booted container does not alarm on jobs that were never due. That is why
+  `uptime_s` is in the response.
+
 ## Sending: two paths, and when to use each
 
 | | ImprovMX SMTP | Resend (HTTPS API) |

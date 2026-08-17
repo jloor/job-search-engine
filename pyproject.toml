@@ -4,7 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "job-search-engine"
-version = "0.7.0"
+# 🚨 READ FROM THE PACKAGE, NEVER TYPED HERE. This was a second literal and it had already
+# drifted: __init__.py said 0.7.0 while a bump to either file alone would have shipped an
+# installed distribution whose reported version and whose code did not match. That is the
+# exact failure the version string exists to prevent, reintroduced by the packaging.
+dynamic = ["version"]
 description = "A single-tenant job-search engine: board scanner, fit triage, and a mail relay with a human approval gate."
 readme = "README.md"
 license = { text = "MIT" }
@@ -43,6 +47,9 @@ dependencies = [
 # The suite runs without these; it detects the missing dependency and skips with the
 # install command rather than reporting a failure a stranger would read as "broken".
 dev = ["httpx"]
+
+[tool.setuptools.dynamic]
+version = { attr = "job_search_engine.__version__" }
 
 [tool.setuptools]
 packages = ["job_search_engine"]
