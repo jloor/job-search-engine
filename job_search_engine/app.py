@@ -3093,8 +3093,15 @@ def job_place() -> str:
         if stale:
             con.execute("DELETE FROM place WHERE origin <> ?", (origin,))
             dropped_stale = stale
-            audit("job_place_reorigin",
-                  f"origin changed; dropped {stale} rows measured from a previous origin")
+            # ⚠️ The audit is written AFTER this block, not inside it. audit() opens its own
+            # connection, and on the sqlite backend that deadlocks against the one still held
+            # here: "database is locked". audit() never raises by design, so the record was
+            # simply lost, and the one operation whose record matters most is the one that
+            # deletes rows.
+
+    if dropped_stale:
+        audit("job_place_reorigin",
+              f"origin changed; dropped {dropped_stale} rows measured from a previous origin")
 
     if not todo:
         return (f"eligibility written for {elig_written}; no new locations to rule on"
