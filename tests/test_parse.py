@@ -1326,6 +1326,15 @@ On Wed, Aug 12, 2026 the candidate wrote:
             _fresh = c.execute("SELECT count(*) n FROM place WHERE origin='1 Test St, Dumont, NJ'"
                                ).fetchone()["n"]
         check("rows measured from a previous origin are dropped", _after, 0)
+        # 🚨 A RULE-DECIDED VERDICT IS ONLY AS GOOD AS THE RULES BEHIND IT. verdict_from says
+        # which LAYER decided; ruled_by says which engine's rules. Without the second, a
+        # gates.py change leaves no way to target the rows it invalidated, which is the gap
+        # eligibility_from closed on the candidate side.
+        with _app7.db() as c:
+            _rb = c.execute("SELECT ruled_by, verdict_from FROM place "
+                            "WHERE verdict_from='rule' LIMIT 1").fetchone()
+        check("a rule-decided place records the engine that ruled it",
+              dict(_rb)["ruled_by"] if _rb else None, _app7.ENGINE_VERSION)
         check("...and the locations are ruled on again from the new one", _fresh > 0, True)
         check("...so a location never carries two origins at once", _before > 0, True)
         _o7.environ.pop("COMMUTE_ORIGIN", None)

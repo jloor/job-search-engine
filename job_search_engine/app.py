@@ -350,6 +350,13 @@ MIGRATIONS = [
     # reader from whatever gates.py they happened to have, so a stale laptop produced
     # a different queue than production, silently. eligibility_from records the engine
     # that decided, which turns a rule change into a targeted re-gate.
+    # 🚨 A RULE-DECIDED VERDICT IS ONLY AS GOOD AS THE RULES THAT DECIDED IT.
+    # place.verdict_from records the LAYER (rule, measurement, model) but not the
+    # VERSION, so a gates.py change could not target the rows it invalidated. That is
+    # the same gap eligibility_from closed: without it the only options are trusting
+    # stale verdicts or re-ruling everything blindly. Measurements are exempt in
+    # practice, since they depend on the origin rather than on the rules.
+    "ALTER TABLE place ADD COLUMN ruled_by TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN eligibility TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN eligibility_from TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN model TEXT",
@@ -3111,7 +3118,7 @@ def job_place() -> str:
 
     def record(loc, n, verdict, frm, note, best=None, mode=None):
         pending.append((origin, loc, n, verdict, frm, note, best, mode,
-                        now() if best is not None else None))
+                        now() if best is not None else None, ver))
 
     def flush():
         if not pending:
@@ -3119,7 +3126,8 @@ def job_place() -> str:
         with db() as con:
             con.executemany(
                 "INSERT INTO place (origin, board, location, postings, verdict, verdict_from, "
-                "note, best_min, best_mode, measured_at) VALUES (?,'',?,?,?,?,?,?,?,?)",
+                "note, best_min, best_mode, measured_at, ruled_by) "
+                "VALUES (?,'',?,?,?,?,?,?,?,?,?)",
                 list(pending))
         pending.clear()
 
