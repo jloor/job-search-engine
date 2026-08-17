@@ -1333,6 +1333,54 @@ On Wed, Aug 12, 2026 the candidate wrote:
         with _app7.db() as c:
             _rb = c.execute("SELECT ruled_by, verdict_from FROM place "
                             "WHERE verdict_from='rule' LIMIT 1").fetchone()
+        # ── office resolution: a precise address for the WRONG office is worse ───
+        # 🚨 Every guard below stopped a real wrong answer. A centroid is honestly vague; a
+        # confident address for the wrong building is not, and it is what gets measured.
+        print("\n  office resolution guards:")
+        _mk = lambda addr, name: {"formattedAddress": addr, "displayName": {"text": name},
+                                  "id": "x"}
+        def _places(payload):
+            import json as _j, io
+            class _R:
+                def __enter__(s): return s
+                def __exit__(s, *a): return False
+                def read(s): return _j.dumps(payload).encode()
+            import urllib.request as _u
+            _app7.__dict__.setdefault("_orig_urlopen", _u.urlopen)
+            _u.urlopen = lambda *a, **k: _R()
+        import urllib.request as _ureq
+        _real_urlopen = _ureq.urlopen
+        _app7.GOOGLE_MAPS_KEY = "k"
+        try:
+            # ⚠️ STATE IS NOT A CHECK. "Middletown, NY" and "New York, NY" are both NY and
+            # sixty miles apart, which is the entire quantity being measured. A real lookup
+            # for a CoreBTS office in Middletown returned 1 Pennsylvania Plaza.
+            _places({"places": [_mk("1 Pennsylvania Plaza, New York, NY 10001", "CoreBTS")]})
+            check("a right-state wrong-city address is refused",
+                  _app7.resolve_office("corebts", "Middletown, NY")["status"], "city_mismatch")
+            # 🚨 The city can be right and the answer still useless if it is not the employer.
+            _places({"places": [_mk("100 Main St, Bronx, NY 10463", "Riverdale Crossing")]})
+            check("a right-city wrong-business address is refused",
+                  _app7.resolve_office("acmesoft", "Bronx, NY")["status"], "name_mismatch")
+            # ⚠️ No street number means a centroid wearing a nicer label.
+            _places({"places": [_mk("Nashville, TN, USA", "Acmesoft")]})
+            check("an address with no street number is refused",
+                  _app7.resolve_office("acmesoft", "Nashville, TN")["status"], "not_street_level")
+            _places({"places": []})
+            check("no results is reported, not guessed",
+                  _app7.resolve_office("acmesoft", "Nashville, TN")["status"], "no_match")
+            # The one that should pass: right city, right state, right business, street level.
+            _places({"places": [_mk("222 2nd Ave S, Nashville, TN 37201", "Acmesoft HQ")]})
+            _good = _app7.resolve_office("acmesoft", "Nashville, TN")
+            check("a correct office resolves", _good["status"], "ok")
+            check("...and carries a street-level address",
+                  _good["address"].startswith("222 2nd Ave S"), True)
+        finally:
+            _ureq.urlopen = _real_urlopen
+        check("no key means no call at all",
+              (lambda: (setattr(_app7, "GOOGLE_MAPS_KEY", ""),
+                        _app7.resolve_office("a", "b")["status"])[1])(), "no_key")
+
         check("a rule-decided place records the engine that ruled it",
               dict(_rb)["ruled_by"] if _rb else None, _app7.ENGINE_VERSION)
         check("...and the locations are ruled on again from the new one", _fresh > 0, True)

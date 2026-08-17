@@ -3021,6 +3021,135 @@ def _measure(origin: str, dests: list, mode: str, when: int) -> list:
     return out
 
 
+# ------------------------------------------------------- office address resolution --
+# ⭐ WHY AN ADDRESS AT ALL. A city centroid is a guess whose error grows with the size of the
+# city, and the commute number is the whole quantity this system measures. Measuring to the
+# real office is strictly better. Ported from tools/office-address.py, which learned every
+# guard below the hard way.
+#
+# 🚨 PLACES API (NEW), not the legacy endpoint. Google refuses legacy Places on projects
+# created recently. Distance Matrix legacy still works, so the two halves of this pipeline sit
+# on different API generations. Enabling one does not enable the other.
+TEXTSEARCH_API = "https://places.googleapis.com/v1/places:searchText"
+ADDRESS_BATCH  = int(os.environ.get("ADDRESS_BATCH", "40"))
+
+_STATE_ABBR = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA",
+    "colorado": "CO", "connecticut": "CT", "delaware": "DE", "florida": "FL",
+    "georgia": "GA", "hawaii": "HI", "idaho": "ID", "illinois": "IL", "indiana": "IN",
+    "iowa": "IA", "kansas": "KS", "kentucky": "KY", "louisiana": "LA", "maine": "ME",
+    "maryland": "MD", "massachusetts": "MA", "michigan": "MI", "minnesota": "MN",
+    "mississippi": "MS", "missouri": "MO", "montana": "MT", "nebraska": "NE",
+    "nevada": "NV", "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM",
+    "new york": "NY", "north carolina": "NC", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "tennessee": "TN", "texas": "TX", "utah": "UT", "vermont": "VT", "virginia": "VA",
+    "washington": "WA", "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY"}
+
+# ⚠️ A result without a street number is a centroid wearing a nicer label. Rejecting it is the
+# point: the whole reason to make this call is precision, so an imprecise answer is a failure
+# rather than a partial success.
+_HAS_STREET = re.compile(r"^\s*\d+[\w-]*\s+\S")
+
+
+def _target_state(location: str) -> str | None:
+    """The two-letter state a resolved address must sit in, or None if unreadable."""
+    m = re.search(r",\s*([A-Z]{2})\b", location or "")
+    if m and m.group(1) in _STATE_ABBR.values():
+        return m.group(1)
+    for name, ab in _STATE_ABBR.items():
+        if re.search(rf"\b{name}\b", location or "", re.I):
+            return ab
+    return None
+
+
+def _target_city(location: str) -> str | None:
+    """
+    The city a resolved address must sit in.
+
+    ⚠️ THIS EXISTS BECAUSE VERIFYING THE STATE IS NOT A VERIFICATION. "Middletown, NY" and
+    "New York, NY" are both NY and sixty miles apart, which is the entire quantity being
+    measured. A lookup for a CoreBTS office in Middletown returned "1 Pennsylvania Plaza,
+    New York, NY" and was correctly stored as a failure.
+    """
+    loc = re.sub(r"\b(united states|usa|u\.s\.a?\.?|remote)\b", "", location or "", flags=re.I)
+    for part in [x.strip(" ,") for x in loc.split(",") if x.strip(" ,")]:
+        low = part.lower()
+        if low in _STATE_ABBR or part.upper() in _STATE_ABBR.values() or len(part) <= 2:
+            continue
+        if re.fullmatch(r"[\w .'-]+", part):
+            return part
+    return None
+
+
+def resolve_office(company: str, location: str) -> dict:
+    """One employer's office in one city, or a verdict saying why not."""
+    if not GOOGLE_MAPS_KEY:
+        return {"status": "no_key"}
+    import urllib.error, urllib.request
+    q = f"{company} office {location}"
+    req = urllib.request.Request(
+        TEXTSEARCH_API, json.dumps({"textQuery": q, "maxResultCount": 5}).encode(),
+        {"Content-Type": "application/json", "X-Goog-Api-Key": GOOGLE_MAPS_KEY,
+         # The field mask is REQUIRED and it is also the billing tier. Asking for fields
+         # nothing reads costs more per call for nothing.
+         "X-Goog-FieldMask": "places.formattedAddress,places.displayName,places.id"})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            d = json.load(r)
+    except urllib.error.HTTPError as e:
+        return {"status": "api_error", "error": e.read().decode(errors="replace")[:160]}
+    except Exception as e:                                        # noqa: BLE001
+        return {"status": "api_error", "error": f"{type(e).__name__}: {e}"[:160]}
+
+    raw = d.get("places", [])
+    if not raw:
+        return {"status": "no_match", "query": q}
+    results = [{"address": p.get("formattedAddress", ""),
+                "name": (p.get("displayName") or {}).get("text", ""),
+                "place_id": p.get("id", "")} for p in raw]
+
+    want_state, want_city = _target_state(location), _target_city(location)
+
+    def in_right_place(r_):
+        a = r_["address"]
+        if want_state and not re.search(rf",\s*{want_state}\b", a):
+            return False
+        if want_city and not re.search(rf"\b{re.escape(want_city)}\b", a, re.I):
+            return False
+        return True
+
+    matched = [r_ for r_ in results if in_right_place(r_)]
+    if not matched:
+        return {"status": "city_mismatch", "wanted": f"{want_city or '?'}, {want_state or '?'}",
+                "got": [r_["address"][:60] for r_ in results[:3]]}
+
+    # 🚨 VERIFY THE BUSINESS, NOT JUST THE PLACE. Searching "riverdale office Bronx, NY"
+    # returned "Riverdale Crossing", a shopping centre. Right city, useless answer, because
+    # nothing checked that the result IS the employer.
+    # ⚠️ THE WEAKEST LINK. The company name is an ATS board TOKEN, a slug rather than a legal
+    # name, so token overlap is evidence and not proof. The status says which it is.
+    def name_score(r_):
+        nm = re.sub(r"[^a-z0-9 ]", " ", r_["name"].lower())
+        toks = {x for x in re.split(r"\s+", re.sub(r"[^a-z0-9 ]", " ", company.lower()))
+                if len(x) > 2}
+        return sum(1 for x in toks if x in nm) / max(len(toks), 1)
+
+    named = [r_ for r_ in matched if name_score(r_) >= 0.5]
+    if not named:
+        return {"status": "name_mismatch",
+                "got": [f"{r_['name']} — {r_['address'][:44]}" for r_ in matched[:3]]}
+
+    top = named[0]
+    if not _HAS_STREET.match(top["address"]):
+        return {"status": "not_street_level", "address": top["address"]}
+    # 📌 Several buildings in the SAME town are not ambiguity worth refusing over: two
+    # GenScript sites in Piscataway are the same commute. Ambiguity that matters is several
+    # CITIES, and the city filter above has already removed those.
+    return {"status": "ok", "address": top["address"], "name": top["name"],
+            "place_id": top["place_id"]}
+
+
 def job_place() -> str:
     """
     Post-scan: record WHERE every candidate is, as data rather than as a recomputation.
@@ -3110,9 +3239,10 @@ def job_place() -> str:
         audit("job_place_reorigin",
               f"origin changed; dropped {dropped_stale} rows measured from a previous origin")
 
-    if not todo:
-        return (f"eligibility written for {elig_written}; no new locations to rule on"
-                if elig_written else "nothing to do")
+    # ⚠️ NO EARLY RETURN HERE. An empty city queue is the NORMAL steady state once the backlog
+    # is ruled on, and the office stage further down is a different queue entirely. Returning
+    # here meant address resolution could only run on a day that also happened to discover a
+    # new city, which is to say almost never.
 
     pending = []
 
@@ -3151,10 +3281,10 @@ def job_place() -> str:
             measure_queue.append(t)
 
     flush()
-    if measure_queue and not GOOGLE_MAPS_KEY:
+    if not GOOGLE_MAPS_KEY:
         return (f"eligibility {elig_written}; ruled {ruled}; "
                 f"{len(measure_queue)} need measuring but GOOGLE_MAPS_API_KEY is unset")
-    if measure_queue and not origin:
+    if not origin:
         return f"eligibility {elig_written}; ruled {ruled}; no commute origin configured"
 
     when = _next_weekday_9am()
@@ -3183,11 +3313,91 @@ def job_place() -> str:
             ruled["measured"] += 1
 
     flush()
+    # ── 5. the employer's actual office, measured to instead of the city ───────
+    # ⭐ WHY THIS IS A PREREQUISITE AND NOT A REFINEMENT. Everything above measures to a city
+    # centroid, which is a guess whose error grows with the size of the city. The commute
+    # number IS the quantity this system exists to decide on, so the office address is the
+    # reference the measurement should have been taken from all along.
+    #
+    # 🚨 FOUR SKIPS, EACH ONE A WRONG ANSWER AVOIDED. A precise address for the WRONG office
+    # is worse than a centroid, because it looks authoritative.
+    addr_done = {"resolved": 0, "rejected": 0, "skipped": 0}
+    if GOOGLE_MAPS_KEY and origin:
+        with db() as con:
+            pairs = con.execute(
+                "SELECT sc.board, sc.location, count(*) n "
+                "  FROM scan_candidate sc "
+                " WHERE cast(sc.score as int) >= ? AND sc.board <> '' "
+                "   AND coalesce(sc.eligibility,'unknown') <> 'ineligible' "
+                "   AND sc.location IS NOT NULL AND sc.location <> '' "
+                " GROUP BY sc.board, sc.location", (PLACE_MIN_SCORE,)).fetchall()
+            have_pair = {(r["board"], r["location"]) for r in con.execute(
+                "SELECT board, location FROM place WHERE board <> '' AND origin = ?",
+                (origin,)).fetchall()}
+            city = {r["location"]: dict(r) for r in con.execute(
+                "SELECT location, verdict, best_min FROM place WHERE board = '' AND origin = ?",
+                (origin,)).fetchall()}
+
+        todo_addr = []
+        for r in pairs:
+            b, loc = r["board"], r["location"]
+            if (b, loc) in have_pair:
+                continue
+            c = city.get(loc) or {}
+            if _G.REMOTE_TXT.search(loc) or _MULTI.search(loc) or _UNROUTABLE.match(loc):
+                # No office to find, or several and one address would be the wrong one.
+                addr_done["skipped"] += 1
+            elif c.get("verdict") == "too_far" and (c.get("best_min") or 0) > ceiling * 2:
+                # ⚠️ No address makes Kelowna commutable. Sharpening a number nobody disputes
+                # is the definition of spending for nothing.
+                addr_done["skipped"] += 1
+            else:
+                todo_addr.append((b, loc, r["n"]))
+
+        for b, loc, n in todo_addr[:ADDRESS_BATCH]:
+            company = b.split("|", 1)[-1]          # board key is platform|token
+            res = resolve_office(company, loc)
+            if res.get("status") != "ok":
+                # Recorded, not discarded: a failed lookup is a fact about this pair and
+                # stops it being retried every run.
+                with db() as con:
+                    con.execute(
+                        "INSERT INTO place (origin, board, location, postings, verdict, "
+                        "verdict_from, address_status, note, ruled_by) "
+                        "VALUES (?,?,?,?,NULL,NULL,?,?,?)",
+                        (origin, b, loc, n, res["status"],
+                         str(res.get("got") or res.get("error") or "")[:180], ver))
+                addr_done["rejected"] += 1
+                continue
+            # Measure to the ADDRESS, which is the whole point of having resolved it.
+            try:
+                dr = _measure(origin, [res["address"]], "driving", when)[0]
+                tr = _measure(origin, [res["address"]], "transit", when)[0]
+            except Exception:                                     # noqa: BLE001
+                dr = tr = None
+            opts = [(m, v) for m, v in (("drive", dr), ("transit", tr)) if v is not None]
+            mode, best = min(opts, key=lambda x: x[1]) if opts else (None, None)
+            with db() as con:
+                con.execute(
+                    "INSERT INTO place (origin, board, location, postings, address, place_id, "
+                    "place_name, address_status, best_min, best_mode, verdict, verdict_from, "
+                    "measured_at, note, ruled_by) VALUES (?,?,?,?,?,?,?,'ok',?,?,?,?,?,?,?)",
+                    (origin, b, loc, n, res["address"], res.get("place_id"), res.get("name"),
+                     best, mode,
+                     None if best is None else ("commutable" if best <= ceiling else "too_far"),
+                     None if best is None else "measurement",
+                     now() if best is not None else None,
+                     "measured to the resolved office, not the city", ver))
+            addr_done["resolved"] += 1
+
     left = max(0, len(measure_queue) - PLACE_BATCH * 4)
     return ((f"re-origin: dropped {dropped_stale} stale rows; " if dropped_stale else "")
             + f"eligibility {elig_written}; remote {ruled['remote']}, multi {ruled['multi']}, "
             f"unroutable {ruled['unroutable']}, measured {ruled['measured']}, "
-            f"failed {ruled['failed']}" + (f"; {left} left for the next run" if left else ""))
+            f"failed {ruled['failed']}"
+            + (f"; offices resolved {addr_done['resolved']}, rejected {addr_done['rejected']}, "
+               f"skipped {addr_done['skipped']}" if any(addr_done.values()) else "")
+            + (f"; {left} left for the next run" if left else ""))
 
 
 def job_table() -> list:
