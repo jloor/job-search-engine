@@ -1577,6 +1577,14 @@ On Wed, Aug 12, 2026 the candidate wrote:
               "live=true" in _ai1["result"], True)
         check("the key value never appears in the response",
               "sk-not-a-real-key" in _j8.dumps(_ai1), False)
+        # ⚠️ The success path must report fields the schema actually defines. Reporting a
+        # `label` that AI_SCHEMA does not have made a good reply read as a failed one.
+        _src_ai = _i.getsource(_appa.diag_ai)
+        check("the live result reports a real schema field",
+              "classification=r.get" in _src_ai, True)
+        check("...and not an invented one", 'label=r.get("label")' in _src_ai, False)
+        check("...which AI_SCHEMA confirms exists",
+              "classification" in _appa.AI_SCHEMA["properties"], True)
 
         # A read token is not an admin token. This route names every job and its schedule.
         try:

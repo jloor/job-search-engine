@@ -3289,8 +3289,13 @@ def diag_ai(request: Request, authorization: str | None = Header(None), live: bo
         r = ai_read_message("Interview scheduling",
                             "Hi, are you free Tuesday at 10am to talk about the role?",
                             to_alias="diag@" + (MAIL_DOMAIN or "example.com"))
+        # ⚠️ Report the fields the schema ACTUALLY defines. An earlier version reported
+        # `label`, which is not in AI_SCHEMA, so a perfectly good reply came back as
+        # "label: None" and read as a model that had failed to classify. A diagnostic that
+        # invents a field name is the same lie as one that hides a failure.
         out.update(live_called=True, ok=True, elapsed_ms=int((time.time() - t0) * 1000),
-                   label=r.get("label"), usage=r.get("_usage"),
+                   classification=r.get("classification"), confidence=r.get("confidence"),
+                   usage=r.get("_usage"),
                    result="the configured model answered and its reply parsed")
     except Exception as e:                                        # noqa: BLE001
         out.update(live_called=True, ok=False, elapsed_ms=int((time.time() - t0) * 1000),
