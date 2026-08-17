@@ -3052,6 +3052,7 @@ def job_place() -> str:
     ver = ENGINE_VERSION
     elig_written = 0
     ruled = {"remote": 0, "multi": 0, "unroutable": 0, "measured": 0, "failed": 0}
+    dropped_stale = 0
 
     with db() as con:
         # ── 1. eligibility, free, for everything that lacks it ─────────────────────
@@ -3077,8 +3078,23 @@ def job_place() -> str:
             "   AND coalesce(eligibility,'unknown') <> 'ineligible' "
             " GROUP BY location", (PLACE_MIN_SCORE,)).fetchall()
         known = {r["location"] for r in
-                 con.execute("SELECT DISTINCT location FROM place").fetchall()}
+                 con.execute("SELECT DISTINCT location FROM place "
+                             "WHERE origin = ?", (origin,)).fetchall()}
         todo = [dict(r) for r in cand if r["location"] not in known]
+
+        # 🚨 A MEASUREMENT IS ONLY TRUE OF THE ORIGIN IT WAS TAKEN FROM. Changing the origin
+        # invalidates every one of them, and that is correct rather than a bug: they measured
+        # the trip from somewhere else. The rows are matched on `origin` above, so a changed
+        # origin simply makes them invisible and they are re-measured as if new. Stale rows
+        # are DELETED rather than left beside the new ones, because two rows for one location
+        # with different origins is exactly the ambiguity `verdict_from` exists to prevent.
+        stale = con.execute("SELECT count(*) n FROM place WHERE origin <> ?",
+                            (origin,)).fetchone()["n"]
+        if stale:
+            con.execute("DELETE FROM place WHERE origin <> ?", (origin,))
+            dropped_stale = stale
+            audit("job_place_reorigin",
+                  f"origin changed; dropped {stale} rows measured from a previous origin")
 
     if not todo:
         return (f"eligibility written for {elig_written}; no new locations to rule on"
@@ -3153,7 +3169,8 @@ def job_place() -> str:
 
     flush()
     left = max(0, len(measure_queue) - PLACE_BATCH * 4)
-    return (f"eligibility {elig_written}; remote {ruled['remote']}, multi {ruled['multi']}, "
+    return ((f"re-origin: dropped {dropped_stale} stale rows; " if dropped_stale else "")
+            + f"eligibility {elig_written}; remote {ruled['remote']}, multi {ruled['multi']}, "
             f"unroutable {ruled['unroutable']}, measured {ruled['measured']}, "
             f"failed {ruled['failed']}" + (f"; {left} left for the next run" if left else ""))
 

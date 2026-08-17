@@ -1311,6 +1311,24 @@ On Wed, Aug 12, 2026 the candidate wrote:
         # ⚠️ It walks the whole candidate table, so it outlives a request.
         check("place is async, so a CDN timeout cannot kill it",
               "place" in _app7.ASYNC_JOBS, True)
+
+        # 🚨 A MEASUREMENT IS ONLY TRUE OF THE ORIGIN IT WAS TAKEN FROM. Changing the origin
+        # invalidates all of them. Keeping the old rows would leave two answers for one
+        # location, measured from different doorsteps, with nothing saying which is current.
+        with _app7.db() as c:
+            _before = c.execute("SELECT count(*) n FROM place").fetchone()["n"]
+            c.execute("UPDATE place SET origin='Somewhere Else, NJ'")
+        _o7.environ["COMMUTE_ORIGIN"] = "1 Test St, Dumont, NJ"
+        _app7.job_place()
+        with _app7.db() as c:
+            _after = c.execute("SELECT count(*) n FROM place WHERE origin='Somewhere Else, NJ'"
+                               ).fetchone()["n"]
+            _fresh = c.execute("SELECT count(*) n FROM place WHERE origin='1 Test St, Dumont, NJ'"
+                               ).fetchone()["n"]
+        check("rows measured from a previous origin are dropped", _after, 0)
+        check("...and the locations are ruled on again from the new one", _fresh > 0, True)
+        check("...so a location never carries two origins at once", _before > 0, True)
+        _o7.environ.pop("COMMUTE_ORIGIN", None)
     finally:
         if _p7 is None: _o7.environ.pop("DB_PATH", None)
         else: _o7.environ["DB_PATH"] = _p7
