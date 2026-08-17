@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import hashlib, hmac, json, os, re, smtplib, sqlite3, ssl, sys, secrets, threading, time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid, parseaddr
 from pathlib import Path
@@ -345,6 +345,13 @@ MIGRATIONS = [
     "  AND id <= (SELECT max(id) FROM scan_run)",
     # 2026-08-14: triage cost was unmeasurable. See schema.sql for why cache_read is the
     # column that actually decides whether this system is expensive.
+    # 🚨 ELIGIBILITY WAS THE ONLY GATE WHOSE ANSWER WAS DISCARDED. Pay, remote and
+    # commute all store a verdict and its provenance; this was recomputed by every
+    # reader from whatever gates.py they happened to have, so a stale laptop produced
+    # a different queue than production, silently. eligibility_from records the engine
+    # that decided, which turns a rule change into a targeted re-gate.
+    "ALTER TABLE scan_candidate ADD COLUMN eligibility TEXT",
+    "ALTER TABLE scan_candidate ADD COLUMN eligibility_from TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN model TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN input_tokens INTEGER",
     "ALTER TABLE scan_candidate ADD COLUMN output_tokens INTEGER",
@@ -2952,6 +2959,189 @@ def job_comp() -> str:
     return (f"extracted {found} verified band(s); {badquote} unverifiable quote, "
             f"{badnums} numbers not in the quote, {none} stated no band")
 
+# ---------------------------------------------------------------- place: where is it --
+PLACE_EVERY_MIN  = int(os.environ.get("PLACE_EVERY_MIN", "53"))
+# Only locations attached to a candidate at least this good are worth an API call. A
+# commute for a posting he would never open is a number nobody reads.
+PLACE_MIN_SCORE  = int(os.environ.get("PLACE_MIN_SCORE", "70"))
+# One Distance Matrix call carries 25 destinations, so this is the natural batch.
+PLACE_BATCH      = int(os.environ.get("PLACE_BATCH", "25"))
+GOOGLE_MAPS_KEY  = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+DISTANCE_API     = "https://maps.googleapis.com/maps/api/distancematrix/json"
+
+# A location string that names a country or a whole region is not a destination. Routing to
+# "USA" returns a real number about an arbitrary point, and 27 postings sat behind that one
+# string. These are recorded as unroutable rather than measured.
+_UNROUTABLE = re.compile(
+    r"^\s*(usa|u\.s\.a\.?|us|u\.s\.?|united states(?: of america)?|"
+    r"nationwide|anywhere|multiple locations|various|flexible)\s*$", re.I)
+# Several places in one string. A single measurement would describe exactly one of them,
+# and on 2026-08-16 that produced 2,568 minutes for a role whose New York office is 75.
+_MULTI = re.compile(r"\s\|\s|;|\bor\b|/(?=\s*[A-Z])|,\s*[A-Z][a-z]+,\s*[A-Z]{2}\s*,")
+
+
+def _next_weekday_9am() -> int:
+    """Unix time for the next Tuesday 09:00 local-ish. Commutes are a weekday question."""
+    import calendar
+    now = datetime.now(timezone.utc)
+    d = now + timedelta(days=(1 - now.weekday()) % 7 or 7)
+    d = d.replace(hour=13, minute=0, second=0, microsecond=0)   # 09:00 ET in UTC
+    return calendar.timegm(d.utctimetuple())
+
+
+def _measure(origin: str, dests: list, mode: str, when: int) -> list:
+    """Minutes per destination, or None. Mirrors tools/commute-lookup.py exactly."""
+    import urllib.parse, urllib.request
+    p = {"origins": origin, "destinations": "|".join(dests), "mode": mode,
+         "units": "imperial", "key": GOOGLE_MAPS_KEY}
+    if mode == "driving":
+        p["departure_time"] = str(when)     # duration_in_traffic needs a future departure
+        p["traffic_model"] = "pessimistic"
+    else:
+        # Transit anchors on ARRIVAL. He must be there by 09:00, and the schedule that
+        # achieves that is not the one departing at 09:00.
+        p["arrival_time"] = str(when)
+    with urllib.request.urlopen(f"{DISTANCE_API}?{urllib.parse.urlencode(p)}", timeout=60) as r:
+        d = json.load(r)
+    if d.get("status") != "OK":
+        raise RuntimeError(f"{d.get('status')}: {str(d.get('error_message',''))[:120]}")
+    out = []
+    for el in d["rows"][0]["elements"]:
+        if el.get("status") != "OK":
+            out.append(None); continue
+        sec = (el.get("duration_in_traffic") or el.get("duration") or {}).get("value")
+        out.append(round(sec / 60) if sec else None)
+    return out
+
+
+def job_place() -> str:
+    """
+    Post-scan: record WHERE every candidate is, as data rather than as a recomputation.
+
+    🚨 WHY THIS JOB EXISTS. Until now nothing in the service ever wrote the `place` table.
+    Every row in it came from a laptop script run by hand, so a scan that discovered a new
+    city produced a candidate with no commute, no verdict, and no way for the too_far gate
+    to reject it. 9,894 of 12,389 candidates had no commute data, and that was not a
+    backlog: nothing was working through it.
+
+    🚨 AND WHY ELIGIBILITY IS WRITTEN DOWN. It was the only gate whose answer was thrown
+    away. Pay, remote and commute all store their verdict AND its provenance; eligibility
+    was recomputed by every reader from whatever `gates.py` that reader happened to have.
+    A laptop running a stale engine therefore produced a different queue than production,
+    silently. Storing it makes reading a query instead of an execution, and
+    `eligibility_from` makes a rule change a targeted re-gate rather than a blind rescan.
+
+    ⭐ ORDER IS THE DESIGN, and every step that can end a decision runs before the ones
+    that cost money:
+        1. eligibility for every row            free, no API, no model
+        2. remote in the text                   no office, so no commute to find
+        3. names several places                 a single measurement would be the wrong one
+        4. a country or region                  not a destination at all
+        5. what is left                         measured, and only then
+    """
+    try:
+        import candidate as _C, gates as _G
+    except Exception as e:                                        # noqa: BLE001
+        return f"skipped: {type(e).__name__}: {e}"
+    cfg = _C.load()
+    if not cfg:
+        return "skipped: no candidate config"
+
+    origin = os.environ.get("COMMUTE_ORIGIN") or (cfg.get("commute") or {}).get("origin")
+    ceiling = int((cfg.get("commute") or {}).get("max_minutes") or 90)
+    ver = ENGINE_VERSION
+    elig_written = 0
+    ruled = {"remote": 0, "multi": 0, "unroutable": 0, "measured": 0, "failed": 0}
+
+    with db() as con:
+        # ── 1. eligibility, free, for everything that lacks it ─────────────────────
+        rows = con.execute("SELECT id, location FROM scan_candidate "
+                           "WHERE eligibility IS NULL LIMIT 5000").fetchall()
+        for r in rows:
+            con.execute("UPDATE scan_candidate SET eligibility=?, eligibility_from=? WHERE id=?",
+                        (_G.eligibility(r["location"] or ""), ver, r["id"]))
+            elig_written += 1
+
+        # ── 2. the locations that still need a WHERE answer ────────────────────────
+        cand = con.execute(
+            "SELECT location, max(cast(score as int)) hi, count(*) n "
+            "  FROM scan_candidate "
+            " WHERE location IS NOT NULL AND location <> '' "
+            "   AND cast(score as int) >= ? "
+            "   AND coalesce(eligibility,'unknown') <> 'ineligible' "
+            " GROUP BY location", (PLACE_MIN_SCORE,)).fetchall()
+        known = {r["location"] for r in
+                 con.execute("SELECT DISTINCT location FROM place").fetchall()}
+        todo = [dict(r) for r in cand if r["location"] not in known]
+
+    if not todo:
+        return (f"eligibility written for {elig_written}; no new locations to rule on"
+                if elig_written else "nothing to do")
+
+    def record(loc, n, verdict, frm, note, best=None, mode=None):
+        with db() as con:
+            con.execute(
+                "INSERT INTO place (origin, board, location, postings, verdict, verdict_from, "
+                "note, best_min, best_mode, measured_at) VALUES (?,'',?,?,?,?,?,?,?,?)",
+                (origin, loc, n, verdict, frm, note, best, mode,
+                 now() if best is not None else None))
+
+    measure_queue = []
+    for t in todo:
+        loc = t["location"]
+        if _G.REMOTE_TXT.search(loc):
+            record(loc, t["n"], "remote", "rule", "remote in the location text")
+            ruled["remote"] += 1
+        elif _MULTI.search(loc):
+            # 🚨 NEVER MEASURE THIS. Reuse the same cascade the gate uses, which reads the
+            # whole list against the metro rule instead of routing to one arbitrary entry.
+            v = _G.cascade_hybrid("hybrid", loc, "", cfg)
+            record(loc, t["n"], "commutable" if v == "hybrid_commutable" else "review",
+                   "rule", "names several places; judged by the metro rule, not measured")
+            ruled["multi"] += 1
+        elif _UNROUTABLE.match(loc):
+            record(loc, t["n"], "review", "rule", "country or region level; not a destination")
+            ruled["unroutable"] += 1
+        else:
+            measure_queue.append(t)
+
+    if measure_queue and not GOOGLE_MAPS_KEY:
+        return (f"eligibility {elig_written}; ruled {ruled}; "
+                f"{len(measure_queue)} need measuring but GOOGLE_MAPS_API_KEY is unset")
+    if measure_queue and not origin:
+        return f"eligibility {elig_written}; ruled {ruled}; no commute origin configured"
+
+    when = _next_weekday_9am()
+    for i in range(0, min(len(measure_queue), PLACE_BATCH * 4), PLACE_BATCH):
+        chunk = measure_queue[i:i + PLACE_BATCH]
+        dests = [c["location"] for c in chunk]
+        try:
+            drive = _measure(origin, dests, "driving", when)
+            transit = _measure(origin, dests, "transit", when)
+        except Exception as e:                                    # noqa: BLE001
+            audit("job_place_error", f"{type(e).__name__}: {e}")
+            ruled["failed"] += len(chunk)
+            continue
+        for c, dr, tr in zip(chunk, drive, transit):
+            # 📌 BOTH MODES, BEST WINS. Driving alone puts Manhattan at 98 minutes, over the
+            # ceiling; transit does it in 52. Querying one mode would delete the NYC tier.
+            opts = [(m, v) for m, v in (("drive", dr), ("transit", tr)) if v is not None]
+            if not opts:
+                record(c["location"], c["n"], "review", "rule", "no route found")
+                ruled["failed"] += 1
+                continue
+            mode, best = min(opts, key=lambda x: x[1])
+            record(c["location"], c["n"],
+                   "commutable" if best <= ceiling else "too_far",
+                   "measurement", f"best of drive/transit, arrive 09:00", best, mode)
+            ruled["measured"] += 1
+
+    left = max(0, len(measure_queue) - PLACE_BATCH * 4)
+    return (f"eligibility {elig_written}; remote {ruled['remote']}, multi {ruled['multi']}, "
+            f"unroutable {ruled['unroutable']}, measured {ruled['measured']}, "
+            f"failed {ruled['failed']}" + (f"; {left} left for the next run" if left else ""))
+
+
 def job_table() -> list:
     """
     The one place a scheduled job is declared.
@@ -2968,7 +3158,8 @@ def job_table() -> list:
             ("scan", SCAN_EVERY_HRS * 3600, job_scan),
             ("triage", TRIAGE_EVERY_MIN * 60, job_triage),
             ("remote_check", REMOTE_EVERY_MIN * 60, job_remote_check),
-            ("comp", COMP_EVERY_MIN * 60, job_comp)]
+            ("comp", COMP_EVERY_MIN * 60, job_comp),
+            ("place", PLACE_EVERY_MIN * 60, job_place)]
 
 
 async def _scheduler() -> None:

@@ -1213,6 +1213,102 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # Both AI sub-processes must be reachable from the one registry.
     check("remote_check is registered", "remote_check" in _names, True)
     check("comp is registered", "comp" in _names, True)
+    check("place is registered", "place" in _names, True)
+
+    # ── job_place: where is it, recorded as data ──────────────────────────────────
+    # 🚨 NOTHING IN THE SERVICE EVER WROTE THE place TABLE. Every row came from a laptop
+    # script, so a scan that found a new city produced a candidate with no commute, no
+    # verdict, and no way for the too_far gate to reject it. 9,894 of 12,389 candidates had
+    # no commute data and nothing was working through it.
+    #
+    # ⭐ The tests below are all about the steps that must happen BEFORE anything is
+    # measured. Each one prevented a real wrong answer.
+    print("\njob_place rules on WHERE before it spends anything:")
+    import os as _o7, tempfile as _t7, sqlite3 as _s7
+    _d7 = str(_t7.mkdtemp()) + "/place.db"
+    _p7 = _o7.environ.get("DB_PATH"); _o7.environ["DB_PATH"] = _d7
+    # The seed profile is the config a stranger runs with. Its origin is Chicago and its
+    # ceiling is 75 minutes, so the assertions below are about the RULES, not about numbers
+    # that only make sense from one person's doorstep.
+    _pc7 = _o7.environ.get("CANDIDATE_CONFIG")
+    _o7.environ["CANDIDATE_CONFIG"] = str(HERE.parent / "seed" / "candidate.toml")
+    try:
+        _app7 = load_app()
+        import candidate as _C7; _C7._cache.clear()
+        _c7 = _s7.connect(_d7)
+        _c7.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+        for stmt in _app7.MIGRATIONS:
+            try: _c7.execute(stmt)
+            except Exception: pass
+        _c7.commit()
+        # One candidate per location shape, all scoring above the threshold.
+        for i, loc in enumerate([
+                "Remote - US",                                   # remote text
+                "San Francisco, CA | New York City, NY",         # several places
+                "USA",                                           # not a destination
+                "Toronto, Ontario",                              # ineligible
+                "Nashville, TN"]):                               # genuinely measurable
+            _c7.execute("INSERT INTO scan_candidate (at,req_id,board,title,location,score,triaged) "
+                        "VALUES (?,?,?,?,?,?,1)",
+                        ("2026-08-17T00:00:00+00:00", f"r{i}", "gh|x",
+                         "Support Engineer", loc, 95))
+        _c7.commit(); _c7.close()
+
+        # 🚨 NO KEY, SO NO CALL. The job must still do all its free work and say what it
+        # could not finish, rather than doing nothing because one credential is absent.
+        _app7.GOOGLE_MAPS_KEY = ""
+        _out7 = _app7.job_place()
+        with _app7.db() as c:
+            _el = {r["location"]: r["eligibility"] for r in
+                   c.execute("SELECT location, eligibility FROM scan_candidate").fetchall()}
+            _pl = {r["location"]: dict(r) for r in
+                   c.execute("SELECT * FROM place").fetchall()}
+        check("eligibility is WRITTEN, not recomputed by readers",
+              _el.get("Nashville, TN"), "eligible")
+        check("...including the ineligible one", _el.get("Toronto, Ontario"), "ineligible")
+        with _app7.db() as c:
+            _ef = c.execute("SELECT eligibility_from f FROM scan_candidate "
+                            "WHERE eligibility_from IS NOT NULL LIMIT 1").fetchone()
+        check("...and it records which engine decided", bool(_ef and dict(_ef)["f"]), True)
+        # ⚠️ An ineligible location must never reach the paid stage at all.
+        check("an ineligible location is not ruled on for commute",
+              "Toronto, Ontario" in _pl, False)
+        check("remote text needs no office", _pl["Remote - US"]["verdict"], "remote")
+        check("...decided by rule, not measurement",
+              _pl["Remote - US"]["verdict_from"], "rule")
+        # 🚨 THE 2,568-MINUTE BUG. One measurement describes ONE of the named cities.
+        check("several places are never measured",
+              _pl["San Francisco, CA | New York City, NY"]["best_min"], None)
+        check("...they are judged by the metro rule instead",
+              _pl["San Francisco, CA | New York City, NY"]["verdict_from"], "rule")
+        check("a country is not a destination", _pl["USA"]["verdict"], "review")
+        check("...and is not measured either", _pl["USA"]["best_min"], None)
+        check("the measurable one is left for the paid stage", "Nashville, TN" in _pl, False)
+        check("...and the job says so out loud rather than failing silently",
+              "GOOGLE_MAPS_API_KEY" in _out7, True)
+
+        # With a key, the measurable one is measured and both modes are consulted.
+        _app7.GOOGLE_MAPS_KEY = "test-key"
+        _calls = []
+        def _fake(origin, dests, mode, when):
+            _calls.append(mode)
+            return [40 if mode == "transit" else 120 for _ in dests]
+        _app7._measure = _fake
+        _app7.job_place()
+        with _app7.db() as c:
+            _n = dict(c.execute("SELECT * FROM place WHERE location='Nashville, TN'").fetchone())
+        check("both modes are queried, never one", sorted(set(_calls)), ["driving", "transit"])
+        # 📌 Driving alone puts Manhattan over the ceiling; transit does it in 52. Best wins.
+        check("the better mode wins", (_n["best_min"], _n["best_mode"]), (40, "transit"))
+        check("and the verdict came from the measurement", _n["verdict_from"], "measurement")
+        check("...and it is commutable at 40 minutes", _n["verdict"], "commutable")
+    finally:
+        if _p7 is None: _o7.environ.pop("DB_PATH", None)
+        else: _o7.environ["DB_PATH"] = _p7
+        if _pc7 is None: _o7.environ.pop("CANDIDATE_CONFIG", None)
+        else: _o7.environ["CANDIDATE_CONFIG"] = _pc7
+        import candidate as _C7b; _C7b._cache.clear()
+
     check("the pacer is shared by every AI sub-process",
           "_pace" in _src_of(app.job_remote_check) and "_pace" in _src_of(app.job_comp),
           True)
