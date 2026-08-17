@@ -3,7 +3,9 @@
 name: tests
 on: [push, pull_request]
 jobs:
-  test:
+  # The suite as a stranger runs it: a clean clone, nothing installed, no network.
+  # This is the job that must stay green for the repository to be honest about itself.
+  bare:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -14,3 +16,35 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python3 tests/test_parse.py
+
+  # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
+  #
+  # comp.py here and body_comp() in fetch_job_description are two implementations of the
+  # same pay-band reading. Neither package can import the other by design: the archiver
+  # declares zero dependencies and this suite must pass with nothing installed. So the
+  # suite compares them only when both happen to be present, and otherwise records a SKIP.
+  #
+  # ⚠️ A skip exits 0. The bare job above therefore reports success having never compared
+  # them, and the only machine where the guard actually ran was the operator's laptop,
+  # because the archiver happened to be installed there. One `pip uninstall` and two
+  # implementations of the same rule could diverge in silence, permanently.
+  #
+  # This job installs the archiver so the comparison HAPPENS, and passes --strict so a
+  # skip counts as a failure. If the archiver ever stops installing, this job goes red
+  # rather than quietly reverting to a comparison of nothing against nothing.
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Both optional dependencies, because --strict fails on ANY skip and there are two.
+      # email-reply-parser gates the quoted-history block: without it strip_quotes is a
+      # no-op by design and the misclassification bug it was written for is untested.
+      - name: install both optional dependencies
+        run: |
+          pip install email-reply-parser==0.5.12
+          pip install "fetch-job-description @ git+https://github.com/jloor/fetch_job_description@main"
+      - name: the suite, where a skip is a failure
+        run: python3 tests/test_parse.py --strict

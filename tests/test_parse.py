@@ -124,9 +124,18 @@ def main() -> int:
     fixture = json.loads((HERE / "fixtures" / "improvmx-webhook.json").read_text())
     failures = []
     skipped = []
-    # --strict turns a skip into a failure. CI and the published repo use it, because there
-    # the dependency is installed from requirements.txt and an absent parser is a real fault.
-    # A developer machine runs without it, so a missing optional dependency reports loudly
+    # --strict turns a skip into a failure.
+    #
+    # ⚠️ THIS USED TO BE ASPIRATIONAL. The comment here claimed CI used --strict; CI ran
+    # the suite bare, so both optional blocks skipped on every run and exited 0. The comp
+    # drift guard, whose whole purpose is to catch two implementations diverging, had
+    # therefore never run anywhere except the operator's laptop, and only because the
+    # archiver happened to be installed there.
+    #
+    # ci.yml now runs the suite TWICE: a `bare` job, which is what a stranger with nothing
+    # installed sees and must stay green, and a `drift` job that installs both optional
+    # dependencies and passes --strict, so a skip there is a real failure. A developer
+    # machine still runs without it, so a missing optional dependency reports loudly
     # instead of blocking a commit.
     strict = "--strict" in sys.argv
 
