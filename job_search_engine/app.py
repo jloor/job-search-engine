@@ -31,6 +31,21 @@ from fastapi.responses import JSONResponse
 DB_PATH       = os.environ.get("DB_PATH", "/data/relay.db")
 INBOUND_TOKEN = os.environ.get("INBOUND_TOKEN", "")      # secret path segment in the webhook URL
 API_TOKEN     = os.environ.get("API_TOKEN", "")          # bearer token for /send and /mcp
+
+# 🚨 INBOUND_TOKEN IS READ AS A COMMA-SEPARATED LIST, SO IT CAN BE ROTATED WITHOUT LOSING MAIL.
+#
+# The token IS the webhook URL path. Rotating it means changing two systems that cannot move at
+# the same instant: this service and ImprovMX's webhook setting. Whichever moves first,
+# deliveries in between hit a path the other side rejects. ImprovMX retries twice and then drops
+# the message, so the cost of that gap is lost recruiter mail, and it is lost silently.
+#
+# Accepting several tokens turns a race into a safe sequence: add the new token here, point
+# ImprovMX at it, confirm mail is arriving on the new one, then remove the old.
+#
+# ⚠️ EMPTY ENTRIES ARE DROPPED, and that is a security property rather than tidiness. A trailing
+# comma would otherwise yield an empty token, an empty token compares equal to an empty path
+# segment, and the webhook would accept anybody. An unset variable must yield NO valid tokens.
+INBOUND_TOKENS = tuple(t for t in (s.strip() for s in INBOUND_TOKEN.split(",")) if t)
 SMTP_HOST     = os.environ.get("SMTP_HOST", "smtp.improvmx.com")
 SMTP_PORT     = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER     = os.environ.get("SMTP_USER", "")
@@ -3046,6 +3061,10 @@ def diag_ip(request: Request, authorization: str | None = Header(None)):
         "trusted_proxy_hops": TRUSTED_PROXY_HOPS,
         "inbound_allowlist": sorted(ALLOW_INBOUND_IPS) or ["(disabled)"],
         "would_accept_improvmx": (not ALLOW_INBOUND_IPS) or IMPROVMX_SOURCE_IP in ALLOW_INBOUND_IPS,
+        # ⭐ The COUNT, never the tokens. During a rotation this is how you confirm the new
+        # token actually reached the container before ImprovMX is pointed at it. Two means a
+        # cutover is in progress and is not finished; one means it is.
+        "inbound_tokens_configured": len(INBOUND_TOKENS),
         "note": "'resolved' must equal your real public IP. If it shows a proxy address, "
                 "TRUSTED_PROXY_HOPS is too high; if a caller can change it, it is too low.",
     }
@@ -3444,10 +3463,18 @@ async def inbound(token: str, request: Request):
     if ALLOW_INBOUND_IPS and ip not in ALLOW_INBOUND_IPS:
         audit("inbound_rejected", f"source ip {ip!r} not in allowlist", ip)
         raise HTTPException(404, "not found")
-    if not INBOUND_TOKEN or not _eq(token, INBOUND_TOKEN):
+    # ⚠️ Every configured token is compared, with no short circuit on the first match. Stopping
+    # early would make the response time reveal which position matched, and during a rotation
+    # that is exactly the fact an attacker would want. _eq is already constant time per token.
+    matched = [i for i, t in enumerate(INBOUND_TOKENS) if _eq(token, t)]
+    if not INBOUND_TOKENS or not matched:
         # 404 rather than 401: do not confirm the path exists to someone guessing.
         audit("inbound_rejected", "bad inbound token", ip)
         raise HTTPException(404, "not found")
+    # ⭐ WHICH token was used is recorded, never the token itself. Without this a rotation
+    # cannot be finished safely: there is no way to know whether anything still arrives on the
+    # old path, so removing it is a guess. Position 0 is the first entry in INBOUND_TOKEN.
+    token_slot = matched[0]
 
     declared = request.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > MAX_INBOUND_BYTES:
@@ -3467,7 +3494,8 @@ async def inbound(token: str, request: Request):
             (now(), "", raw),
         )
         mid = cur.lastrowid
-        log_event(con, "inbound_raw", f"message {mid} bytes={len(raw_bytes)}", ip)
+        log_event(con, "inbound_raw",
+                  f"message {mid} bytes={len(raw_bytes)} token_slot={token_slot}", ip)
 
     # now parse, and record failure rather than swallowing it
     try:

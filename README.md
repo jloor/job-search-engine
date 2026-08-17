@@ -131,6 +131,38 @@ allowlist is the primary control and the token is the second factor. It retries 
 on any 4xx or 5xx, so rejections happen before any write, and parse failures answer 200
 on purpose (a poison payload must not be redelivered forever; the raw row is already saved).
 
+### Rotating the webhook token without losing mail
+
+🚨 **The token IS the URL path**, so rotating it means changing two systems that cannot move
+at the same instant. Whichever moves first, deliveries in between hit a path the other side
+rejects, ImprovMX retries twice, and the message is **gone silently**.
+
+`INBOUND_TOKEN` is therefore read as a **comma-separated list** and every entry is accepted.
+That turns the race into a sequence:
+
+1. Set `INBOUND_TOKEN=<old>,<new>` on the app. Confirm it landed **before** touching ImprovMX:
+   ```bash
+   curl -s -H "Authorization: Bearer $ADMIN_TOKEN" https://<host>/diag/ip \
+     | python3 -c "import json,sys;print(json.load(sys.stdin)['inbound_tokens_configured'])"
+   # must print 2
+   ```
+2. Point the ImprovMX webhook at `https://<host>/inbound/<new>`.
+3. Wait for real mail, then confirm it arrived on the new path. `token_slot` is the index into
+   the list, so `token_slot=1` means the new token:
+   ```sql
+   SELECT at, detail FROM event WHERE kind='inbound_raw' ORDER BY id DESC LIMIT 5;
+   ```
+4. Only once nothing has arrived on `token_slot=0` for a full mail cycle, set
+   `INBOUND_TOKEN=<new>` alone. `inbound_tokens_configured` returns to 1.
+
+⚠️ **Do not skip step 3.** Removing the old token while ImprovMX still points at it is the
+same outage the list exists to prevent, just later and with less warning.
+
+🚨 **Empty entries are dropped, and that is load-bearing rather than tidy.** An empty token
+compares equal to an empty path segment, so a trailing comma would open the webhook to
+anybody. Measured: with the filter removed, an unconfigured service **accepts** `/inbound/`.
+The suite asserts both cases.
+
 ## Deployed
 
 | | |

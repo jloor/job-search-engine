@@ -1224,6 +1224,97 @@ On Wed, Aug 12, 2026 the candidate wrote:
           all(f"ADD COLUMN {c}" in " ".join(app.MIGRATIONS)
               for c in ("remote_verdict", "comp_min", "comp_basis")), True)
 
+    # ── the webhook token can be rotated without losing mail ──────────────────────
+    # 🚨 THE TOKEN IS THE WEBHOOK URL PATH, so rotating it means changing this service and
+    # ImprovMX's webhook setting, which cannot happen at the same instant. Whichever moves
+    # first, deliveries in between hit a path the other side rejects, ImprovMX retries twice,
+    # and the message is gone. Accepting several tokens turns that race into a sequence.
+    #
+    # ⚠️ The dangerous case is not the happy path, it is the EMPTY one: a trailing comma
+    # yielding an empty token, which compares equal to an empty path segment and would open
+    # the webhook to anybody. That case is asserted below, twice.
+    print("\nthe webhook token can be rotated without a gap:")
+    import os as _o8, tempfile as _t8, sqlite3 as _s8, asyncio as _a8, json as _j8
+    _d8 = str(_t8.mkdtemp()) + "/inb.db"
+    _p8 = _o8.environ.get("DB_PATH"); _o8.environ["DB_PATH"] = _d8
+    _pt8 = _o8.environ.get("INBOUND_TOKEN")
+    try:
+        def _tokens(spec):
+            """Reload the module with INBOUND_TOKEN=spec, because it binds at import."""
+            _o8.environ["INBOUND_TOKEN"] = spec
+            return load_app()
+
+        check("one token, as before", _tokens("solo").INBOUND_TOKENS, ("solo",))
+        check("two tokens are both accepted", _tokens("old,new").INBOUND_TOKENS, ("old", "new"))
+        check("whitespace around a token is stripped",
+              _tokens(" old , new ").INBOUND_TOKENS, ("old", "new"))
+        # 🚨 The two that matter. An unset variable and a trailing comma must BOTH yield no
+        # usable empty token, or the webhook accepts an empty path segment from anyone.
+        check("unset yields NO tokens, not one empty token", _tokens("").INBOUND_TOKENS, ())
+        check("a trailing comma yields no empty token",
+              _tokens("old,").INBOUND_TOKENS, ("old",))
+        check("...and neither does a lone comma", _tokens(",").INBOUND_TOKENS, ())
+
+        # Now drive the REAL endpoint, so this tests the route rather than a copy of its rule.
+        _app8 = _tokens("oldtok,newtok")
+        _c8 = _s8.connect(_d8)
+        _c8.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+        _c8.commit(); _c8.close()
+        _app8.ALLOW_INBOUND_IPS = set()            # the IP gate is tested elsewhere
+
+        class _H8(dict):
+            def get(self, k, d=None): return dict.get(self, k, d)
+
+        class _Req8:
+            client = None
+            def __init__(self, payload):
+                self._b = _j8.dumps(payload).encode()
+                self.headers = _H8({"content-type": "application/json"})
+            async def body(self): return self._b
+
+        def _post(tok, subject):
+            return _a8.run(_app8.inbound(tok, _Req8({
+                "to": [{"name": "J", "email": "probe@jobs.example.com"}],
+                "from": {"name": "R", "email": "r@example.net"},
+                "subject": subject, "text": "hello"})))
+
+        _post("oldtok", "via old")
+        _post("newtok", "via new")
+        with _app8.db() as c:
+            _n8 = c.execute("SELECT count(*) n FROM message").fetchone()["n"]
+            _slots = [r["detail"] for r in c.execute(
+                "SELECT detail FROM event WHERE kind='inbound_raw' ORDER BY id").fetchall()]
+        check("both tokens deliver during a cutover", _n8, 2)
+        # ⭐ Which slot was used is recorded, so a rotation can be FINISHED safely. Without it
+        # there is no way to know whether anything still arrives on the old path.
+        check("the old path records slot 0", "token_slot=0" in _slots[0], True)
+        check("the new path records slot 1", "token_slot=1" in _slots[1], True)
+
+        for _bad, _label in (("wrongtok", "an unknown token"), ("", "an empty token")):
+            try:
+                _post(_bad, "should not land")
+                check(f"{_label} is refused", "accepted", "404")
+            except Exception as _e8:
+                check(f"{_label} is refused", getattr(_e8, "code", 0), 404)
+        with _app8.db() as c:
+            check("...and neither wrote a message",
+                  c.execute("SELECT count(*) n FROM message").fetchone()["n"], 2)
+
+        # 🚨 With nothing configured, EVERY token must fail, including the empty one.
+        _app0 = _tokens("")
+        _app0.ALLOW_INBOUND_IPS = set()
+        for _bad in ("", "anything"):
+            try:
+                _a8.run(_app0.inbound(_bad, _Req8({"subject": "x"})))
+                check(f"unconfigured refuses {_bad!r}", "accepted", "404")
+            except Exception as _e8:
+                check(f"unconfigured refuses {_bad!r}", getattr(_e8, "code", 0), 404)
+    finally:
+        if _p8 is None: _o8.environ.pop("DB_PATH", None)
+        else: _o8.environ["DB_PATH"] = _p8
+        if _pt8 is None: _o8.environ.pop("INBOUND_TOKEN", None)
+        else: _o8.environ["INBOUND_TOKEN"] = _pt8
+
     # ── every import the engine makes is a DECLARED dependency ────────────────────
     # 🚨 MEASURED, NOT HYPOTHETICAL. pyproject declared fastapi and uvicorn while the code
     # imported cryptography, email_reply_parser and anthropic. That was harmless while the
