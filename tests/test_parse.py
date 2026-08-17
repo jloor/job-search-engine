@@ -2333,6 +2333,90 @@ On Wed, Aug 12, 2026 the candidate wrote:
               _ref(wide)[0] is not None, True)
         check("intentional: the queue refuses it", CMP.from_body(wide), None)
 
+    # ---------------------------------------------------------------- auto_application
+    # 🚨 THE TABLE IS DECLARED TWICE, SO THE TWO COPIES ARE COMPARED RATHER THAN TRUSTED.
+    # schema.sql builds a fresh database; the MIGRATIONS entry is what an existing
+    # production database actually runs. Nothing makes them agree except this test, and a
+    # column present in one and missing from the other is invisible until a write fails in
+    # production against a table a local rebuild says is fine.
+    print("\nauto_application:")
+    import os as _o5, pathlib as _pathlib, sqlite3 as _s5, tempfile as _t5
+    _app6 = load_app()
+
+    def _cols_of(build):
+        p = _t5.NamedTemporaryFile(suffix=".db", delete=False).name
+        con = _s5.connect(p)
+        try:
+            build(con)
+            return [(r[1], r[2].upper(), r[3], r[5])          # name, type, notnull, pk
+                    for r in con.execute("PRAGMA table_info(auto_application)")]
+        finally:
+            con.close()
+            _o5.unlink(p)
+
+    _from_schema = _cols_of(lambda c: c.executescript(
+        (_pathlib.Path(_app6.__file__).parent / "schema.sql").read_text()))
+    _migs = [m for m in _app6.MIGRATIONS
+             if isinstance(m, str) and "auto_application" in m]
+
+    def _build_from_migrations(c):
+        for m in _migs:
+            c.execute(m)
+
+    _from_migration = _cols_of(_build_from_migrations)
+
+    check("schema.sql declares it", len(_from_schema) > 0, True)
+    check("MIGRATIONS declares it", len(_from_migration) > 0, True)
+    check("the two declarations agree", _from_schema, _from_migration)
+
+    # The columns the reconciliation and the liveness check actually write. Named
+    # explicitly so a rename upstream fails here rather than in a tool that silently
+    # inserts nothing.
+    _want = {"id", "source", "company_raw", "role_raw", "occurrence", "match_score",
+             "observed_age", "observed_at", "captured_at", "capture_source", "url",
+             "candidate_id", "application_id", "collision", "live_state",
+             "live_checked_at", "live_evidence", "note"}
+    check("column set", {c[0] for c in _from_schema}, _want)
+
+    # ⭐ occurrence is what lets the same company+role appear twice. Three pairs in the
+    # first real import were identical in every visible field, so a UNIQUE without it
+    # would have swallowed one application of each pair with no error at all.
+    _p6 = _t5.NamedTemporaryFile(suffix=".db", delete=False).name
+    _c6 = _s5.connect(_p6)
+    try:
+        _build_from_migrations(_c6)
+        _ins = ("INSERT INTO auto_application(source,company_raw,role_raw,occurrence,"
+                "captured_at) VALUES (?,?,?,?,?)")
+        _c6.execute(_ins, ("aiapply", "Adoreal", "Implementation Specialist", 1, "t"))
+        _c6.execute(_ins, ("aiapply", "Adoreal", "Implementation Specialist", 2, "t"))
+        check("an identical repeat survives", _c6.execute(
+            "SELECT count(*) FROM auto_application").fetchone()[0], 2)
+        _dup = "no error"
+        try:
+            _c6.execute(_ins, ("aiapply", "Adoreal", "Implementation Specialist", 1, "t"))
+        except Exception as e:                                        # noqa: BLE001
+            _dup = "rejected" if "unique" in str(e).lower() else str(e)
+        check("re-importing the same row is refused", _dup, "rejected")
+
+        # ⚠️ 198 of the first 223 rows had no url. If the url index were not partial they
+        # would all collide on NULL and only one could ever be stored.
+        _iu = ("INSERT INTO auto_application(source,company_raw,role_raw,occurrence,"
+               "captured_at,url) VALUES (?,?,?,?,?,?)")
+        _c6.execute(_iu, ("aiapply", "A Co", "A Role", 1, "t", None))
+        _c6.execute(_iu, ("aiapply", "B Co", "B Role", 1, "t", None))
+        check("many rows may have no url", _c6.execute(
+            "SELECT count(*) FROM auto_application WHERE url IS NULL").fetchone()[0], 4)
+        _c6.execute(_iu, ("aiapply", "C Co", "C Role", 1, "t", "https://x/1"))
+        _same = "no error"
+        try:
+            _c6.execute(_iu, ("aiapply", "D Co", "D Role", 1, "t", "https://x/1"))
+        except Exception as e:                                        # noqa: BLE001
+            _same = "rejected" if "unique" in str(e).lower() else str(e)
+        check("one url cannot be stored twice", _same, "rejected")
+    finally:
+        _c6.close()
+        _o5.unlink(_p6)
+
     print()
     if failures:
         print(f"{len(failures)} FAILED")

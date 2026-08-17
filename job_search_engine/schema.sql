@@ -377,3 +377,76 @@ CREATE TABLE IF NOT EXISTS place (
   UNIQUE(origin, board, location)
 );
 CREATE INDEX IF NOT EXISTS place_verdict ON place (origin, verdict);
+
+-- Applications submitted by an OUTSIDE service on the candidate's behalf, imported as a
+-- record. Added 2026-08-17 after an auto-applier was found to have sent 223 applications,
+-- ten of them into companies the hand-curated pipeline was already managing.
+--
+-- 🚨 THIS IS NOT `application` AND MUST NEVER BE MERGED INTO IT. `application` is 39
+-- hand-curated rows that the tracker renderer round-trips byte-for-byte against
+-- `source_row`; 223 machine-submitted rows would swamp it and break that gate. The two
+-- also answer different questions: `application` is what he decided to do, this is what
+-- something else did for him. Keeping them apart is what makes the collision between them
+-- a query rather than a manual audit.
+--
+-- ⚠️ EVERYTHING FROM THE SERVICE IS STORED VERBATIM AND NORMALISED NOWHERE. Company and
+-- role are whatever the service displayed, typos and all. It is a third-party record, not
+-- our own observation, and cleaning it at write time destroys the only copy.
+CREATE TABLE IF NOT EXISTS auto_application (
+  id             INTEGER PRIMARY KEY,
+  source         TEXT NOT NULL,           -- 'aiapply'. The table is not one vendor's.
+  company_raw    TEXT NOT NULL,           -- exactly as the service displayed it
+  role_raw       TEXT NOT NULL,           -- exactly as the service displayed it
+  -- A service can apply twice to the same company and role. Three such pairs were
+  -- identical in every visible field on first import, so without this they collapse into
+  -- one row and the second application silently stops existing.
+  occurrence     INTEGER NOT NULL DEFAULT 1,
+
+  -- 🚨 THE SERVICE'S OWN SCORE, ON THE SERVICE'S OWN SCALE. It is NOT `scan_candidate.
+  -- score` and the two must never be compared or sorted together. Measured on the first
+  -- import: 223 rows scored 69 to 89, clustered at 75-80 almost regardless of fit, while
+  -- the same postings scored 0 to 94 here. A shared column name would invite exactly the
+  -- comparison that makes a director role in Austin look like a match.
+  match_score    INTEGER,
+
+  -- ⭐ TWO COLUMNS FOR ONE DATE, BECAUSE THE SOURCE IS NOT ALWAYS PRECISE. The service
+  -- renders relative ages, and "last month" carries no day. observed_age keeps what it
+  -- actually said; observed_at is the derived date and is NULL when no day can be
+  -- recovered. A single column forces a guess, and a guessed application date is worse
+  -- than an absent one when the question is "did this go out before or after my own".
+  observed_age   TEXT,
+  observed_at    TEXT,
+
+  captured_at    TEXT NOT NULL,           -- when the record was read out of the service
+  capture_source TEXT,                    -- screenshot filenames, export id: what to re-read
+
+  -- ⚠️ USUALLY NULL, AND THAT IS THE POINT. A dashboard screenshot has no links, so 201 of
+  -- the first 223 rows arrived without one and their liveness is unanswerable. An empty
+  -- url is the record of that, and it is what a future export has to fill.
+  --
+  -- 🚨 THIS IS THE SERVICE'S OWN LINK AND NOTHING ELSE. Never copy the queue's url here
+  -- after a candidate_id match: two auto-applications can match ONE queue posting (the
+  -- service applied twice), and writing it here makes the pair collide on the unique
+  -- index below. Read the queue's link through candidate_id instead.
+  url            TEXT,
+
+  candidate_id   INTEGER,                 -- scan_candidate.id, when the queue holds the posting
+  application_id INTEGER,                 -- application.id, when it lands on a tracked company
+  -- same_role    = the service applied to a requisition already in the tracker
+  -- same_company = a different role at a company the tracker is managing
+  -- NULL = no collision matched. Not a claim that none exists.
+  collision      TEXT,
+
+  live_state     TEXT,                    -- live | gone | unknown
+  live_checked_at TEXT,
+  live_evidence  TEXT,                    -- what the ATS actually answered
+  note           TEXT,
+  UNIQUE(source, company_raw, role_raw, occurrence)
+);
+-- Partial, so the rows with no url do not collide with each other on NULL. Once an export
+-- supplies real links the url is the stronger identity, and this stops a second import of
+-- the same export from duplicating every row.
+CREATE UNIQUE INDEX IF NOT EXISTS auto_application_url
+  ON auto_application (source, url) WHERE url IS NOT NULL AND url != '';
+CREATE INDEX IF NOT EXISTS auto_application_collision
+  ON auto_application (collision, live_state);

@@ -400,6 +400,22 @@ MIGRATIONS = [
     # a single column a held row is indistinguishable from a confirmed one, so it either
     # never gets reported or gets reported on every sweep forever.
     "ALTER TABLE board_state ADD COLUMN vanish_confirmed_at TEXT",
+    # 2026-08-17: applications an outside auto-applier sent on his behalf. Declared in
+    # schema.sql with the reasoning; repeated here so an existing database gets it without
+    # a rebuild. ⚠️ The column list must stay identical to schema.sql — this statement is
+    # what production actually runs, and a fresh build runs the other one. A drift test in
+    # the suite compares them rather than trusting that two copies stay equal.
+    ("CREATE TABLE IF NOT EXISTS auto_application ("
+     "id INTEGER PRIMARY KEY, source TEXT NOT NULL, company_raw TEXT NOT NULL, "
+     "role_raw TEXT NOT NULL, occurrence INTEGER NOT NULL DEFAULT 1, match_score INTEGER, "
+     "observed_age TEXT, observed_at TEXT, captured_at TEXT NOT NULL, capture_source TEXT, "
+     "url TEXT, candidate_id INTEGER, application_id INTEGER, collision TEXT, "
+     "live_state TEXT, live_checked_at TEXT, live_evidence TEXT, note TEXT, "
+     "UNIQUE(source, company_raw, role_raw, occurrence))"),
+    ("CREATE UNIQUE INDEX IF NOT EXISTS auto_application_url "
+     "ON auto_application (source, url) WHERE url IS NOT NULL AND url != ''"),
+    ("CREATE INDEX IF NOT EXISTS auto_application_collision "
+     "ON auto_application (collision, live_state)"),
 ]
 
 
