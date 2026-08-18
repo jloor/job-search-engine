@@ -2373,6 +2373,22 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("workday carries no description", _r[0]["description"], "")
     check("workday carries no band", _r[0]["comp"], None)
 
+    # ⚠️ The second Workday URL form, which the first implementation missed entirely and
+    # would have stored with an empty url. TransTRACK sits under its parent Modaxo's
+    # tenant on the myworkdaysite host.
+    _saved2 = _app7._workday_list
+    _app7._workday_list = lambda url: {"total": 1, "jobPostings": [
+        {"title": "Customer Care Analyst", "externalPath": "/job/United-States---TX/CCA_R57513",
+         "locationsText": "United States - TX", "bulletFields": ["TX", "R57513"]}]}
+    try:
+        _r2 = _app7._board_reqs(
+            "workday", "https://wd3.myworkdaysite.com/wday/cxs/modaxo/TransTrack/jobs")
+    finally:
+        _app7._workday_list = _saved2
+    check("workday myworkdaysite url", _r2[0]["url"],
+          "https://wd3.myworkdaysite.com/recruiting/modaxo/TransTrack"
+          "/job/United-States---TX/CCA_R57513")
+
     _breezy = [{"id": "abc123", "name": "API Developer (Remote Opportunity)",
                 "url": "https://vetsez.breezy.hr/p/abc123-api-developer",
                 "salary": "", "company": {"name": "VetsEZ"},

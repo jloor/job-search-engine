@@ -1659,10 +1659,23 @@ def _board_reqs(platform: str, api_url: str) -> list[dict]:
     elif platform == "workday":
         # api_url is .../wday/cxs/<tenant>/<site>/jobs, so the public site URL is
         # rebuilt from the same three identifiers rather than stored twice.
+        # ⚠️ WORKDAY SERVES TWO URL FORMS AND BOTH OCCUR IN THE WILD:
+        #   <tenant>.wd3.myworkdayjobs.com/<site>          (Motorola, Harris Computer)
+        #   wd3.myworkdaysite.com/recruiting/<tenant>/<site> (TransTRACK, under Modaxo)
+        # The cxs API path is identical for both, so only the public URL rebuild differs.
+        # The first version handled only the former and produced an empty url for the
+        # latter, which would have stored postings with no link at all.
         _m = re.search(r"https://([^.]+)\.(wd\d+)\.myworkdayjobs\.com/wday/cxs/"
                        r"[^/]+/([^/]+)/jobs", api_url)
-        _base = (f"https://{_m.group(1)}.{_m.group(2)}.myworkdayjobs.com/{_m.group(3)}"
-                 if _m else "")
+        _m2 = re.search(r"https://(wd\d+)\.myworkdaysite\.com/wday/cxs/"
+                        r"([^/]+)/([^/]+)/jobs", api_url)
+        if _m:
+            _base = f"https://{_m.group(1)}.{_m.group(2)}.myworkdayjobs.com/{_m.group(3)}"
+        elif _m2:
+            _base = (f"https://{_m2.group(1)}.myworkdaysite.com/recruiting/"
+                     f"{_m2.group(2)}/{_m2.group(3)}")
+        else:
+            _base = ""
         for j in (data.get("jobPostings") or []):
             path = j.get("externalPath") or ""
             loc = j.get("locationsText") or ""
