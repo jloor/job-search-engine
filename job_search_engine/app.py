@@ -1688,6 +1688,49 @@ def _board_reqs(platform: str, api_url: str) -> list[dict]:
                   "comp": None, "location": loc,
                   "url": f"{_base}{path}" if _base and path else "",
                   "description": ""})
+    elif platform == "teamtailor":
+        # ⭐ THE ONLY NEW PLATFORM THAT CARRIES THE FULL DESCRIPTION. Workday and Breezy
+        # list titles and locations only, so the comp reader and the remote check get
+        # nothing at insert. Teamtailor ships content_html plus a schema.org JobPosting,
+        # which is why it was worth an engine cycle for three employers.
+        #
+        # ⚠️ The token is a HOSTNAME, not a slug. Ubeya and YOOBIC both run custom domains
+        # (careers.ubeya.com), so there is no <token>.teamtailor.com to derive.
+        for j in (data.get("items") or []):
+            jp = j.get("_jobposting") or {}
+            org = (jp.get("hiringOrganization") or {}).get("name")
+            locs = jp.get("jobLocation") or []
+            if isinstance(locs, dict):
+                locs = [locs]
+            parts = []
+            for L in locs:
+                ad = (L or {}).get("address") or {}
+                bit = ", ".join(x for x in (ad.get("addressLocality"),
+                                            ad.get("addressRegion"),
+                                            (ad.get("addressCountry") or {}).get("name")
+                                            if isinstance(ad.get("addressCountry"), dict)
+                                            else ad.get("addressCountry")) if x)
+                if bit:
+                    parts.append(bit)
+            loc = " | ".join(dict.fromkeys(parts))
+            sal = jp.get("baseSalary") or {}
+            val = (sal.get("value") or {}) if isinstance(sal, dict) else {}
+            comp = None
+            if val.get("minValue") or val.get("maxValue"):
+                comp = (f"{val.get('minValue') or ''}-{val.get('maxValue') or ''} "
+                        f"{sal.get('currency') or ''}").strip()
+            _add({"req_id": str(j.get("id") or ""),
+                  "title": j.get("title") or jp.get("title") or "",
+                  # TELECOMMUTE is the schema.org marker; the words in title and location
+                  # are the fallback, same as the platforms with no structured flag.
+                  "is_remote": (jp.get("jobLocationType") == "TELECOMMUTE") or
+                               ("remote" in ((j.get("title") or "") + " " + loc).lower()) or None,
+                  "comp": comp,
+                  "location": loc,
+                  "url": j.get("url") or "",
+                  "company": org or None,
+                  "company_source": "ats" if org else None,
+                  "description": _plain(j.get("content_html") or jp.get("description") or "")})
     elif platform == "breezy":
         # Breezy returns a bare list, and is the second platform after Greenhouse to state
         # the employer on every posting. That makes company_source 'ats' rather than the

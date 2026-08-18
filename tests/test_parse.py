@@ -2418,6 +2418,39 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # stated-but-blank range downstream.
     check("breezy empty salary becomes None", _rb[0]["comp"], None)
 
+    # ⭐ Teamtailor is the only one of the three new platforms carrying the DESCRIPTION.
+    _tt = {"items": [{
+        "id": "7953826", "title": "Senior Technical Support - US Market",
+        "url": "https://careers.ubeya.com/jobs/7953826-senior-technical-support",
+        "content_html": "<p>Own the escalation layer.</p>",
+        "_jobposting": {"hiringOrganization": {"name": "Ubeya"},
+                        "jobLocationType": "TELECOMMUTE",
+                        "baseSalary": {"currency": "USD",
+                                       "value": {"minValue": 90000, "maxValue": 120000}},
+                        "jobLocation": [
+                            {"address": {"addressLocality": "Tel Aviv-Jaffa",
+                                         "addressRegion": "Israel", "addressCountry": "IL"}},
+                            {"address": {"addressLocality": "New York",
+                                         "addressRegion": "USA", "addressCountry": "US"}}]}}]}
+    _u.urlopen = lambda req, timeout=None: _Resp(_tt)
+    try:
+        _rt = _app7._board_reqs("teamtailor", "https://careers.ubeya.com/jobs.json")
+    finally:
+        _u.urlopen = _open
+    check("teamtailor parses the board", len(_rt), 1)
+    check("teamtailor states the employer", _rt[0]["company"], "Ubeya")
+    check("teamtailor name is authoritative", _rt[0]["company_source"], "ats")
+    # ⚠️ The whole reason this platform was worth an engine cycle: Workday and Breezy give
+    # the comp reader and the remote check nothing at insert, and this gives both.
+    check("teamtailor carries the description", _rt[0]["description"],
+          "Own the escalation layer.")
+    check("teamtailor reads TELECOMMUTE", _rt[0]["is_remote"], True)
+    check("teamtailor reads the band", _rt[0]["comp"], "90000-120000 USD")
+    # Several locations are joined rather than one being picked, because a role open in two
+    # countries is a fact the commute and remote gates both need.
+    check("teamtailor joins every location", _rt[0]["location"],
+          "Tel Aviv-Jaffa, Israel, IL | New York, USA, US")
+
     # ---------------------------------------------------------------- auto_application
     # 🚨 THE TABLE IS DECLARED TWICE, SO THE TWO COPIES ARE COMPARED RATHER THAN TRUSTED.
     # schema.sql builds a fresh database; the MIGRATIONS entry is what an existing
