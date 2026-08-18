@@ -1525,6 +1525,55 @@ def _plain(text: str) -> str:
     return re.sub(r"[ \t]+", " ", re.sub(r"\n{3,}", "\n\n", t)).strip()
 
 
+# Workday pages 20 postings at a time and needs a POST body, so it cannot use the shared
+# GET path. Split out because the pagination has a correctness requirement the other five
+# platforms do not.
+WORKDAY_PAGE = 20
+WORKDAY_MAX_PAGES = 120          # 2,400 postings; the largest board measured was 913
+
+
+def _workday_list(api_url: str) -> dict:
+    """Every posting on a Workday board, or an exception. Never a partial list.
+
+    🚨 A PARTIAL FETCH MUST RAISE, NOT RETURN. The caller's diff treats a sweep as the
+    complete SET of live requisitions (`now_ids = {p["req_id"] for p in reqs}`), so
+    returning page one of a 913-posting board would mark the other 893 as VANISHED, on
+    every board, every night. An error loses one board for one night; a partial success
+    corrupts the vanish log, which is the record of what he applied to.
+
+    ⚠️ Workday's list carries no description and no pay band, unlike Greenhouse and Ashby.
+    So `description` is empty here and the comp reader gets nothing at insert. That is a
+    real coverage gap, recorded rather than papered over: the per-job endpoint
+    /wday/cxs/<tenant>/<site>/job/<path> has the text, and fetching it for the ~15% that
+    pass the title filter is a separate step, not this one.
+    """
+    import urllib.request
+    postings: list = []
+    total = None
+    for page in range(WORKDAY_MAX_PAGES):
+        body = json.dumps({"appliedFacets": {}, "limit": WORKDAY_PAGE,
+                           "offset": page * WORKDAY_PAGE, "searchText": ""}).encode()
+        req = urllib.request.Request(api_url, data=body, headers={
+            "Content-Type": "application/json", "Accept": "application/json",
+            "User-Agent": "job-search-relay (board watch; one sweep per board per day)"})
+        with urllib.request.urlopen(req, timeout=SCAN_TIMEOUT) as r:
+            d = json.loads(r.read())
+        if total is None:
+            total = int(d.get("total") or 0)
+        batch = d.get("jobPostings") or []
+        postings.extend(batch)
+        if not batch or len(postings) >= total:
+            break
+    else:
+        raise RuntimeError(
+            f"workday board exceeded {WORKDAY_MAX_PAGES} pages "
+            f"({len(postings)} of {total}); refusing a partial list")
+    if total and len(postings) < total:
+        raise RuntimeError(
+            f"workday board returned {len(postings)} of {total}; refusing a partial list")
+    return {"jobPostings": postings, "total": total}
+
+
 def _board_reqs(platform: str, api_url: str) -> list[dict]:
     """
     Return one dict per posting on a board.
@@ -1536,11 +1585,14 @@ def _board_reqs(platform: str, api_url: str) -> list[dict]:
     populated in the 2.25GB public dataset measured on 2026-08-14.
     """
     import urllib.request
-    req = urllib.request.Request(api_url, headers={
-        "User-Agent": "job-search-relay (board watch; one request per board per day)",
-        "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=SCAN_TIMEOUT) as r:
-        data = json.loads(r.read())
+    if platform == "workday":
+        data = _workday_list(api_url)
+    else:
+        req = urllib.request.Request(api_url, headers={
+            "User-Agent": "job-search-relay (board watch; one request per board per day)",
+            "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=SCAN_TIMEOUT) as r:
+            data = json.loads(r.read())
 
     out: list[dict] = []
     _seen_ids: set = set()
@@ -1604,6 +1656,47 @@ def _board_reqs(platform: str, api_url: str) -> list[dict]:
                         "is_remote": bool(loc.get("remote")), "comp": None,
                         "location": f"{loc.get('city','')} {loc.get('country','')}".strip(),
                         "url": j.get("applyUrl") or "", "description": ""})
+    elif platform == "workday":
+        # api_url is .../wday/cxs/<tenant>/<site>/jobs, so the public site URL is
+        # rebuilt from the same three identifiers rather than stored twice.
+        _m = re.search(r"https://([^.]+)\.(wd\d+)\.myworkdayjobs\.com/wday/cxs/"
+                       r"[^/]+/([^/]+)/jobs", api_url)
+        _base = (f"https://{_m.group(1)}.{_m.group(2)}.myworkdayjobs.com/{_m.group(3)}"
+                 if _m else "")
+        for j in (data.get("jobPostings") or []):
+            path = j.get("externalPath") or ""
+            loc = j.get("locationsText") or ""
+            _add({# ⭐ externalPath, not bulletFields. The req number lives in bulletFields
+                  # but its position varies by tenant, while externalPath is unique per
+                  # posting and is what builds the URL.
+                  "req_id": path,
+                  "title": j.get("title") or "",
+                  "is_remote": "remote" in loc.lower() or None,
+                  "comp": None, "location": loc,
+                  "url": f"{_base}{path}" if _base and path else "",
+                  "description": ""})
+    elif platform == "breezy":
+        # Breezy returns a bare list, and is the second platform after Greenhouse to state
+        # the employer on every posting. That makes company_source 'ats' rather than the
+        # board token, which is the difference between a verified name and a guess.
+        for j in (data if isinstance(data, list) else []):
+            locd = j.get("location") or {}
+            city = locd.get("city") or ""
+            st = ((locd.get("state") or {}) or {}).get("name") or ""
+            ctry = ((locd.get("country") or {}) or {}).get("name") or ""
+            loc = ", ".join(x for x in (city, st, ctry) if x)
+            comp = j.get("salary")
+            _add({"req_id": str(j.get("id") or j.get("friendly_id") or ""),
+                  "title": j.get("name") or "",
+                  "is_remote": "remote" in (j.get("name") or "").lower() or None,
+                  # ⚠️ Breezy sends "" for no band, not null. Stored as None so an empty
+                  # string never reads as a stated-but-blank range.
+                  "comp": comp or None,
+                  "location": loc, "url": j.get("url") or "",
+                  "company": ((j.get("company") or {}) or {}).get("name") or None,
+                  "company_source": "ats" if ((j.get("company") or {}) or {}).get("name") else None,
+                  # Breezy's list carries no description, same gap as Workday.
+                  "description": ""})
     elif platform == "workable":
         for j in (data.get("jobs") or []):
             _add({"req_id": str(j.get("shortcode")), "title": j.get("title") or "",

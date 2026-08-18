@@ -2333,6 +2333,75 @@ On Wed, Aug 12, 2026 the candidate wrote:
               _ref(wide)[0] is not None, True)
         check("intentional: the queue refuses it", CMP.from_body(wide), None)
 
+    # ---------------------------------------------------------------- workday + breezy
+    # 🚨 WORKDAY WAS WRONGLY WRITTEN OFF AS UNSWEEPABLE. Forty-two employers were classified
+    # "board found, cannot be read" because Workday has no public list API. It does; it just
+    # needs a POST and pagination. These fix the parse and, more importantly, the refusal.
+    print("\nworkday + breezy:")
+    _app7 = load_app()
+
+    _wd_page = {"total": 3, "jobPostings": [
+        {"title": "Technical Support Specialist", "externalPath": "/job/Texas/TSS_R66354",
+         "locationsText": "Texas, Remote Work", "bulletFields": ["TX", "R66354"]},
+        {"title": "Bid Manager", "externalPath": "/job/Germany/Bid_R1",
+         "locationsText": "Germany Offsite", "bulletFields": ["DE", "R1"]},
+        {"title": "Dupe", "externalPath": "/job/Texas/TSS_R66354",
+         "locationsText": "Texas", "bulletFields": ["TX", "R66354"]}]}
+
+    _saved = _app7._workday_list
+    _app7._workday_list = lambda url: _wd_page
+    try:
+        _r = _app7._board_reqs(
+            "workday",
+            "https://motorolasolutions.wd5.myworkdayjobs.com/wday/cxs/"
+            "motorolasolutions/Careers/jobs")
+    finally:
+        _app7._workday_list = _saved
+
+    # ⭐ req_id is externalPath, not bulletFields: the req number's position inside
+    # bulletFields varies by tenant, while externalPath is unique and builds the URL.
+    check("workday req_id is externalPath", _r[0]["req_id"], "/job/Texas/TSS_R66354")
+    check("workday rebuilds the public url", _r[0]["url"],
+          "https://motorolasolutions.wd5.myworkdayjobs.com/Careers/job/Texas/TSS_R66354")
+    check("workday reads remote from location", _r[0]["is_remote"], True)
+    check("workday non-remote stays None", _r[1]["is_remote"], None)
+    # The shared _add() dedupe must cover a new platform too; a repeated req_id on one
+    # board violates board_state's primary key and aborts the entire sweep.
+    check("workday drops a repeated req_id", len(_r), 2)
+    # ⚠️ Workday's list has no description or band. Asserted so the gap stays known rather
+    # than being mistaken for an extraction bug later.
+    check("workday carries no description", _r[0]["description"], "")
+    check("workday carries no band", _r[0]["comp"], None)
+
+    _breezy = [{"id": "abc123", "name": "API Developer (Remote Opportunity)",
+                "url": "https://vetsez.breezy.hr/p/abc123-api-developer",
+                "salary": "", "company": {"name": "VetsEZ"},
+                "location": {"city": "Tampa", "state": {"name": "Florida"},
+                             "country": {"name": "United States"}}}]
+    # Exercised through the real entry point with only the fetch stubbed, so the parse
+    # under test is the one production runs.
+    import json as _js, urllib.request as _u
+    class _Resp:
+        def __init__(self, payload): self._p = _js.dumps(payload).encode()
+        def read(self): return self._p
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    _open = _u.urlopen
+    _u.urlopen = lambda req, timeout=None: _Resp(_breezy)
+    try:
+        _rb = _app7._board_reqs("breezy", "https://vetsez.breezy.hr/json")
+    finally:
+        _u.urlopen = _open
+    check("breezy parses the board", len(_rb), 1)
+    # ⭐ Breezy is the second platform after Greenhouse to STATE the employer. That makes
+    # the name evidence rather than a guess from the board token.
+    check("breezy states the employer", _rb[0]["company"], "VetsEZ")
+    check("breezy marks the name authoritative", _rb[0]["company_source"], "ats")
+    check("breezy joins the location", _rb[0]["location"], "Tampa, Florida, United States")
+    # ⚠️ Breezy sends "" for no band. Stored as None so an empty string never reads as a
+    # stated-but-blank range downstream.
+    check("breezy empty salary becomes None", _rb[0]["comp"], None)
+
     # ---------------------------------------------------------------- auto_application
     # 🚨 THE TABLE IS DECLARED TWICE, SO THE TWO COPIES ARE COMPARED RATHER THAN TRUSTED.
     # schema.sql builds a fresh database; the MIGRATIONS entry is what an existing

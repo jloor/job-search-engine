@@ -25,4 +25,4 @@ if _HERE not in sys.path:
 # 🚨 THE ONLY COPY OF THIS NUMBER. app.py reads it out of this file rather than declaring
 # its own, and /health serves it to an authenticated caller. A second literal anywhere is
 # the bug that made a container report 0.4.0 and send someone to debug the wrong code.
-__version__ = "0.15.0"
+__version__ = "0.16.0"
