@@ -1529,7 +1529,18 @@ def _plain(text: str) -> str:
 # GET path. Split out because the pagination has a correctness requirement the other five
 # platforms do not.
 WORKDAY_PAGE = 20
-WORKDAY_MAX_PAGES = 120          # 2,400 postings; the largest board measured was 913
+# 🚨 THIS IS A BACKSTOP AGAINST A RUNAWAY BOARD, NOT A BUDGET. It was 120 (2,400 postings)
+# when the largest board measured was 913, and CVS Health then turned out to hold 19,140,
+# which is 957 pages. The guard did the right thing and refused rather than sweeping a
+# partial board, but a cap tuned to yesterday's largest board silently excludes the next
+# employer who is bigger.
+#
+# ⚠️ RAISING IT COSTS WALL-CLOCK ON ONE BOARD, NOT ON THE SWEEP. Boards run 12-wide, so
+# pagination on a single board overlaps everything else; measured, adding 45 boards and
+# ~15,700 requisitions moved a 2,860-board sweep from 17.5-22.2 min to 21.8 min, inside the
+# existing variance. What a huge board does cost is TRIAGE on whatever it churns nightly,
+# and that is measured from scan_run rather than guessed here.
+WORKDAY_MAX_PAGES = 1200         # 24,000 postings; CVS Health alone is 19,140
 
 
 def _workday_list(api_url: str) -> dict:
