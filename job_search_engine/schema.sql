@@ -443,10 +443,14 @@ CREATE TABLE IF NOT EXISTS auto_application (
   note           TEXT,
   UNIQUE(source, company_raw, role_raw, occurrence)
 );
--- Partial, so the rows with no url do not collide with each other on NULL. Once an export
--- supplies real links the url is the stronger identity, and this stops a second import of
--- the same export from duplicating every row.
-CREATE UNIQUE INDEX IF NOT EXISTS auto_application_url
-  ON auto_application (source, url) WHERE url IS NOT NULL AND url != '';
+-- 🚨 THIS INDEX WAS UNIQUE AND THAT WAS WRONG. It was meant to stop a second import of the
+-- same export from duplicating rows, but UNIQUE(source, company_raw, role_raw, occurrence)
+-- already does that, and the importer updates on that key rather than inserting. What the
+-- unique url index actually did was make the legitimate case unstorable: TWO applications
+-- to ONE posting, which is precisely what `occurrence` exists to record. Measured on the
+-- first real batch of pasted links, Adoreal and AssistIQ each had two applications to a
+-- single requisition and the second could never carry its url.
+CREATE INDEX IF NOT EXISTS auto_application_url
+  ON auto_application (source, url);
 CREATE INDEX IF NOT EXISTS auto_application_collision
   ON auto_application (collision, live_state);

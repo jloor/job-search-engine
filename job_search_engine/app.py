@@ -414,6 +414,14 @@ MIGRATIONS = [
      "UNIQUE(source, company_raw, role_raw, occurrence))"),
     ("CREATE UNIQUE INDEX IF NOT EXISTS auto_application_url "
      "ON auto_application (source, url) WHERE url IS NOT NULL AND url != ''"),
+    # 2026-08-18: the unique url index blocked the legitimate case, two applications to one
+    # posting, which is what `occurrence` records. The row-level dedupe that index was meant
+    # to provide is already covered by UNIQUE(source, company_raw, role_raw, occurrence).
+    # Dropped and recreated non-unique. ⚠️ Both statements run in order on every boot, so
+    # the CREATE UNIQUE above is superseded rather than removed: deleting it would leave
+    # databases that never saw the DROP with the old index still in place.
+    "DROP INDEX IF EXISTS auto_application_url",
+    "CREATE INDEX IF NOT EXISTS auto_application_url ON auto_application (source, url)",
     ("CREATE INDEX IF NOT EXISTS auto_application_collision "
      "ON auto_application (collision, live_state)"),
 ]

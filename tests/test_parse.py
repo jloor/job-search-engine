@@ -2524,13 +2524,14 @@ On Wed, Aug 12, 2026 the candidate wrote:
         _c6.execute(_iu, ("aiapply", "B Co", "B Role", 1, "t", None))
         check("many rows may have no url", _c6.execute(
             "SELECT count(*) FROM auto_application WHERE url IS NULL").fetchone()[0], 4)
+        # 🚨 TWO APPLICATIONS TO ONE POSTING MUST BE STORABLE. The url index was UNIQUE and
+        # made this impossible, which is the exact case `occurrence` exists to record:
+        # Adoreal and AssistIQ each had two applications to a single requisition. Row-level
+        # dedupe is UNIQUE(source, company_raw, role_raw, occurrence), asserted above.
         _c6.execute(_iu, ("aiapply", "C Co", "C Role", 1, "t", "https://x/1"))
-        _same = "no error"
-        try:
-            _c6.execute(_iu, ("aiapply", "D Co", "D Role", 1, "t", "https://x/1"))
-        except Exception as e:                                        # noqa: BLE001
-            _same = "rejected" if "unique" in str(e).lower() else str(e)
-        check("one url cannot be stored twice", _same, "rejected")
+        _c6.execute(_iu, ("aiapply", "C Co", "C Role", 2, "t", "https://x/1"))
+        check("one url may sit on two applications", _c6.execute(
+            "SELECT count(*) FROM auto_application WHERE url='https://x/1'").fetchone()[0], 2)
     finally:
         _c6.close()
         _o5.unlink(_p6)
