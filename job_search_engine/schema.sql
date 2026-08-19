@@ -24,6 +24,17 @@ CREATE TABLE IF NOT EXISTS message (
                                                 -- otp|recruiter_outreach|scheduling|noise
   otp_code       TEXT,
   application_ref TEXT,                         -- resolved company/role slug
+  -- A HUMAN's decision about which application this message belongs to, used when the
+  -- alias could not resolve to exactly one. It is a SEPARATE column from application_ref
+  -- on purpose: application_ref records where the mail actually arrived, and overwriting
+  -- it to make tracking work would destroy the only evidence of how it was routed.
+  -- 🚨 NOTHING AUTOMATED MAY WRITE THIS. Not the classifier, not the model matcher, not
+  -- the webhook. The model writes proposals to message_application_match and a human
+  -- accepts one from his own machine. A sender who could set this could close a live
+  -- interview from outside the system.
+  resolved_application_id INTEGER,
+  resolved_by    TEXT,                          -- who decided, free text, e.g. 'human:cli'
+  resolved_at    TEXT,
   needs_human    INTEGER NOT NULL DEFAULT 1,
   handled_at     TEXT,
   -- Result of the ORIGINAL email's own authentication, as reported by the receiving

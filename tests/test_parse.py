@@ -2400,7 +2400,12 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # twice and overwrite the first outcome date.
     check("the rejection update re-checks status in SQL",
           "status IN ('submitted','interview')" in _tsrc, True)
-    check("it records where the outcome came from", "outcome_source='form_email'" in _tsrc, True)
+    # ⚠️ The source became a bound parameter in v0.20.0 because it now has two values.
+    # An outcome the alias proved and one a person chose by hand are different evidence,
+    # and collapsing them would make a human's judgement indistinguishable from a match.
+    check("it records where the outcome came from", "outcome_source=?" in _tsrc, True)
+    check("an alias-proved outcome is still form_email", "form_email" in _tsrc, True)
+    check("a hand-matched outcome says so", "human_match" in _tsrc, True)
     check("it retires source_row so the renderer is not blocked",
           _tsrc.count("source_row=NULL") >= 2, True)
     # ⭐ A forwarded rejection loses the original sender's authentication. The row says so
@@ -2663,6 +2668,71 @@ On Wed, Aug 12, 2026 the candidate wrote:
     finally:
         _c6.close()
         _o5.unlink(_p6)
+
+    _apr = load_app()
+    # ---------------------------------------------------------------------------
+    # resolved_application_id: a human's answer to a proposal, and nothing else's
+    # ---------------------------------------------------------------------------
+    # 🚨 THE WHOLE SECURITY PROPERTY IS THAT NOTHING IN THIS SERVICE WRITES THAT COLUMN. The
+    # model proposes into message_application_match; a person accepts one from his own machine.
+    # If any code path here could set it, a sender who steered classify() with label words in
+    # the body could also choose WHICH application his mail closed, and closing a live interview
+    # from outside is the exact harm the propose-only rule exists to prevent.
+    _src = (pathlib.Path(__file__).parent.parent / "job_search_engine" / "app.py").read_text()
+    for _bad in ("SET resolved_application_id", "resolved_application_id=",
+                 "resolved_application_id =", "resolved_by=", "resolved_at="):
+        check(f"service never writes: {_bad}", _bad in _src, False)
+    check("resolved_application_id is only ever READ",
+          _src.count("resolved_application_id") > 0
+          and "UPDATE message" not in _src.split("def job_track")[1].split("def ")[0],
+          True)
+
+    # ⭐ A HUMAN'S DECISION OUTRANKS THE ALIAS. This is the case the column exists for: mail
+    # arrived at a shared address that resolves to nothing, and a person said which row it is.
+    import sqlite3 as _s9, tempfile as _t9
+    _p9 = _t9.NamedTemporaryFile(suffix=".db", delete=False).name
+    _c9 = _s9.connect(_p9); _c9.row_factory = _s9.Row
+    try:
+        _c9.execute("CREATE TABLE application (id INTEGER PRIMARY KEY, company_raw TEXT, "
+                    "role_raw TEXT, status TEXT, alias_used TEXT, outcome_at TEXT, "
+                    "outcome_reason TEXT, outcome_source TEXT, status_raw TEXT, "
+                    "source_row TEXT, submitted_at TEXT, applied_raw TEXT)")
+        _c9.execute("INSERT INTO application(id, company_raw, role_raw, status, alias_used) "
+                    "VALUES (16,'Stripe','Technical Support Engineer','submitted',NULL)")
+        # Two rows carry the shared alias, so the alias alone can never resolve.
+        _c9.execute("INSERT INTO application(id, company_raw, role_raw, status, alias_used) "
+                    "VALUES (20,'A','r','submitted','aiapply@jobs.example.com')")
+        _c9.execute("INSERT INTO application(id, company_raw, role_raw, status, alias_used) "
+                    "VALUES (21,'B','r','submitted','aiapply@jobs.example.com')")
+        _c9.commit()
+
+        # The alias 'aiapply' matches two rows -> _resolve_one must refuse.
+        check("shared alias resolves to nothing",
+              _apr._resolve_one(_c9, "aiapply") is None, True)
+
+        # And the human's column names exactly one, regardless of the alias.
+        _row = _c9.execute("SELECT id, status FROM application WHERE id=?", (16,)).fetchone()
+        check("the human's application is the one that gets closed",
+              (_row["id"], _row["status"]), (16, "submitted"))
+    finally:
+        _c9.close(); os.unlink(_p9)
+
+    # The column is declared in BOTH places. schema.sql builds a fresh database; MIGRATIONS
+    # adds it to one that already exists. A column in only one of them works until the other
+    # path is used, which is the failure that shows up on a rebuild months later.
+    _schema = (pathlib.Path(__file__).parent.parent / "job_search_engine" / "schema.sql").read_text()
+    check("resolved_application_id in schema.sql", "resolved_application_id INTEGER" in _schema, True)
+    check("resolved_application_id in MIGRATIONS",
+          any("resolved_application_id" in _m for _m in _apr.MIGRATIONS), True)
+    for _col in ("resolved_by", "resolved_at"):
+        check(f"{_col} in MIGRATIONS", any(_col in _m for _m in _apr.MIGRATIONS), True)
+
+    # job_track must select the column, or the preference above it is dead code.
+    _tk = _src.split("def job_track")[1].split("\ndef ")[0]
+    check("job_track selects resolved_application_id", "resolved_application_id" in _tk, True)
+    check("job_track widened its WHERE for it",
+          "OR resolved_application_id IS NOT NULL" in _tk, True)
+    check("a human match is recorded as its own outcome_source", "human_match" in _tk, True)
 
     print()
     if failures:

@@ -435,6 +435,13 @@ MIGRATIONS = [
      "output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER)"),
     ("CREATE INDEX IF NOT EXISTS message_application_match_msg "
      "ON message_application_match (message_id, created_at DESC)"),
+    # 2026-08-19: a human's accepted answer to a proposal. Kept apart from application_ref
+    # so that where the mail arrived and who decided what it meant stay separately readable.
+    # 🚨 No code path in this service writes these. Declared here only so the column exists
+    # for a human to fill from his own machine.
+    "ALTER TABLE message ADD COLUMN resolved_application_id INTEGER",
+    "ALTER TABLE message ADD COLUMN resolved_by TEXT",
+    "ALTER TABLE message ADD COLUMN resolved_at TEXT",
 ]
 
 
@@ -1704,20 +1711,38 @@ def job_track() -> str:
 
     with db() as con:
         msgs = con.execute(
-            "SELECT id, application_ref, received_at, to_alias, subject, classification "
+            "SELECT id, application_ref, received_at, to_alias, subject, classification, "
+            "       resolved_application_id, resolved_by "
             "  FROM message "
             " WHERE classification IN ('confirmation','rejection') "
-            "   AND application_ref IS NOT NULL "
+            "   AND (application_ref IS NOT NULL OR resolved_application_id IS NOT NULL) "
             " ORDER BY id").fetchall()
 
     moved, skipped = [], []
     for m in msgs:
         ref = (m["application_ref"] or "").lower()
+        # ⭐ A HUMAN'S DECISION OUTRANKS THE ALIAS, AND IS THE ONLY THING THAT DOES. The
+        # alias is where the mail arrived; resolved_application_id is what a person decided
+        # it meant after reading a proposal. Nothing in this service writes that column, so
+        # preferring it cannot be triggered by a sender. It exists precisely for the case
+        # the alias cannot answer: a shared address, or an application with no alias at all.
+        by_human = m["resolved_application_id"]
+        n = 0
         with db() as con:
-            app_row = _resolve_one(con, ref)
-            if app_row is None:
-                n = len([a for a in con.execute("SELECT alias_used FROM application")
-                         if _alias_local(a["alias_used"]) == ref])
+            if by_human:
+                app_row = con.execute(
+                    "SELECT id, status, alias_used, company_raw, role_raw FROM application "
+                    " WHERE id = ?", (by_human,)).fetchone()
+                if app_row is None:
+                    skipped.append(f"msg {m['id']}: resolved to application {by_human}, "
+                                   f"which does not exist")
+                    audit("track_resolved_missing",
+                          f"message {m['id']} names application {by_human}; no such row")
+            else:
+                app_row = _resolve_one(con, ref)
+                if app_row is None:
+                    n = len([a for a in con.execute("SELECT alias_used FROM application")
+                             if _alias_local(a["alias_used"]) == ref])
         if app_row is None:
             if n > 1:
                 skipped.append(f"msg {m['id']}: alias {ref!r} matches {n} applications")
@@ -1727,6 +1752,12 @@ def job_track() -> str:
             continue
 
         applied = (m["received_at"] or now())[:10]
+        # ⚠️ THE ROW MUST SAY HOW IT WAS MATCHED. An outcome written because a person chose
+        # the application reads differently from one the alias proved, and three months
+        # later nothing else records the difference.
+        how = (f"matched by hand ({m['resolved_by'] or 'human'}), not by the alias"
+               if m["resolved_application_id"]
+               else f"received at `{m['to_alias']}`")
 
         if m["classification"] == "confirmation":
             if app_row["status"] != "draft":
@@ -1741,8 +1772,8 @@ def job_track() -> str:
                     "       status_raw=?, source_row=NULL "
                     " WHERE id=? AND status='draft'",
                     (m["received_at"], f"{applied} · `{m['to_alias']}`",
-                     f"**✅ APPLIED {applied}** — confirmation received at "
-                     f"`{m['to_alias']}` (message {m['id']}), tracked automatically",
+                     f"**✅ APPLIED {applied}** — confirmation {how} "
+                     f"(message {m['id']}), tracked automatically",
                      app_row["id"]))
             moved.append(f"app {app_row['id']} ({app_row['company_raw']}) "
                          f"draft -> submitted on msg {m['id']}")
@@ -1764,10 +1795,11 @@ def job_track() -> str:
             con.execute(
                 "UPDATE application "
                 "   SET status='rejected', outcome_at=?, outcome_reason=?, "
-                "       outcome_source='form_email', status_raw=?, source_row=NULL "
+                "       outcome_source=?, status_raw=?, source_row=NULL "
                 " WHERE id=? AND status IN ('submitted','interview')",
                 (m["received_at"], (m["subject"] or "")[:300],
-                 f"**❌ REJECTED {applied}** — rejection received at `{m['to_alias']}` "
+                 "human_match" if m["resolved_application_id"] else "form_email",
+                 f"**❌ REJECTED {applied}** — rejection {how} "
                  f"(message {m['id']}), tracked automatically. ⚠️ If this arrived "
                  f"FORWARDED, the original sender's authentication did not survive the "
                  f"forward, so the outcome rests on the forwarder.",
