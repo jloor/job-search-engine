@@ -2364,7 +2364,28 @@ On Wed, Aug 12, 2026 the candidate wrote:
         ("Interview invitation", "We would like to schedule a call. Does Tuesday work?",
          "interview_invite"),
         ("Availability", "Does Tuesday work for you?", "scheduling"),
+        # 🚨 EVERY REJECTION WORDING THAT REACHED THE MAILBOX AND WAS MISSED LIVES HERE.
+        # The rule has now failed twice on plain rejections, both times because the list
+        # held one conjugation of a phrase and the employer sent another. A regex is only
+        # as good as the sentences it was tested against, so each real miss stays a case.
         ("Update", "We decided to move forward with other applicants.", "rejection"),
+        # Zafran, 2026-08-14. Forced the first widening.
+        ("Zafran Security Application Update",
+         "At this time, we have decided to move forward with other applicants.", "rejection"),
+        # athenahealth, 2026-08-17. Sat as 'unknown' for two days and was found only when
+        # the model matcher proposed an application for a message nothing had classified.
+        ("Thank you for your interest in athenahealth",
+         "After reviewing your application for the R15369 Client Support Analyst position, "
+         "we have made the decision not to move forward with your candidacy at this time.",
+         "rejection"),
+        ("Update", "We will not be moving forward with your application.", "rejection"),
+        ("Update", "You were not selected for this role.", "rejection"),
+        ("Update", "We have chosen to pursue other candidates.", "rejection"),
+        # ⚠️ THE WIDENING MUST NOT SWALLOW ITS NEIGHBOURS. "move forward" is ordinary
+        # scheduling language, and an offer letter routinely contains "unfortunately".
+        ("Availability", "Are you free Tuesday to move forward with a call?", "scheduling"),
+        ("Your offer", "We are delighted to offer you the position. Unfortunately we "
+         "could not match your full ask.", "hired"),
         ("Thanks", "Thank you for applying to Acme.", "confirmation"),
         ("Your code", "Your one-time verification code is 123456", "otp"),
         ("Hello", "I came across your profile and wanted to reach out.", "recruiter_outreach"),

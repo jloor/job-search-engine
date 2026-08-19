@@ -869,9 +869,15 @@ RULES = [
     # forward with other applicants", which matched no alternative here: the list had
     # "not moving forward" and "other candidates" but neither of that email's phrasings.
     # Every wording an employer actually sends belongs in this list.
-    ("rejection",        r"\b(not moving forward|unfortunately|other candidates|"
-                         r"other applicants|move forward with other|"
-                         r"decided not to|will not be proceeding|no longer under consideration)\b"),
+    # 2026-08-19, the SECOND time this rule missed a plain rejection. athenahealth wrote
+    # "made the decision not to move forward with your candidacy". The list held "decided
+    # not to" and "not moving forward" and matched neither. The phrasings differ only in
+    # which verb carries the negation, so match the negation instead of one conjugation.
+    ("rejection",        r"\b(not moving forward|not be moving forward|not to move forward|"
+                         r"unfortunately|other candidates|"
+                         r"other applicants|move forward with other|pursue other|"
+                         r"decided not to|not to proceed|not be selected|were not selected|"
+                         r"will not be proceeding|no longer under consideration)\b"),
     ("confirmation",     r"\b(thank you for applying|we(?:'ve| have) received your application|"
                          r"application (?:was )?(?:received|submitted)|thanks for your application)\b"),
     ("recruiter_outreach", r"\b(reaching out|came across your|would you be open|"
