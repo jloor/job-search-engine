@@ -824,6 +824,45 @@ RULES = [
     ("hired",            r"\b(offer letter|pleased to offer|delighted to offer|formal offer|"
                          r"we(?:'d| would) like to offer|welcome to the team|"
                          r"congratulations.{0,60}\boffer\b|your offer (?:letter|details))\b"),
+    # 🚨 A TERMINAL OUTCOME IS CHECKED BEFORE ANY PROCESS LABEL, AND THIS BLOCK EXISTS
+    # BECAUSE ORDER, NOT VOCABULARY, WAS THE BUG. `interview_invite` matches the bare word
+    # "interview" and `scheduling` matches the bare word "available". Both sit above the
+    # ordinary rejection rule, so a CVS rejection was stolen by "interview prep" in its
+    # footer and an HPE rejection by "opportunities will become available" in its footer.
+    # Measured on 101 forwarded rejections: 14 were filed as invites, scheduling, or
+    # recruiter outreach, and every one of them contained plain rejection language that was
+    # never reached.
+    #
+    # ⭐ WHY A SPLIT RATHER THAN MOVING THE WHOLE RULE UP. The ordinary rule matches bare
+    # "unfortunately", which a genuine scheduling mail says all the time ("unfortunately I
+    # need to reschedule"). That word is the reason the rule sits low, and it must keep
+    # sitting low. Only the phrasings that cannot mean anything except "no" are promoted.
+    # `hired` still outranks these: an offer letter says "unfortunately" about the salary.
+    ("rejection",        r"\b(not moving forward|not be moving forward|not to move forward|"
+                         r"mov(?:e|ing) forward with (?:other|another|a select group|"
+                         r"candidates|applicants)|"
+                         r"other candidates|other applicants|pursue other|"
+                         r"decided not to|not to proceed|will not be proceeding|"
+                         r"no longer under consideration|regret to inform|"
+                         r"(?:was|were|not) not selected|not selected for|"
+                         r"selected (?:a|another) candidate|"
+                         r"(?:position|role) has been (?:\w+ )?filled|"
+                         r"(?:position|role) was filled|filled the\b[^.]{0,60}\bposition|"
+                         r"more closely align|align\w*\s+(?:a bit\s+)?more closely|"
+                         # Every wording below came off a real rejection in the 2026-08-19
+                         # forward of 101 messages. Each one was filed as unknown,
+                         # scheduling, or confirmation before it was added.
+                         r"won.?t be moving forward|to not move forward|"      # Junction, Waystar, DoorDash
+                         r"not been selected|pursue another|"                  # WEX, Huntington
+                         r"other talents|moving ahead in our search|closer match|"  # n8n, Qventus
+                         r"(?:was|is)n.?t the right fit|not the right fit for|"     # Adoreal
+                         r"won.?t be inviting|not be inviting|not be pursuing|"     # Transmit, Mount Sinai
+                         r"unable to offer you|consider additional applications|"   # Motorola, Workday tpl
+                         r"not currently permitting remote|"                        # Mosaic Life Care
+                         # One employer replied in Spanish. A rule that only reads English
+                         # silently files those as unknown forever.
+                         r"lamentamos informarte|no podremos avanzar|"
+                         r"no continuaremos con tu)\b"),
     ("eeo_form",         r"\b(eeo-?1|equal employment opportunity|"
                          r"voluntary self[- ]identification|self[- ]identify|"
                          r"demographic (?:questions|information|survey)|"
@@ -837,7 +876,11 @@ RULES = [
                          r"\b(incomplete application|application (?:is )?incomplete|"
                          r"(?:finish|complete|resume|continue) your application|"
                          r"you (?:started|began) an application|"
-                         r"did ?n.?t (?:finish|complete)|application (?:was )?not submitted)\b"),
+                         r"did ?n.?t (?:finish|complete)|application (?:was )?not submitted|"
+                         # Clay, 2026-08-19: "the take home assessment portion of your
+                         # application was not completed ... feel free to reapply with a
+                         # complete assessment". Recoverable, so it must outrank rejection.
+                         r"was not completed|reapply with a complete)\b"),
     ("assessment_result",
                          r"\b(assessment (?:results?|score|outcome)|"
                          r"results? of your (?:assessment|test|challenge)|"
@@ -909,7 +952,15 @@ def needs_human_for(label: str, auth_warn: bool) -> int:
 
 def classify(subject: str, body: str) -> tuple[str, str | None]:
     """Return (classification, otp_code|None). Order matters: invite beats scheduling."""
-    hay = f"{subject}\n{body}".lower()
+    # 🚨 COLLAPSE WHITESPACE FIRST. Email bodies hard-wrap at about 72 characters, and every
+    # pattern in RULES is written with literal spaces, so any phrase that straddles a wrap
+    # is invisible. HPE's rejection reads "We decided to move forward\nwith another
+    # candidate" and matched no rejection rule at all; it was filed as scheduling because
+    # the word "available" appeared in its footer. This is not one employer's formatting
+    # quirk: it silently weakens EVERY multi-word pattern here, and the longer the phrase
+    # the likelier it breaks. Measured on 109 real messages, this one line moved more of
+    # them than the entire rejection vocabulary did.
+    hay = re.sub(r"\s+", " ", f"{subject}\n{body}").lower()
     for label, pattern in RULES:
         if re.search(pattern, hay, re.I):
             code = None

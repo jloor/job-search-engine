@@ -2394,6 +2394,57 @@ On Wed, Aug 12, 2026 the candidate wrote:
         # ⚠️ THE WIDENING MUST NOT SWALLOW ITS NEIGHBOURS. "move forward" is ordinary
         # scheduling language, and an offer letter routinely contains "unfortunately".
         ("Availability", "Are you free Tuesday to move forward with a call?", "scheduling"),
+        # 🚨 ORDER, NOT VOCABULARY, WAS THE BUG. On 2026-08-19 he forwarded 101 real
+        # rejections and 14 were filed as invites, scheduling, or recruiter outreach.
+        # interview_invite matches the bare word "interview" and scheduling matches the
+        # bare word "available", and both sat above rejection, so a CVS rejection was
+        # stolen by "interview prep" in its footer and an HPE one by "opportunities will
+        # become available" in its footer. Unambiguous rejection language now sits second,
+        # under `hired` only. These four are the exact emails that were misfiled.
+        ("Thank you for your interest in CVS Health",
+         "After careful review, we will not be moving forward with your application for "
+         "this role. To support your career journey we offer free interview prep.",
+         "rejection"),
+        ("Thank You for Interviewing with Kizen",
+         "Thank you for the time you put into our interview process. After careful "
+         "consideration, we have decided to move forward with another candidate.",
+         "rejection"),
+        ("HPE position closed",
+         "We decided to move forward\nwith another candidate. Visit our career page often "
+         "as new opportunities become available.", "rejection"),
+        ("Your Application at Marathon Health",
+         "This message is to inform you that we have selected a candidate who is a match "
+         "for the job requirements of the position.", "rejection"),
+        # 🚨 THE INVARIANTS THAT PROMOTION PUTS AT RISK. Each of these means "keep going",
+        # and misreading one as "no" would close a live interview.
+        ("Your offer", "We are delighted to offer you the position. Unfortunately we could "
+         "not match your full ask, and we moved forward with other candidates for the "
+         "senior band.", "hired"),
+        ("Reschedule", "Unfortunately I need to reschedule our call. What time works for "
+         "you?", "scheduling"),
+        ("Interview", "Congratulations, we would like to invite you to interview next "
+         "week.", "interview_invite"),
+        # ⚠️ WHITESPACE IS NORMALISED BEFORE MATCHING, AND THIS PROVES IT. Email bodies
+        # hard-wrap at about 72 characters and every pattern uses literal spaces, so a
+        # phrase straddling a wrap was invisible. That single line moved more of the 109
+        # real messages than the entire rejection vocabulary did.
+        ("Wrapped", "we have decided\nnot to move forward\nwith your application",
+         "rejection"),
+        # One employer replied in Spanish. English-only rules file those as unknown forever.
+        ("Gracias por participar", "lamentamos informarte que en esta ocasion no podremos "
+         "avanzar con tu candidatura", "rejection"),
+        # ⭐ Recoverable, so it must NOT be swallowed by the promoted rejection rule.
+        ("Incomplete Assessment - Product Support Specialist at Clay",
+         "The take home assessment portion of your application was not completed, so we "
+         "unfortunately cannot move forward with the process. That said, feel free to "
+         "reapply with a complete assessment.", "incomplete_application"),
+        # ⚠️ A RECEIPT THAT SOUNDS LIKE A NO IS STILL A RECEIPT. Interra Health says it
+        # only follows up with candidates whose experience "closely aligns", one word away
+        # from the "more closely align" that IS a rejection. Kept apart deliberately.
+        ("Follow up from Interra Health",
+         "Thank you for applying for the Technical Support Specialist, L2 role. We are "
+         "only able to follow up directly with candidates whose experience closely aligns "
+         "with the requirements of the position.", "confirmation"),
         ("Your offer", "We are delighted to offer you the position. Unfortunately we "
          "could not match your full ask.", "hired"),
         ("Thanks", "Thank you for applying to Acme.", "confirmation"),
