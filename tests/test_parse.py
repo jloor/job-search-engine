@@ -2333,6 +2333,102 @@ On Wed, Aug 12, 2026 the candidate wrote:
               _ref(wide)[0] is not None, True)
         check("intentional: the queue refuses it", CMP.from_body(wide), None)
 
+    # ---------------------------------------------------------------- classification
+    # Mirrors the auto-applier's twelve labels so one inbox does not carry two vocabularies.
+    print("\nclassification:")
+    _appc = load_app()
+    for _subj, _body, _want in [
+        # 🚨 The offer letter is first because it is the expensive one. It says
+        # "unfortunately" and would have been filed as a REJECTION before `hired` existed.
+        ("Your offer letter from Acme",
+         "We are pleased to offer you the position. Unfortunately we cannot match your "
+         "requested start date.", "hired"),
+        ("Voluntary Self-Identification",
+         "Please complete the invitation to self-identify.", "eeo_form"),
+        ("Your application is incomplete",
+         "You started an application but did not finish.", "incomplete_application"),
+        ("Your assessment results", "The results of your assessment are ready.",
+         "assessment_result"),
+        ("Take-home challenge",
+         "Please complete the HackerRank assessment within 72 hours.", "assessment_invite"),
+        ("Interview feedback", "We have feedback from your interview to share.",
+         "interview_feedback"),
+        ("Following up on your interview", "Just checking in after your interview.",
+         "interview_followup"),
+        # ⚠️ The invariants that must not regress as labels are added above them.
+        ("Interview invitation", "We would like to schedule a call. Does Tuesday work?",
+         "interview_invite"),
+        ("Availability", "Does Tuesday work for you?", "scheduling"),
+        ("Update", "We decided to move forward with other applicants.", "rejection"),
+        ("Thanks", "Thank you for applying to Acme.", "confirmation"),
+        ("Your code", "Your one-time verification code is 123456", "otp"),
+        ("Hello", "I came across your profile and wanted to reach out.", "recruiter_outreach"),
+        ("Newsletter", "Here is our monthly update.", "unknown"),
+    ]:
+        check(f"classify: {_want}", _appc.classify(_subj, _body)[0], _want)
+
+    # ⭐ Only confirmation and noise may skip a human, and assessment_invite and
+    # incomplete_application are named explicitly so a future addition to AUTO_HANDLED
+    # cannot quietly swallow either. Both are actionable and time-boxed.
+    for _lbl, _warn, _want in (("confirmation", False, 0), ("noise", False, 0),
+                               ("assessment_invite", False, 1),
+                               ("incomplete_application", False, 1),
+                               ("confirmation", True, 1), ("rejection", False, 1)):
+        check(f"needs_human {_lbl}/{_warn}", _appc.needs_human_for(_lbl, _warn), _want)
+
+    # ---------------------------------------------------------------- application matching
+    print("\napplication matching (fallback):")
+    _appm = load_app()
+    check("registered as a job", "match_application" in [n for n, _, _ in _appm.job_table()], True)
+    check("shortlist is capped", _appm.MATCH_MAX_CANDIDATES <= 20, True)
+    check("null is an allowed answer",
+          "null" in str(_appm.MATCH_SCHEMA["properties"]["application_id"]["type"]), True)
+    check("injection flag is required",
+          "prompt_injection_suspected" in _appm.MATCH_SCHEMA["required"], True)
+
+    # 🚨 THE WHOLE POINT: it proposes and never writes. A sender who could choose which
+    # application a rejection lands on could close a live interview from outside the
+    # system, so the job body must not contain a write to any table but its own.
+    # ⚠️ CHECK THE CODE, NOT THE PROSE. The first version grepped the raw source and failed
+    # on "needs_human" and "send" appearing in the docstring that explains it never touches
+    # them. A test that cannot tell an assertion from its own explanation is worthless.
+    import ast as _ast, textwrap as _tw
+    _fn = _ast.parse(_tw.dedent(_src_of(_appm.job_match_application))).body[0]
+    if (_fn.body and isinstance(_fn.body[0], _ast.Expr)
+            and isinstance(getattr(_fn.body[0], "value", None), _ast.Constant)):
+        _fn.body = _fn.body[1:]                       # drop the docstring
+    _code = _ast.unparse(_fn)
+    for _forbidden in ("UPDATE application", "UPDATE message", "needs_human",
+                       "INSERT INTO application"):
+        check(f"never writes: {_forbidden}", _forbidden.lower() in _code.lower(), False)
+    check("writes only its own table",
+          _code.count("INSERT INTO") == _code.count("INSERT INTO message_application_match"),
+          True)
+
+    # ⭐ The shortlist narrows on the employer name before any model call, so the model
+    # only ever chooses between rows that are already plausible.
+    import sqlite3 as _s7, tempfile as _t7, os as _o7
+    _p7 = _t7.NamedTemporaryFile(suffix=".db", delete=False).name
+    _c7 = _s7.connect(_p7); _c7.row_factory = _s7.Row
+    try:
+        _c7.execute("CREATE TABLE application (id INTEGER PRIMARY KEY, company_raw TEXT, "
+                    "role_raw TEXT, status TEXT, alias_used TEXT)")
+        for _i, _co, _st in ((1, "**Labcorp** (NYSE: LH)", "interview"),
+                             (2, "ReadMe", "interview"),
+                             (3, "Acme Health", "rejected")):
+            _c7.execute("INSERT INTO application VALUES (?,?,?,?,?)",
+                        (_i, _co, "Engineer", _st, f"a{_i}@x"))
+        _msg = {"subject": "Update from Labcorp", "body_text": "regarding your application",
+                "body_reply": None, "from_addr": "noreply@labcorp.com"}
+        _got = [a["id"] for a in _appm._match_candidates(_c7, _msg)]
+        check("shortlist finds the named employer", _got, [1])
+        # A closed application is not a candidate: nothing inbound should reopen it.
+        _msg2 = dict(_msg, subject="Update from Acme Health", from_addr="x@acme.com")
+        check("closed applications are excluded",
+              [a["id"] for a in _appm._match_candidates(_c7, _msg2)], [])
+    finally:
+        _c7.close(); _o7.unlink(_p7)
+
     # ---------------------------------------------------------------- workday + breezy
     # 🚨 WORKDAY WAS WRONGLY WRITTEN OFF AS UNSWEEPABLE. Forty-two employers were classified
     # "board found, cannot be read" because Workday has no public list API. It does; it just

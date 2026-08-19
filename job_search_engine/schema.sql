@@ -454,3 +454,45 @@ CREATE INDEX IF NOT EXISTS auto_application_url
   ON auto_application (source, url);
 CREATE INDEX IF NOT EXISTS auto_application_collision
   ON auto_application (collision, live_state);
+
+-- A model's guess at WHICH application an inbound email belongs to, when the alias cannot
+-- say. Added 2026-08-19.
+--
+-- 🚨 THE ALIAS IS THE PRIMARY KEY AND THIS IS ONLY THE FALLBACK. resolve_application()
+-- takes the alias local part as the reference, which works because per-company aliases are
+-- unique. It stops working the moment one alias covers many applications: an auto-applier
+-- sending as `aiapply@` produced 111 rows sharing one alias, so an inbound rejection
+-- matched all 111 and job_track correctly refused to guess.
+--
+-- 🚨 IT PROPOSES. NOTHING READS THIS TO CHANGE STATE. No row here may move an application,
+-- set a submitted date, clear needs_human, or send mail. The reason is the same one that
+-- keeps ai_reading advisory: every body it reads was written by someone outside this
+-- system, and a probe already proved classify() can be steered by a sender who writes
+-- label words into the body. A sender who could also choose WHICH application a rejection
+-- lands on could close a live interview from the outside.
+--
+-- ⚠️ candidate_ids is stored because a proposal is only as good as the shortlist it chose
+-- from. Without it, "the model picked application 47" cannot be distinguished from "47 was
+-- the only option offered", and a bad shortlist is invisible.
+CREATE TABLE IF NOT EXISTS message_application_match (
+  id             INTEGER PRIMARY KEY,
+  message_id     INTEGER NOT NULL,
+  created_at     TEXT NOT NULL,
+  model          TEXT NOT NULL,
+  -- NULL means the model declined to choose, which is a valid and useful answer.
+  proposed_application_id INTEGER,
+  confidence     TEXT,                      -- low | medium | high
+  reasoning      TEXT,
+  candidate_ids  TEXT,                      -- the shortlist it chose from, comma separated
+  candidates_n   INTEGER,
+  -- ⚠️ The model's own report that the body tried to instruct it. Recorded, never trusted
+  -- as a defence: it is a signal for a human, not a control.
+  prompt_injection_suspected INTEGER,
+  raw_json       TEXT NOT NULL,
+  input_tokens   INTEGER,
+  output_tokens  INTEGER,
+  cache_read_tokens  INTEGER,
+  cache_write_tokens INTEGER
+);
+CREATE INDEX IF NOT EXISTS message_application_match_msg
+  ON message_application_match (message_id, created_at DESC);
