@@ -2381,6 +2381,16 @@ On Wed, Aug 12, 2026 the candidate wrote:
         ("Update", "We will not be moving forward with your application.", "rejection"),
         ("Update", "You were not selected for this role.", "rejection"),
         ("Update", "We have chosen to pursue other candidates.", "rejection"),
+        # Emerging Tech, 2026-08-17. The THIRD miss in this family. The rule kept
+        # enumerating surface phrasings; it now anchors on the object of the verb,
+        # because the tell is moving forward with SOMEONE ELSE.
+        ("Thank you for your interest in Emerging Tech",
+         "After careful review of your background and experience, we have decided to move "
+         "forward with candidates whose qualifications more closely align with the "
+         "requirements of this role.", "rejection"),
+        # ⚠️ The positive use of the same verb must survive the anchoring.
+        ("Next steps", "We would love to move forward with you. Does Tuesday work?",
+         "scheduling"),
         # ⚠️ THE WIDENING MUST NOT SWALLOW ITS NEIGHBOURS. "move forward" is ordinary
         # scheduling language, and an offer letter routinely contains "unfortunately".
         ("Availability", "Are you free Tuesday to move forward with a call?", "scheduling"),

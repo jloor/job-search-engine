@@ -875,7 +875,13 @@ RULES = [
     # which verb carries the negation, so match the negation instead of one conjugation.
     ("rejection",        r"\b(not moving forward|not be moving forward|not to move forward|"
                          r"unfortunately|other candidates|"
-                         r"other applicants|move forward with other|pursue other|"
+                         r"other applicants|pursue other|"
+                         # ⚠️ THE TELL IS MOVING FORWARD WITH SOMEONE ELSE, not the phrase
+                         # "move forward", which is ordinary scheduling language. Emerging
+                         # Tech wrote "decided to move forward with candidates whose
+                         # qualifications more closely align". Anchor on the object.
+                         r"mov(?:e|ing) forward with (?:other|another|candidates|applicants)|"
+                         r"more closely (?:align|match)|"
                          r"decided not to|not to proceed|not be selected|were not selected|"
                          r"will not be proceeding|no longer under consideration)\b"),
     ("confirmation",     r"\b(thank you for applying|we(?:'ve| have) received your application|"
