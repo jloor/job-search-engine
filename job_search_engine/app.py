@@ -1425,7 +1425,8 @@ def job_match_application() -> str:
     if not msgs:
         return "nothing to match"
 
-    done = declined = skipped = 0
+    done = declined = skipped = failed = 0
+    first_error = ""
     for m in msgs:
         with db() as con:
             # ⚠️ An alias that resolves to exactly one application needs no model at all.
@@ -1453,6 +1454,15 @@ def job_match_application() -> str:
         try:
             obj = ai_match_application(m, cands)
         except Exception as e:                                        # noqa: BLE001
+            # 🚨 A FAILURE MUST REACH THE JOB'S OWN RESULT, NOT ONLY THE AUDIT LOG. This
+            # counted nothing and returned "proposed 0, declined 0", which is
+            # indistinguishable from an empty queue. On 2026-08-19 ten messages in a row
+            # died on an OpenRouter 429 and the run reported ok. A status that reports what
+            # was received rather than what was done is the exact failure this project keeps
+            # finding, and here it was in our own summary line.
+            failed += 1
+            if not first_error:
+                first_error = f"{type(e).__name__}: {str(e)[:120]}"
             audit("match_failed", f"message {m['id']}: {type(e).__name__}: {e}")
             continue
         u = obj.get("_usage") or {}
@@ -1474,6 +1484,11 @@ def job_match_application() -> str:
             done += 1
         else:
             declined += 1
+    if failed:
+        # ⚠️ A run where everything failed must not read like a run with nothing to do.
+        return (f"🚨 FAILED {failed} of {len(msgs)}; proposed {done}, declined {declined}, "
+                f"alias already unique {skipped}. First error: {first_error}. "
+                f"They keep no proposal, so the next run retries them.")
     return (f"proposed {done}, declined {declined}, alias already unique {skipped} "
             f"(proposals only; nothing was changed)")
 

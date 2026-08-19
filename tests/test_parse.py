@@ -2751,6 +2751,16 @@ On Wed, Aug 12, 2026 the candidate wrote:
         _c6.close()
         _o5.unlink(_p6)
 
+    # 🚨 A JOB THAT FAILS MUST NOT RETURN A SENTENCE THAT READS LIKE SUCCESS. On
+    # 2026-08-19 ten messages in a row died on an OpenRouter 429 and job_match_application
+    # returned "proposed 0, declined 0", which is indistinguishable from an empty queue.
+    # The counter existed for every outcome except the one that matters.
+    _mm = _src_of(load_app().job_match_application)
+    check("the matcher counts its failures", "failed += 1" in _mm, True)
+    check("a failed run says so in its own result", "FAILED" in _mm, True)
+    check("and names the first error", "first_error" in _mm, True)
+    check("and says they will be retried", "retries them" in _mm, True)
+
     _apr = load_app()
     # ---------------------------------------------------------------------------
     # resolved_application_id: a human's answer to a proposal, and nothing else's
