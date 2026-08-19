@@ -391,11 +391,16 @@ On Wed, Aug 12, 2026 the candidate wrote:
         # reads and narrowly updates them, so the test creates the minimum it touches.
         with _a.db() as con:
             con.execute("CREATE TABLE IF NOT EXISTS posting (id INTEGER PRIMARY KEY)")
+            # ⚠️ The outcome columns are part of the pipeline schema, not this service's,
+            # and job_track writes them when it closes an application on a rejection. The
+            # fixture has to carry every column the relay writes or the test fails on the
+            # schema rather than on the behaviour.
             con.execute("CREATE TABLE IF NOT EXISTS application ("
                         "id INTEGER PRIMARY KEY, posting_id INTEGER, status TEXT, "
                         "alias_used TEXT, company_raw TEXT, role_raw TEXT, "
                         "source_row TEXT, submitted_at TEXT, applied_raw TEXT, "
-                        "status_raw TEXT)")
+                        "status_raw TEXT, outcome_at TEXT, outcome_reason TEXT, "
+                        "outcome_source TEXT)")
         def seed(alias, status, rid):
             with _a.db() as con:
                 con.execute("INSERT INTO posting (id) VALUES (?)", (rid,))
@@ -2375,6 +2380,33 @@ On Wed, Aug 12, 2026 the candidate wrote:
                                ("incomplete_application", False, 1),
                                ("confirmation", True, 1), ("rejection", False, 1)):
         check(f"needs_human {_lbl}/{_warn}", _appc.needs_human_for(_lbl, _warn), _want)
+
+    # ---------------------------------------------------------------- rejection tracking
+    print("\nrejection tracking:")
+    _appr = load_app()
+    # ⚠️ `draft` is deliberately absent. A rejection referencing an application that was
+    # never submitted is suspicious rather than authoritative, and a pre-existing test in
+    # the job_track fixture already asserted that a rejection must not move a draft.
+    check("only submitted or interviewing rows close", _appr.CLOSEABLE,
+          {"submitted", "interview"})
+    # ⚠️ `passed` and `suspended` were HIS decisions and `superseded` was ours. An employer
+    # rejection arriving afterwards must not rewrite why the row stopped.
+    for _st in ("draft", "passed", "suspended", "superseded", "ghosted", "rejected"):
+        check(f"{_st} is not closeable", _st in _appr.CLOSEABLE, False)
+
+    _tsrc = _src_of(_appr.job_track)
+    # 🚨 The UPDATE must be guarded by status in its own WHERE clause, not only by the
+    # Python check above it. Two runs racing on one message would otherwise close a row
+    # twice and overwrite the first outcome date.
+    check("the rejection update re-checks status in SQL",
+          "status IN ('submitted','interview')" in _tsrc, True)
+    check("it records where the outcome came from", "outcome_source='form_email'" in _tsrc, True)
+    check("it retires source_row so the renderer is not blocked",
+          _tsrc.count("source_row=NULL") >= 2, True)
+    # ⭐ A forwarded rejection loses the original sender's authentication. The row says so
+    # rather than presenting the outcome as though the employer sent it here directly.
+    check("it warns that a forward loses authentication",
+          "survive the" in _tsrc and "forwarder" in _tsrc, True)
 
     # ---------------------------------------------------------------- application matching
     print("\napplication matching (fallback):")

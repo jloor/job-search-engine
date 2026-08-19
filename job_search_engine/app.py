@@ -1666,16 +1666,34 @@ def _alias_local(alias: str) -> str:
     return (alias or "").split("@")[0].strip().lower()
 
 
+def _resolve_one(con, ref: str):
+    """The single application an alias refers to, or None when it is not exactly one.
+
+    🚨 AMBIGUITY IS NEVER GUESSED. A shared alias matching many rows returns None and the
+    caller records why. Writing an outcome onto the wrong application closes a live thread,
+    and the candidate would find out from the silence.
+    """
+    rows = [a for a in con.execute(
+        "SELECT id, status, alias_used, company_raw, role_raw FROM application")
+        if _alias_local(a["alias_used"]) == ref]
+    return rows[0] if len(rows) == 1 else None
+
+
+# Statuses a rejection may close. Anything else is left alone and reported.
+# ⚠️ `passed` and `suspended` were HIS decisions and `superseded` was ours. An employer
+# rejection arriving afterwards does not rewrite why the row stopped.
+CLOSEABLE = {"submitted", "interview"}
+
+
 def job_track() -> str:
-    """Move an application from draft to submitted when its confirmation arrives."""
+    """Move an application on inbound mail: draft to submitted, or open to rejected."""
     if not TRACK_ENABLED:
         return "disabled (TRACK_ENABLED=0)"
 
     # ⚠️ `application` is NOT created by this service's schema.sql. It is part of the
     # pipeline schema that rollout.py imports, and the relay only reads and narrowly
-    # updates it. A relay pointed at a fresh database therefore has no such table, and a
-    # job that raised every ten minutes over a table it does not own would be noise
-    # rather than a signal. Say so once and stop.
+    # updates it. A relay pointed at a fresh database has no such table, and a job that
+    # raised every ten minutes over a table it does not own would be noise, not a signal.
     try:
         with db() as con:
             con.execute("SELECT 1 FROM application LIMIT 1")
@@ -1686,58 +1704,80 @@ def job_track() -> str:
 
     with db() as con:
         msgs = con.execute(
-            "SELECT id, application_ref, received_at, to_alias, subject "
+            "SELECT id, application_ref, received_at, to_alias, subject, classification "
             "  FROM message "
-            " WHERE classification = 'confirmation' AND application_ref IS NOT NULL "
+            " WHERE classification IN ('confirmation','rejection') "
+            "   AND application_ref IS NOT NULL "
             " ORDER BY id").fetchall()
-        apps = con.execute(
-            "SELECT id, status, alias_used, company_raw, role_raw FROM application").fetchall()
-
-    by_alias: dict = {}
-    for a in apps:
-        loc = _alias_local(a["alias_used"])
-        if loc:
-            by_alias.setdefault(loc, []).append(a)
 
     moved, skipped = [], []
     for m in msgs:
         ref = (m["application_ref"] or "").lower()
-        cands = by_alias.get(ref, [])
-        if not cands:
-            continue                                  # no row claims this alias; nothing to do
-        if len(cands) > 1:
-            # Ambiguity is the one thing that must never be guessed: picking wrong writes
-            # a false submission date onto a real application.
-            skipped.append(f"msg {m['id']}: alias {ref!r} matches {len(cands)} applications")
-            audit("track_ambiguous", f"alias {ref!r} matches application ids "
-                                     f"{[c['id'] for c in cands]}; no change made")
+        with db() as con:
+            app_row = _resolve_one(con, ref)
+            if app_row is None:
+                n = len([a for a in con.execute("SELECT alias_used FROM application")
+                         if _alias_local(a["alias_used"]) == ref])
+        if app_row is None:
+            if n > 1:
+                skipped.append(f"msg {m['id']}: alias {ref!r} matches {n} applications")
+                audit("track_ambiguous",
+                      f"alias {ref!r} matches {n} applications; no change made. "
+                      f"message_application_match may hold a proposal for a human.")
             continue
-        app_row = cands[0]
-        if app_row["status"] != "draft":
-            continue                                  # already tracked, or not ours to move
 
-        # source_row is the byte-for-byte copy of the hand-written markdown this row was
-        # imported from, and render-tracker.py refuses to write unless every row still
-        # renders back to it. Changing a display field without retiring source_row would
-        # therefore BLOCK the renderer. Setting it NULL marks the row as
-        # database-authoritative: the renderer regenerates that line from the fields and
-        # keeps the gate for every row still backed by its original markdown.
         applied = (m["received_at"] or now())[:10]
+
+        if m["classification"] == "confirmation":
+            if app_row["status"] != "draft":
+                continue                          # already tracked, or not ours to move
+            # source_row is the byte-for-byte copy of the markdown this row was imported
+            # from, and render-tracker.py refuses to write unless every row still renders
+            # back to it. Setting it NULL marks the row database-authoritative.
+            with db() as con:
+                con.execute(
+                    "UPDATE application "
+                    "   SET status='submitted', submitted_at=?, applied_raw=?, "
+                    "       status_raw=?, source_row=NULL "
+                    " WHERE id=? AND status='draft'",
+                    (m["received_at"], f"{applied} · `{m['to_alias']}`",
+                     f"**✅ APPLIED {applied}** — confirmation received at "
+                     f"`{m['to_alias']}` (message {m['id']}), tracked automatically",
+                     app_row["id"]))
+            moved.append(f"app {app_row['id']} ({app_row['company_raw']}) "
+                         f"draft -> submitted on msg {m['id']}")
+            audit("track_submitted",
+                  f"application {app_row['id']} ({app_row['company_raw']} / "
+                  f"{app_row['role_raw']}) draft -> submitted from confirmation message "
+                  f"{m['id']} at {m['to_alias']}")
+            continue
+
+        # --------------------------------------------------------------- rejection
+        if app_row["status"] not in CLOSEABLE:
+            skipped.append(f"msg {m['id']}: application {app_row['id']} is "
+                           f"{app_row['status']!r}, not closeable")
+            continue
+        # 🚨 The status is re-checked in the WHERE clause, not only in Python above it.
+        # Two runs racing on one message would otherwise close a row twice and overwrite
+        # the first outcome date.
         with db() as con:
             con.execute(
                 "UPDATE application "
-                "   SET status='submitted', submitted_at=?, applied_raw=?, status_raw=?, "
-                "       source_row=NULL "
-                " WHERE id=? AND status='draft'",
-                (m["received_at"], f"{applied} · `{m['to_alias']}`",
-                 f"**✅ APPLIED {applied}** — confirmation received at "
-                 f"`{m['to_alias']}` (message {m['id']}), tracked automatically",
+                "   SET status='rejected', outcome_at=?, outcome_reason=?, "
+                "       outcome_source='form_email', status_raw=?, source_row=NULL "
+                " WHERE id=? AND status IN ('submitted','interview')",
+                (m["received_at"], (m["subject"] or "")[:300],
+                 f"**❌ REJECTED {applied}** — rejection received at `{m['to_alias']}` "
+                 f"(message {m['id']}), tracked automatically. ⚠️ If this arrived "
+                 f"FORWARDED, the original sender's authentication did not survive the "
+                 f"forward, so the outcome rests on the forwarder.",
                  app_row["id"]))
-        moved.append(f"app {app_row['id']} ({app_row['company_raw']}) draft -> submitted "
-                     f"on msg {m['id']}")
-        audit("track_submitted",
-              f"application {app_row['id']} ({app_row['company_raw']} / {app_row['role_raw']}) "
-              f"draft -> submitted from confirmation message {m['id']} at {m['to_alias']}")
+        moved.append(f"app {app_row['id']} ({app_row['company_raw']}) "
+                     f"{app_row['status']} -> rejected on msg {m['id']}")
+        audit("track_rejected",
+              f"application {app_row['id']} ({app_row['company_raw']} / "
+              f"{app_row['role_raw']}) {app_row['status']} -> rejected from message "
+              f"{m['id']} at {m['to_alias']}; subject {(m['subject'] or '')[:120]!r}")
 
     if not moved and not skipped:
         return "nothing to track"
