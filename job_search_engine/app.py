@@ -2033,9 +2033,17 @@ def job_track() -> str:
         # ⚠️ THE ROW MUST SAY HOW IT WAS MATCHED. An outcome written because a person chose
         # the application reads differently from one the alias proved, and three months
         # later nothing else records the difference.
-        how = (f"matched by hand ({m['resolved_by'] or 'human'}), not by the alias"
-               if m["resolved_application_id"]
-               else f"received at `{m['to_alias']}`")
+        # 🚨 A MODEL DECISION MUST NOT BE RECORDED AS A HUMAN ONE. Before v0.23.x the only
+        # writer of resolved_application_id was a person, so "matched by hand" was true by
+        # construction. Auto-accept broke that and the first three rows it closed each
+        # claimed a human had decided. The row is the record; if it cannot say who chose,
+        # it cannot be audited later.
+        by = m["resolved_by"] or ""
+        if m["resolved_application_id"]:
+            who = ("matched by a MODEL" if by.startswith("auto:") else "matched by hand")
+            how = f"{who} ({by or 'unknown'}), not by the alias"
+        else:
+            how = f"received at `{m['to_alias']}`"
 
         if m["classification"] == "confirmation":
             if app_row["status"] != "draft":
@@ -2076,7 +2084,8 @@ def job_track() -> str:
                 "       outcome_source=?, status_raw=?, source_row=NULL "
                 " WHERE id=? AND status IN ('submitted','interview')",
                 (m["received_at"], (m["subject"] or "")[:300],
-                 "human_match" if m["resolved_application_id"] else "form_email",
+                 ("model_match" if (m["resolved_by"] or "").startswith("auto:")
+                  else "human_match") if m["resolved_application_id"] else "form_email",
                  f"**❌ REJECTED {applied}** — rejection {how} "
                  f"(message {m['id']}), tracked automatically. ⚠️ If this arrived "
                  f"FORWARDED, the original sender's authentication did not survive the "

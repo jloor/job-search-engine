@@ -2488,6 +2488,10 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("it records where the outcome came from", "outcome_source=?" in _tsrc, True)
     check("an alias-proved outcome is still form_email", "form_email" in _tsrc, True)
     check("a hand-matched outcome says so", "human_match" in _tsrc, True)
+    # 🚨 Auto-accept made "matched by hand" a lie on any row a model resolved. The first
+    # three rows it closed each claimed a human had decided.
+    check("a model-matched outcome is NOT called human", "model_match" in _tsrc, True)
+    check("and the status line names the model", "matched by a MODEL" in _tsrc, True)
     check("it retires source_row so the renderer is not blocked",
           _tsrc.count("source_row=NULL") >= 2, True)
     # ⭐ A forwarded rejection loses the original sender's authentication. The row says so
