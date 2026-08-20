@@ -17,7 +17,7 @@ Design rules carried from platform/SPEC.md:
 """
 from __future__ import annotations
 
-import hashlib, hmac, json, os, re, smtplib, sqlite3, ssl, sys, secrets, threading, time
+import hashlib, hmac, json, os, re, smtplib, sqlite3, ssl, sys, secrets, threading, time, unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -1394,13 +1394,140 @@ def ai_match_application(msg, candidates) -> dict:
     return obj
 
 
-def job_match_application() -> str:
-    """Propose which application an unresolvable inbound email belongs to.
+# ---------------------------------------------------------------------------
+# auto-accept
+# ---------------------------------------------------------------------------
+# 🚨 THIS REVERSES A DELIBERATE SECURITY DECISION, ON HIS EXPLICIT INSTRUCTION 2026-08-20.
+# Until now nothing in this service could write message.resolved_application_id, and the
+# suite proved it by reading this file for any assignment. The reason was concrete: a probe
+# showed classify() can be steered by a sender who writes label words into the body, so a
+# sender who could ALSO choose which application his mail landed on could close a live
+# interview from outside the system.
+#
+# ⭐ WHAT CHANGED AND WHY. Mail forwarded to the SHARED aiapply@ alias resolves to no
+# application at all, by design, so job_track skips it and 87 of 108 forwarded rejections
+# needed hand acceptance. The alias cannot identify the row, so the model is the only thing
+# that can. He asked for those to write themselves.
+#
+# 🚨 THE PROPERTY IS NOW "WRITES ONLY WHEN EVERY GUARD PASSES", NOT "NEVER WRITES", AND THE
+# GUARDS ARE THE WHOLE SECURITY BOUNDARY. They are hard refusals computed here, never
+# warnings for a human to weigh, because the entire point is that no human is looking. Each
+# one is ported verbatim from tools/match-proposals.py, where they were measured against 108
+# real messages and accepted 21.
+#
+# ⚠️ THE ROLE-TITLE CHECK IS THE LOAD-BEARING ONE. The shortlist is built by matching the
+# EMPLOYER name, so re-checking the employer proves nothing: every candidate passed that test
+# by construction. The role title was never used to build the shortlist, so the title
+# appearing in the email is evidence the model did not have handed to it.
+AUTO_ACCEPT_ENABLED = os.environ.get("AUTO_ACCEPT_ENABLED", "1").strip() not in ("0", "false", "no")
 
-    🚨 IT WRITES ONLY TO message_application_match. It never touches `application`, never
-    sets message.classification or application_ref, never clears needs_human, and can never
-    cause mail to be sent. A sender able to choose which application a rejection lands on
-    could close a live interview from outside this system.
+# ⚠️ A row at INTERVIEW is never auto-accepted. Closing a live interview is the single most
+# expensive wrong write this system can make, and it is the one case where waiting costs
+# nothing: he already knows he is interviewing there and will see the mail. Rows at
+# 'submitted' are overwhelmingly the auto-applier backlog, where the cost of being wrong is
+# a tracker correction rather than a lost opportunity.
+AUTO_ACCEPT_STATUSES = ("submitted",)
+
+GENERIC_ROLE_WORDS = {
+    "senior", "junior", "staff", "lead", "principal", "associate", "assistant",
+    "manager", "engineer", "engineering", "specialist", "analyst", "consultant",
+    "technician", "advocate", "architect", "director", "head", "officer",
+    "technical", "support", "customer", "client", "service", "services", "success",
+    "solution", "solutions", "product", "team", "remote", "hybrid", "onsite",
+    "level", "tier", "the", "and", "for", "with", "our", "your", "position", "role",
+    "full", "time", "part", "us", "usa", "united", "states", "east", "west", "north",
+    "south", "america", "americas", "global", "sr", "jr", "ii", "iii", "iv",
+}
+
+
+def _role_tokens(s: str) -> list:
+    s = "".join(c for c in unicodedata.normalize("NFKD", s or "")
+                if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).split()
+
+
+def _title_in_email(role: str, hay_tokens: list) -> bool:
+    """Does the whole role title appear as a contiguous phrase in the email?
+
+    Employers repeat the title and drop its qualifiers, so each variant below is the same
+    title with a qualifier removed. None of them widens it to a different role.
+    """
+    variants = []
+    base = role or ""
+    for cand in (base, re.sub(r"\(.*?\)", " ", base),
+                 re.split(r"\s+[-\u2013\u2014\u00b7]\s+", base)[0], re.split(r",", base)[0]):
+        toks = [w for w in _role_tokens(cand) if w not in ("the", "a", "an", "and", "of", "at")]
+        if len(toks) >= 2 and toks not in variants:
+            variants.append(toks)
+    for v in list(variants):
+        if len(v) > 2 and v[0] in ("sr", "senior", "jr", "junior", "lead", "staff", "principal") \
+                and v[1:] not in variants:
+            variants.append(v[1:])
+    for v in variants:
+        n = len(v)
+        if any(hay_tokens[i:i + n] == v for i in range(len(hay_tokens) - n + 1)):
+            return True
+    return False
+
+
+def auto_accept_reason(con, msg, proposal) -> str | None:
+    """Return None if the proposal may be written, else the reason it must not be."""
+    if not AUTO_ACCEPT_ENABLED:
+        return "auto-accept disabled"
+    if msg["resolved_application_id"] is not None:
+        return "already resolved"
+    if msg.get("auth_warn"):
+        # ⚠️ A message failing its own domain's DMARC never writes anything, whatever it says.
+        return "authentication warning on the message"
+    aid = proposal.get("application_id")
+    if not aid:
+        return "the model declined to choose"
+    if (proposal.get("confidence") or "").lower() != "high":
+        return f"confidence {proposal.get('confidence')!r}, not high"
+    if proposal.get("prompt_injection_suspected"):
+        return "the model reports the body tried to instruct it"
+    if msg["classification"] not in ("confirmation", "rejection"):
+        return f"classification {msg['classification']!r} would change nothing"
+    row = con.execute("SELECT id, company_raw, role_raw, status FROM application "
+                      " WHERE id = ?", (aid,)).fetchone()
+    if row is None:
+        return f"application {aid} does not exist"
+    want = AUTO_ACCEPT_STATUSES if msg["classification"] == "rejection" else ("draft",)
+    if row["status"] not in want:
+        return (f"application {aid} is {row['status']!r}; auto-accept requires "
+                f"{' or '.join(want)}")
+    hay = _role_tokens(" ".join(x or "" for x in (msg["subject"],
+                                                  msg["body_reply"] or msg["body_text"])))
+    if not _title_in_email(row["role_raw"], hay):
+        return "the role title does not appear in the email"
+    # 🚨 A SECOND CANDIDATE WHOSE ROLE ALSO APPEARS MEANS THE EVIDENCE POINTS TWO WAYS.
+    for cid in [c for c in (proposal.get("candidate_ids") or "").split(",") if c.strip()]:
+        if int(cid) == aid:
+            continue
+        other = con.execute("SELECT role_raw FROM application WHERE id=?", (int(cid),)).fetchone()
+        if other is not None and _title_in_email(other["role_raw"], hay):
+            return f"the email also names the role of application {cid}"
+    # 🚨 TWO MESSAGES CLAIMING ONE APPLICATION ARE BOTH AMBIGUOUS.
+    dupe = con.execute("SELECT count(*) c FROM message WHERE resolved_application_id=? "
+                       "  AND id <> ?", (aid, msg["id"])).fetchone()
+    if dupe and dupe["c"]:
+        return f"application {aid} is already claimed by another message"
+    return None
+
+
+def job_match_application() -> str:
+    """Propose which application an unresolvable inbound email belongs to, and, when every
+    guard passes, resolve it.
+
+    ⚠️ CHANGED 2026-08-20 ON HIS INSTRUCTION. This was propose-only. It now also writes
+    message.resolved_application_id when auto_accept_reason() returns None, so mail forwarded
+    to the shared aiapply@ alias can move an application without a human. It still never
+    touches `application` directly, never sets classification or application_ref, never
+    clears needs_human, and can never cause mail to be sent. job_track does the status write,
+    unchanged, from the column this sets.
+
+    🚨 The guards ARE the security boundary now. Read auto_accept_reason() before changing
+    anything here.
     """
     if not AI_READ_ENABLED:
         return "disabled (AI_READ_ENABLED=0)"
@@ -1426,6 +1553,7 @@ def job_match_application() -> str:
         return "nothing to match"
 
     done = declined = skipped = failed = 0
+    accepted, refused = 0, []
     first_error = ""
     for m in msgs:
         with db() as con:
@@ -1480,6 +1608,31 @@ def job_match_application() -> str:
                  json.dumps({k: v for k, v in obj.items() if k != "_usage"}),
                  u.get("input_tokens"), u.get("output_tokens"),
                  u.get("cache_read_tokens"), u.get("cache_write_tokens")))
+            # ⭐ AUTO-ACCEPT, IN THE SAME TRANSACTION AS THE PROPOSAL. Re-read the message
+            # here rather than trusting the copy loaded at the top of the run: a human may
+            # have resolved it by hand while the model call was in flight, and the guard
+            # must see that.
+            fresh = dict(con.execute(
+                "SELECT id, subject, body_text, body_reply, classification, auth_warn, "
+                "       resolved_application_id FROM message WHERE id=?", (m["id"],)).fetchone())
+            why = auto_accept_reason(con, fresh, obj)
+            if why is None:
+                aid = obj["application_id"]
+                con.execute(
+                    "UPDATE message SET resolved_application_id=?, resolved_by=?, "
+                    "resolved_at=? WHERE id=? AND resolved_application_id IS NULL",
+                    (aid, f"auto:{AI_MODEL}", now(), m["id"]))
+                back = con.execute("SELECT resolved_application_id r FROM message "
+                                   " WHERE id=?", (m["id"],)).fetchone()
+                if back and back["r"] == aid:
+                    accepted += 1
+                    audit("auto_accepted",
+                          f"message {m['id']} -> application {aid} by {AI_MODEL}; every guard "
+                          f"passed. job_track will act on it next run.")
+                else:
+                    refused.append(f"msg {m['id']}: write did not take")
+            else:
+                refused.append(f"msg {m['id']}: {why}")
         if obj.get("application_id"):
             done += 1
         else:
@@ -1489,8 +1642,10 @@ def job_match_application() -> str:
         return (f"🚨 FAILED {failed} of {len(msgs)}; proposed {done}, declined {declined}, "
                 f"alias already unique {skipped}. First error: {first_error}. "
                 f"They keep no proposal, so the next run retries them.")
-    return (f"proposed {done}, declined {declined}, alias already unique {skipped} "
-            f"(proposals only; nothing was changed)")
+    tail = (f"; AUTO-ACCEPTED {accepted}" if accepted else "")
+    if refused:
+        tail += f"; not auto-accepted {len(refused)}: " + "; ".join(refused[:6])
+    return (f"proposed {done}, declined {declined}, alias already unique {skipped}{tail}")
 
 
 def job_ai_read() -> str:

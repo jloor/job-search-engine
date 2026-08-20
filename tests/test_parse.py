@@ -2517,12 +2517,21 @@ On Wed, Aug 12, 2026 the candidate wrote:
             and isinstance(getattr(_fn.body[0], "value", None), _ast.Constant)):
         _fn.body = _fn.body[1:]                       # drop the docstring
     _code = _ast.unparse(_fn)
-    for _forbidden in ("UPDATE application", "UPDATE message", "needs_human",
-                       "INSERT INTO application"):
-        check(f"never writes: {_forbidden}", _forbidden.lower() in _code.lower(), False)
-    check("writes only its own table",
+    # ⚠️ CHANGED 2026-08-20. It used to write nothing but its own table. It may now also
+    # set message.resolved_application_id, on his instruction, so mail forwarded to the
+    # shared aiapply@ alias can move an application without a human. Everything else it was
+    # forbidden to touch, it is STILL forbidden to touch.
+    for _forbidden in ("UPDATE application", "needs_human", "INSERT INTO application",
+                       "classification=", "application_ref="):
+        check(f"still never writes: {_forbidden}", _forbidden.lower() in _code.lower(), False)
+    check("still inserts only into its own table",
           _code.count("INSERT INTO") == _code.count("INSERT INTO message_application_match"),
           True)
+    check("the ONLY message column it writes is the resolution",
+          "UPDATE message SET resolved_application_id" in _code, True)
+    check("and it is guarded, never unconditional",
+          "auto_accept_reason" in _code, True)
+    check("the write is re-read before it is counted", "back[" in _code or "back and back" in _code, True)
 
     # ⭐ The shortlist narrows on the employer name before any model call, so the model
     # only ever chooses between rows that are already plausible.
@@ -2762,6 +2771,76 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("and says they will be retried", "retries them" in _mm, True)
 
     _apr = load_app()
+
+    # -----------------------------------------------------------------------
+    # auto_accept_reason: the guards ARE the security boundary now
+    # -----------------------------------------------------------------------
+    # 🚨 Until 2026-08-20 nothing here could write resolved_application_id, because a sender
+    # who can steer classify() with label words could otherwise choose which application his
+    # mail closed. That protection is now these guards and nothing else, so every one gets a
+    # case that FAILS, not just the happy path. A guard nobody proves is a comment.
+    import sqlite3 as _sA, tempfile as _tA
+    _pA = _tA.NamedTemporaryFile(suffix=".db", delete=False).name
+    _cA = _sA.connect(_pA); _cA.row_factory = _sA.Row
+    try:
+        _cA.execute("CREATE TABLE application (id INTEGER PRIMARY KEY, company_raw TEXT, "
+                    "role_raw TEXT, status TEXT)")
+        _cA.execute("CREATE TABLE message (id INTEGER PRIMARY KEY, resolved_application_id INTEGER)")
+        for _i, _co, _ro, _st in ((1, "Cyclops", "Technical Support Engineer (Remote)", "submitted"),
+                                  (2, "Labcorp", "EDI Senior Specialist", "interview"),
+                                  (3, "Alpha", "Support Engineer", "draft"),
+                                  (4, "AssistIQ", "Implementation Manager", "submitted"),
+                                  (5, "AssistIQ", "Sr. Implementation Manager", "submitted")):
+            _cA.execute("INSERT INTO application VALUES (?,?,?,?)", (_i, _co, _ro, _st))
+        _cA.commit()
+
+        def _msg(**kw):
+            base = dict(id=10, subject="Fwd: update", body_text="", body_reply="",
+                        classification="rejection", auth_warn=0, resolved_application_id=None)
+            base.update(kw); return base
+
+        def _prop(**kw):
+            base = dict(application_id=1, confidence="high", candidate_ids="1",
+                        prompt_injection_suspected=0)
+            base.update(kw); return base
+
+        _good_body = "Your Technical Support Engineer application at Cyclops. Unfortunately no."
+
+        check("clean proposal is accepted",
+              _apr.auto_accept_reason(_cA, _msg(body_reply=_good_body), _prop()), None)
+
+        for _label, _m, _p in (
+            ("medium confidence refused", _msg(body_reply=_good_body), _prop(confidence="medium")),
+            ("injection flag refused", _msg(body_reply=_good_body), _prop(prompt_injection_suspected=1)),
+            ("declined pick refused", _msg(body_reply=_good_body), _prop(application_id=None)),
+            ("DMARC warning refused", _msg(body_reply=_good_body, auth_warn=1), _prop()),
+            ("already resolved refused",
+             _msg(body_reply=_good_body, resolved_application_id=9), _prop()),
+            ("label that changes nothing refused",
+             _msg(body_reply=_good_body, classification="unknown"), _prop()),
+            ("missing application refused", _msg(body_reply=_good_body), _prop(application_id=99)),
+            ("🚨 LIVE INTERVIEW refused",
+             _msg(body_reply="Your EDI Senior Specialist application at Labcorp. Unfortunately no."),
+             _prop(application_id=2, candidate_ids="2")),
+            ("rejection onto a draft refused",
+             _msg(body_reply="Your Support Engineer application at Alpha. Unfortunately no."),
+             _prop(application_id=3, candidate_ids="3")),
+            ("role title absent refused",
+             _msg(body_reply="Regarding your application at Cyclops, unfortunately no."), _prop()),
+            ("rival role in the email refused",
+             _msg(body_reply="We reviewed you for the Implementation Manager and the Sr. "
+                             "Implementation Manager roles at AssistIQ. Unfortunately no."),
+             _prop(application_id=4, candidate_ids="4,5")),
+        ):
+            _r = _apr.auto_accept_reason(_cA, _m, _p)
+            check(_label, _r is not None, True)
+
+        # 🚨 Two messages cannot claim one application.
+        _cA.execute("INSERT INTO message VALUES (11, 1)"); _cA.commit()
+        check("second message claiming the same application refused",
+              _apr.auto_accept_reason(_cA, _msg(body_reply=_good_body), _prop()) is not None, True)
+    finally:
+        _cA.close(); os.unlink(_pA)
     # ---------------------------------------------------------------------------
     # resolved_application_id: a human's answer to a proposal, and nothing else's
     # ---------------------------------------------------------------------------
@@ -2771,13 +2850,24 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # the body could also choose WHICH application his mail closed, and closing a live interview
     # from outside is the exact harm the propose-only rule exists to prevent.
     _src = (pathlib.Path(__file__).parent.parent / "job_search_engine" / "app.py").read_text()
-    for _bad in ("SET resolved_application_id", "resolved_application_id=",
-                 "resolved_application_id =", "resolved_by=", "resolved_at="):
-        check(f"service never writes: {_bad}", _bad in _src, False)
-    check("resolved_application_id is only ever READ",
-          _src.count("resolved_application_id") > 0
-          and "UPDATE message" not in _src.split("def job_track")[1].split("def ")[0],
-          True)
+    # ⚠️ REVERSED 2026-08-20 ON HIS INSTRUCTION, and the reversal is NARROW. The service may
+    # now write resolved_application_id, but only from job_match_application and only behind
+    # auto_accept_reason(). job_track must still never write it: job_track READS that column
+    # and acts on it, and a job that both sets and consumes its own trigger has no boundary
+    # left at all.
+    _tk_body = _src.split("def job_track")[1].split("\ndef ")[0]
+    check("job_track still never writes the resolution",
+          ("resolved_application_id=" in _tk_body
+           or "SET resolved_application_id" in _tk_body), False)
+    check("job_track still writes no message column", "UPDATE message" in _tk_body, False)
+    _mm_body = _src.split("def job_match_application")[1].split("\ndef ")[0]
+    check("only the matcher writes the resolution",
+          "UPDATE message SET resolved_application_id" in _mm_body, True)
+    check("and only behind the guard", "auto_accept_reason" in _mm_body, True)
+    check("a live INTERVIEW is never auto-accepted",
+          "interview" in str(_apr.AUTO_ACCEPT_STATUSES), False)
+    check("auto-accept applies to submitted rows only",
+          _apr.AUTO_ACCEPT_STATUSES, ("submitted",))
 
     # ⭐ A HUMAN'S DECISION OUTRANKS THE ALIAS. This is the case the column exists for: mail
     # arrived at a shared address that resolves to nothing, and a person said which row it is.
