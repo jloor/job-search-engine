@@ -2864,6 +2864,13 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("only the matcher writes the resolution",
           "UPDATE message SET resolved_application_id" in _mm_body, True)
     check("and only behind the guard", "auto_accept_reason" in _mm_body, True)
+    # 🚨 The selection at the top of the job skips any message that already has a proposal,
+    # so without a second pass the auto-accept path could only ever see mail proposed in the
+    # same run. Six real forwarded rejections were skipped on the first live run.
+    check("it sweeps proposals it did not just make",
+          "m.resolved_application_id IS NULL AND m.handled_at IS NULL" in _mm_body, True)
+    check("and never re-litigates a human decision",
+          "x.model <> '(human)'" in _mm_body, True)
     check("a live INTERVIEW is never auto-accepted",
           "interview" in str(_apr.AUTO_ACCEPT_STATUSES), False)
     check("auto-accept applies to submitted rows only",

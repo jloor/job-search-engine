@@ -1642,6 +1642,51 @@ def job_match_application() -> str:
         return (f"🚨 FAILED {failed} of {len(msgs)}; proposed {done}, declined {declined}, "
                 f"alias already unique {skipped}. First error: {first_error}. "
                 f"They keep no proposal, so the next run retries them.")
+    # 🚨 SWEEP THE EXISTING PROPOSALS TOO, NOT ONLY THE ONES MADE IN THIS RUN. The selection
+    # above skips any message that already has a proposal, so without this the auto-accept
+    # path could only ever see mail proposed in the same pass. Every message proposed before
+    # the feature existed, and every backlog message, would be permanently invisible to it.
+    # Found immediately on the first live run: six forwarded rejections were skipped entirely.
+    # ⭐ This costs NO model calls. It re-evaluates guards against proposals already paid for.
+    swept = 0
+    with db() as con:
+        pending = [dict(x) for x in con.execute(
+            "SELECT m.id, m.subject, m.body_text, m.body_reply, m.classification, m.auth_warn, "
+            "       m.resolved_application_id, x.proposed_application_id, x.confidence, "
+            "       x.candidate_ids, x.prompt_injection_suspected, x.model "
+            "  FROM message m "
+            "  JOIN message_application_match x ON x.id = ("
+            "        SELECT id FROM message_application_match "
+            "         WHERE message_id = m.id ORDER BY id DESC LIMIT 1) "
+            " WHERE m.resolved_application_id IS NULL AND m.handled_at IS NULL "
+            "   AND x.proposed_application_id IS NOT NULL "
+            # ⚠️ A human decision is never re-litigated by a machine.
+            "   AND x.model <> '(human)' "
+            " ORDER BY m.id")]
+        for pm in pending:
+            prop = {"application_id": pm["proposed_application_id"],
+                    "confidence": pm["confidence"],
+                    "candidate_ids": pm["candidate_ids"],
+                    "prompt_injection_suspected": pm["prompt_injection_suspected"]}
+            why = auto_accept_reason(con, pm, prop)
+            if why is not None:
+                refused.append(f"msg {pm['id']}: {why}")
+                continue
+            aid = pm["proposed_application_id"]
+            con.execute("UPDATE message SET resolved_application_id=?, resolved_by=?, "
+                        "resolved_at=? WHERE id=? AND resolved_application_id IS NULL",
+                        (aid, f"auto:{pm['model']}", now(), pm["id"]))
+            back = con.execute("SELECT resolved_application_id r FROM message WHERE id=?",
+                               (pm["id"],)).fetchone()
+            if back and back["r"] == aid:
+                swept += 1
+                audit("auto_accepted",
+                      f"message {pm['id']} -> application {aid} by {pm['model']} on the "
+                      f"backlog sweep; every guard passed.")
+            else:
+                refused.append(f"msg {pm['id']}: write did not take")
+    accepted += swept
+
     tail = (f"; AUTO-ACCEPTED {accepted}" if accepted else "")
     if refused:
         tail += f"; not auto-accepted {len(refused)}: " + "; ".join(refused[:6])
