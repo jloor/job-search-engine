@@ -2447,6 +2447,20 @@ On Wed, Aug 12, 2026 the candidate wrote:
          "with the requirements of the position.", "confirmation"),
         ("Your offer", "We are delighted to offer you the position. Unfortunately we "
          "could not match your full ask.", "hired"),
+        # 🚨 REGRESSION, 2026-08-21. The real Ashby confirmation for OpenRouter, verbatim.
+        # It classified as `unknown` and left a submitted application sitting at `draft`.
+        # It missed twice, each time by one word: the list held "thank you for applying"
+        # and "thanks for your application" but not "thanks for applying", and the body
+        # said "received your resume" against a pattern reading "received your
+        # application". Greeting and object both vary by vendor.
+        ("Thanks for applying to OpenRouter!",
+         "Hi Jonathan,\n\nWe have received your resume for Scaled Support Specialist role "
+         "at OpenRouter! We appreciate your interest in joining the team. We will review "
+         "your application and get back to you if there are next steps.\n\nAll the best,\n\n"
+         "OpenRouter Hiring Team", "confirmation"),
+        # The two halves of that miss, isolated, so a future edit cannot drop one silently.
+        ("Thanks for applying", "", "confirmation"),
+        ("Update", "We have received your resume.", "confirmation"),
         ("Thanks", "Thank you for applying to Acme.", "confirmation"),
         ("Your code", "Your one-time verification code is 123456", "otp"),
         ("Hello", "I came across your profile and wanted to reach out.", "recruiter_outreach"),

@@ -927,8 +927,16 @@ RULES = [
                          r"more closely (?:align|match)|"
                          r"decided not to|not to proceed|not be selected|were not selected|"
                          r"will not be proceeding|no longer under consideration)\b"),
-    ("confirmation",     r"\b(thank you for applying|we(?:'ve| have) received your application|"
-                         r"application (?:was )?(?:received|submitted)|thanks for your application)\b"),
+    # 2026-08-21: an Ashby confirmation for OpenRouter classified as `unknown` and the
+    # application row stayed `draft` after it had really been sent. It missed twice, each
+    # time by one word. Subject: "Thanks for applying to OpenRouter!" against a list holding
+    # "thank you for applying" AND "thanks for your application", but not "thanks for
+    # applying". Body: "we have received your resume" against a pattern reading "received
+    # your application". Neither wording is unusual, which is the point: the greeting and the
+    # object both vary by vendor, so match the shape rather than one vendor's sentence.
+    ("confirmation",     r"\b(than(?:k you|ks) for (?:applying|your application|submitting)|"
+                         r"we(?:'ve| have) received your (?:application|resume|r\xe9sum\xe9|submission)|"
+                         r"application (?:was )?(?:received|submitted))\b"),
     ("recruiter_outreach", r"\b(reaching out|came across your|would you be open|"
                            r"opportunity (?:at|with)|recruiter)\b"),
 ]
