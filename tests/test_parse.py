@@ -2477,6 +2477,42 @@ On Wed, Aug 12, 2026 the candidate wrote:
                                ("confirmation", True, 1), ("rejection", False, 1)):
         check(f"needs_human {_lbl}/{_warn}", _appc.needs_human_for(_lbl, _warn), _want)
 
+    # ---------------------------------------------------------------- NUL at the boundary
+    # 🚨 REGRESSION, 2026-08-21. One NUL byte in one scraped posting made every nightly
+    # backup unrestorable for three days while the seal verified and the file decrypted.
+    # sqlite3.executescript() refuses a script containing a NUL, so the dump replayed as
+    # "ValueError: embedded null character" and nothing earlier in the chain complained.
+    # _arg() is the single point every written parameter passes through, which is why the
+    # strip lives there rather than at the two call sites that happened to be involved.
+    print("\nNUL is stripped at the parameter boundary:")
+    _argf = _appc.BunnyDB._arg if hasattr(_appc, "BunnyDB") else None
+    if _argf is None:
+        for _n in dir(_appc):
+            _o = getattr(_appc, _n)
+            if isinstance(_o, type) and hasattr(_o, "_arg") and hasattr(_o, "executemany"):
+                _argf = _o._arg
+                break
+    check("adapter with _arg was found", _argf is not None, True)
+    if _argf is not None:
+        _got = _argf("Roles vary \x00\x00 some can be performed from anywhere")
+        check("NUL removed from text params", "\x00" in _got["value"], False)
+        check("...and the rest of the text survives",
+              _got["value"], "Roles vary  some can be performed from anywhere")
+        check("a clean string is untouched", _argf("plain")["value"], "plain")
+        # A dump built from a stripped value must actually replay.
+        import sqlite3 as _sq
+        _c = _sq.connect(":memory:")
+        _c.executescript("CREATE TABLE t(x TEXT);")
+        _c.execute("INSERT INTO t VALUES (?)", (_argf("a\x00b")["value"],))
+        _dump = "\n".join(_c.iterdump())
+        _c2 = _sq.connect(":memory:")
+        try:
+            _c2.executescript(_dump)
+            _replays = True
+        except ValueError:
+            _replays = False
+        check("the resulting dump replays", _replays, True)
+
     # ---------------------------------------------------------------- rejection tracking
     print("\nrejection tracking:")
     _appr = load_app()

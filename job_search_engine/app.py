@@ -201,7 +201,18 @@ class _Hrana:
         if isinstance(v, (bytes, bytearray)):
             import base64
             return {"type": "blob", "base64": base64.b64encode(v).decode()}
-        return {"type": "text", "value": str(v)}
+        # 🚨 STRIP NUL. A NUL byte is never meaningful in any text this system stores, and
+        # exactly one can make every backup unrestorable while every other signal stays
+        # green. Measured 2026-08-21: a scraped Komodo Health posting carried a mangled em
+        # dash that arrived as two NULs in scan_candidate.remote_evidence. The nightly job
+        # kept sealing and uploading, the seal verified, the file decrypted, and
+        # sqlite3.executescript() then refused the whole dump with "embedded null
+        # character". Three days of backups were fine to look at and impossible to replay.
+        #
+        # It belongs here rather than at the scraper, because this is the one place every
+        # write passes through. Fixing the two known call sites would leave the next one
+        # exposed, and the failure is silent until the day it is needed.
+        return {"type": "text", "value": str(v).replace("\x00", "")}
 
     @staticmethod
     def _cell(c):
