@@ -945,9 +945,23 @@ RULES = [
     # applying". Body: "we have received your resume" against a pattern reading "received
     # your application". Neither wording is unusual, which is the point: the greeting and the
     # object both vary by vendor, so match the shape rather than one vendor's sentence.
+    # 2026-08-22, the THIRD miss of this shape. Tennr wrote "Thank you for your interest in
+    # the Enterprise Solutions Engineer role at Tennr! Our team is currently reviewing
+    # applications, and we will be in touch if there is a potential fit." Nothing in the list
+    # matched, so a real confirmation raised needs_human.
+    # 🚨 "Thank you for your interest" CANNOT be the trigger, and that is the whole difficulty:
+    # it is the standard opening of a REJECTION too. What separates them is what the sentence
+    # says happens next. A confirmation says the review is still running; a rejection has
+    # already decided. So anchor on the ongoing-review tell, never on the greeting.
+    # ✅ Safe to add because the rejection rule is matched FIRST: a letter that says both
+    # "currently reviewing" and "moving forward with other candidates" still reads as a
+    # rejection.
     ("confirmation",     r"\b(than(?:k you|ks) for (?:applying|your application|submitting)|"
                          r"we(?:'ve| have) received your (?:application|resume|r\xe9sum\xe9|submission)|"
-                         r"application (?:was )?(?:received|submitted))\b"),
+                         r"application (?:was )?(?:received|submitted)|"
+                         r"(?:currently|actively) reviewing (?:all )?(?:applications|"
+                         r"your application|candidates)|"
+                         r"we(?:'ll| will) be in touch if)\b"),
     ("recruiter_outreach", r"\b(reaching out|came across your|would you be open|"
                            r"opportunity (?:at|with)|recruiter)\b"),
 ]

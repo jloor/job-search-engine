@@ -2458,6 +2458,20 @@ On Wed, Aug 12, 2026 the candidate wrote:
          "at OpenRouter! We appreciate your interest in joining the team. We will review "
          "your application and get back to you if there are next steps.\n\nAll the best,\n\n"
          "OpenRouter Hiring Team", "confirmation"),
+        # 🚨 REGRESSION, 2026-08-22. The real Tennr confirmation, verbatim. It classified as
+        # `unknown` and raised needs_human on a receipt. Its opening, "Thank you for your
+        # interest", is ALSO the standard opening of a rejection, so the greeting can never be
+        # the trigger. The tell is that the review is still running.
+        ("Thank you from Tennr!",
+         "Thank you for your interest in the Enterprise Solutions Engineer role at Tennr! "
+         "Our team is currently reviewing applications, and we will be in touch if there is "
+         "a potential fit.\n\nAll the best,\nTennr Talent Team", "confirmation"),
+        # 🚨 AND THE OTHER HALF OF THAT COIN. The same greeting, with a decision already made,
+        # must still be a rejection. This is what makes the new pattern safe: the rejection
+        # rule runs first, so an ongoing-review phrase cannot promote a no into a receipt.
+        ("Thank you from Acme",
+         "Thank you for your interest in the role. We are currently reviewing applications "
+         "but have decided to move forward with other candidates.", "rejection"),
         # The two halves of that miss, isolated, so a future edit cannot drop one silently.
         ("Thanks for applying", "", "confirmation"),
         ("Update", "We have received your resume.", "confirmation"),
