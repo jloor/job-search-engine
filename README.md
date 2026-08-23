@@ -26,6 +26,37 @@ anything in the auth path.
 | `deploy.sh` | Builds `linux/amd64`, smoke-tests the image, pushes to GHCR. |
 | `Dockerfile` | Non-root (uid 10001), no `--proxy-headers` (see SECURITY.md). |
 
+## 🚨 A rebuild must produce a database the operator's tools can write into (2026-08-22)
+
+Until 2026-08-22 the engine declared its **mail** tables and its **scan** tables and none of
+the pipeline: `company`, `posting`, `application`, `contact`, `interaction`, `backlog_item`,
+`content_item`. Those were applied once by a rollout script reading a spec file that lives
+outside this repository. **A database rebuilt from `init_db()` therefore came up with no
+pipeline at all**, and nothing said so: the service starts, `/health` is green, and the only
+symptom is `job_track` returning `skipped: no application table in this database`.
+
+⚠️ **The backup guard would have passed that database.** `job_backup()` counts rows in
+`application`, `posting`, `company` and `message` and refuses to ship a dump missing them,
+but a table that does not exist counts as `None` and `None` is skipped. The one check
+written to notice a dump losing the pipeline could not notice a database that never had one.
+
+They are declared in `schema.sql` and repeated in `MIGRATIONS` now, both `IF NOT EXISTS`,
+and the suite compares the two column lists rather than trusting that two copies stay equal.
+
+⭐ **The DDL was taken from the live database's `sqlite_master`, not retyped from the spec**,
+and the two were then diffed statement by statement. The seven tables are identical once
+comments are removed. Three objects were not:
+
+| object | spec | live | done |
+|---|---|---|---|
+| `idx_application_status` | declared | **absent** | declared here; it is created on the next boot |
+| `scan_observation` | declared | absent | **not revived**, superseded by `board_state` + `scan_change` |
+| `idx_scan_at` | declared | absent | not revived, it indexed `scan_observation` |
+
+📌 **Declaring a table and owning its contents are different things.** This service still
+only reads the pipeline and narrowly updates an application's status on inbound mail. The
+point is that a restore produces a database the operator's own tools can write into.
+
 ## Storage is swappable
 
 `BUNNY_DATABASE_URL` set routes every query to Bunny Database over its documented
@@ -206,8 +237,8 @@ read from `__init__.py` rather than written a second time, because two copies dr
 
 🚨 **`/diag/jobs` is the only thing that watches the scheduler.** Every other check triggers
 a job by hand through `/admin/run`, which proves the job works and proves nothing about the
-loop meant to call it. If `_scheduler()` dies, all eight jobs stop, `/health` stays green,
-and the silence looks exactly like a quiet night.
+loop meant to call it. If `_scheduler()` dies, every scheduled job stops, `/health` stays
+green, and the silence looks exactly like a quiet night.
 
 - **Read `ok` first.** It is false when any job has missed `STALE_FACTOR` (default 3)
   intervals. Every job stale at once means the loop, not the job.
@@ -222,6 +253,11 @@ and the silence looks exactly like a quiet night.
   non-blocking lock with no timeout, so a wedged job holds it forever and answers
   `skipped: <name> is already running` to everything — which is also the correct answer while
   a long job is legitimately mid-run. `running_for_s` is what separates them.
+- ⚠️ **A job with `interval_s: 0` is MANUAL ONLY and can never be stale**, because nothing
+  ever scheduled it. `workday_enrich` is the first one. Without that exemption its limit
+  would be zero, it would be overdue the instant the process booted, and `ok` would sit at
+  false forever on a job behaving exactly as designed. It gets `MANUAL_JOB_STUCK_AFTER_S`
+  (default one hour) as its stuck window instead.
 
 ### Is the configuration I deployed the configuration that is running
 
@@ -603,3 +639,129 @@ revert path, where it is worth 30–46%.
 ⚠️ **`openai_compat` via OpenRouter puts mail with two parties**, OpenRouter and the
 upstream provider, each with its own retention terms. Prefer OpenAI direct for anything
 that runs on real mail. OpenRouter is for benchmarking.
+
+## Triage caching: the profile is the prefix (2026-08-22)
+
+The mail-reading numbers above are about `job_ai_read`. **`job_triage` is a different and
+much larger bill**, and until this change almost none of it cached.
+
+| measured over 1,207 triaged candidate rows | value |
+|---|---|
+| input tokens attributed per posting | 5,888 |
+| of that, the candidate profile | ~4,580 |
+| cache read tokens per posting | **302, about 5%** |
+
+The profile sat at the **front of the user message**. On the Anthropic path the single
+breakpoint covered the system prompt plus the output schema (~1,426 tokens) and never
+reached it. On the OpenAI-compatible path there is no breakpoint at all: automatic caching
+keys on the longest matching **prefix**, and the prefix was one short system message.
+
+**The change is ordering, not retrieval.** The profile and the gap vocabulary move into the
+system message, and only the postings stay in the user message. Measured on the real
+document with a pack of five:
+
+```
+stable prefix (system message):   96,701 chars  ~24,175 tok
+varying part  (user message)  :   16,062 chars  ~ 4,015 tok
+cacheable share of the prompt : 85.8%     (it was 5.8%)
+```
+
+- **Anthropic:** two `cache_control` breakpoints, one after the instructions and one after
+  the profile. Two, because they change for different reasons: editing the profile must not
+  also throw away the instruction prefix. Caching is now unconditional, where it used to
+  require `len(cands) > 1`. That test was right when the prefix was 1,426 tokens; with
+  ~24,000 in the prefix the next call repays the write whatever this pack size was.
+- **`openai_compat`, which is what production runs:** no parameter exists to set. The only
+  lever is a byte-identical prefix ahead of every posting, which is what this produces.
+
+🚨 **A prefix hit is not guaranteed and must be measured, not assumed.** Automatic caches
+expire after a few minutes of idle and a gateway can route two calls to different
+providers. `cache_read_tokens` is already recorded per candidate row, so the honest check
+after deploy is to read that column and compare it against the 302 above:
+
+```bash
+# has the cache actually engaged? Compare to ~302 before this change.
+sqlite3 relay.db "SELECT date(at) d, count(*) n, avg(input_tokens) avg_in,
+                         avg(cache_read_tokens) avg_cached
+                    FROM scan_candidate WHERE triaged=1 AND input_tokens IS NOT NULL
+                   GROUP BY d ORDER BY d DESC LIMIT 7;"
+```
+
+If `avg_cached` has not moved, the prefix is not being reused, and the answer is the pacing
+of the triage job, not another prompt edit.
+
+🚫 **Retrieval over the profile was considered and rejected.** The strongest matches this
+system has produced came from single buried sentences that no query for the posting's own
+subject would have returned. Caching keeps the whole document in every call. Retrieval
+would cut the bill by dropping the sentences that matter.
+
+## Workday: repairing the rows a backfill wrote blind (2026-08-22)
+
+**Measured 2026-08-22:** 716 Workday candidate rows, **700 with an empty `url`** and
+**716 with an empty `description`**, of which 65 were sitting at `score >= 80`. Workday is
+about 5% of the queue and about a quarter of the strong-and-remote shortlist, so those are
+scores derived from a title and a place name with no posting text behind them.
+
+**The URL bug was not where it looked.** All 40 Workday boards match the hostname rebuild,
+and every row the sweep has written since carries a URL. All 700 bad rows share a single
+insert timestamp: they came from an out-of-band backfill that read a board-state table
+holding only board, req_id and title. The fix is therefore not a better regex, it is one
+addressing helper every writer can call:
+
+- `workday_bases(board_or_api_url)` accepts a cxs list URL **or** a stored board key, and
+  covers both host forms (`<tenant>.<wdN>.myworkdayjobs.com/<site>` and
+  `<wdN>.myworkdaysite.com/recruiting/<tenant>/<site>`).
+- `workday_path(board, req_id)` accepts **both stored `req_id` shapes**, because the two
+  writers disagree: the sweep stores `<board>:<externalPath>` and the backfill stored the
+  bare `<externalPath>`. Both are in the table right now.
+- `workday_job_url` / `workday_job_api_url` build the public link and the per-job endpoint.
+  Both are offline, so a row whose posting has already been taken down still gets its link,
+  which is exactly when the link matters most.
+- `workday_job_detail` reads `/wday/cxs/<tenant>/<site>/job/<path>`, which carries the full
+  text the list API omits.
+
+🚨 **A failed read is not a dead requisition.** Measured on three tenants the same
+afternoon: one returned 200 with 5,918 characters, one returned 404 for a requisition that
+had really gone, and one returned **403 for a posting that is plainly live and whose list
+endpoint answers normally**. Only 404 and 410 may mean gone. 403, 429, 5xx and timeouts are
+`blocked`. Nothing here writes a vanish either way.
+
+### Running it
+
+`workday_enrich` is registered in `job_table()` so it can be triggered by hand, with a
+**scheduler interval of 0, which means manual only**. It spends hundreds of requests
+against employers' boards and it is a data job someone decides to run and watch.
+
+```bash
+# one batch (WORKDAY_ENRICH_BATCH, default 150 rows, paced 1 request per second)
+curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+     https://<host>/admin/run/workday_enrich | python3 -m json.tool
+# it is an async job: poll the ticket it returns
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+     https://<host>/admin/run-status/<ticket> | python3 -m json.tool
+```
+
+Repeat until the summary reports `0 still to do`. Each run commits as it goes, so a run
+that dies halfway has kept everything before the failure.
+
+🚨 **It does not re-triage, and re-triaging is a separate decision.** `triaged` is left
+exactly as found, so a run changes no score and spends nothing on a model. Once the text is
+in and someone has read a sample of it, re-scoring the affected rows is the deliberate paid
+step:
+
+```bash
+# how many rows now have text they were scored without
+sqlite3 relay.db "SELECT count(*) FROM scan_candidate
+                   WHERE board LIKE 'workday|%' AND description != '' AND triaged=1;"
+# clear the flag on those rows so the normal triage job re-reads them, then let it run
+sqlite3 relay.db "UPDATE scan_candidate SET triaged=0
+                   WHERE board LIKE 'workday|%' AND description != '' AND triaged=1;"
+```
+
+⚠️ **Price that before running it.** It is one triage call per pack of five at roughly
+$0.0009 a posting, so 716 rows is under a dollar at the current model and about thirty
+times that on a frontier one.
+
+⚠️ **A permanently 404 row is re-read on every run.** That is deliberate for a manual job
+(it doubles as a liveness re-check) but it means the `still to do` count does not reach zero
+for requisitions that are genuinely gone.

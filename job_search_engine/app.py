@@ -134,6 +134,11 @@ BOOTED_AT = time.time()
 # How many intervals a job may miss before it counts as stale. Three is deliberately
 # forgiving: a sweep that overruns its window, or one skipped tick, is not an outage.
 STALE_FACTOR = float(os.environ.get("STALE_FACTOR", "3"))
+# How long a MANUAL-ONLY job (scheduler interval 0) may run before /diag/jobs calls it
+# stuck. It has no interval to multiply, and the honest number is "longer than the
+# longest legitimate run": the Workday enrichment paces one request per second across a
+# batch, so an hour is generous and still catches a wedge.
+MANUAL_JOB_STUCK_AFTER_S = int(os.environ.get("MANUAL_JOB_STUCK_AFTER_S", "3600"))
 
 
 # Storage is swappable. Bunny Database is libSQL (a SQLite fork), so the schema and
@@ -453,6 +458,65 @@ MIGRATIONS = [
     "ALTER TABLE message ADD COLUMN resolved_application_id INTEGER",
     "ALTER TABLE message ADD COLUMN resolved_by TEXT",
     "ALTER TABLE message ADD COLUMN resolved_at TEXT",
+    # 2026-08-22: THE PIPELINE TABLES. Declared in schema.sql with the full reasoning;
+    # repeated here so an existing database gets anything it is missing without a rebuild.
+    #
+    # 🚨 THE ENGINE DECLARED NONE OF THESE UNTIL NOW. They were applied once by a rollout
+    # script reading the operator's private SPEC, so a database rebuilt from init_db() came
+    # up with mail and scan and no pipeline at all. Worse, job_backup() counts rows in
+    # application, posting and company and refuses a dump missing them, but a table that
+    # does not exist counts as None and None is skipped: the guard written to notice a lost
+    # pipeline could not notice a database that never had one.
+    #
+    # ⚠️ The column lists must stay identical to schema.sql. This is what an existing
+    # production database runs and the other is what a fresh build runs. A drift test in
+    # the suite compares the two rather than trusting that two copies stay equal.
+    #
+    # 📌 Every one is IF NOT EXISTS, so against the live database all of these are no-ops
+    # except idx_application_status, which the SPEC declared and the live database never
+    # had. That one gap was found by diffing sqlite_master against the SPEC on 2026-08-22.
+    ("CREATE TABLE IF NOT EXISTS company ("
+     "id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, ats_platform TEXT, "
+     "ats_token TEXT, board_url TEXT, api_url TEXT, email_alias TEXT, "
+     "watch_state TEXT NOT NULL DEFAULT 'active', watch_cadence TEXT, next_check TEXT, "
+     "hiring_model TEXT, notes_path TEXT)"),
+    ("CREATE TABLE IF NOT EXISTS posting ("
+     "id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES company(id), "
+     "title TEXT NOT NULL, req_id TEXT, canonical_url TEXT, apply_url TEXT, "
+     "captured_at TEXT NOT NULL, posted_at TEXT, closes_at TEXT, archive_path TEXT, "
+     "archive_sha256 TEXT, comp_min INTEGER, comp_max INTEGER, "
+     "comp_currency TEXT DEFAULT 'USD', comp_source TEXT, location TEXT, "
+     "work_model TEXT, work_model_raw TEXT, hours_stated TEXT, gate_remote INTEGER, "
+     "gate_hours INTEGER, gate_comp INTEGER, "
+     "status TEXT NOT NULL DEFAULT 'unknown', status_evidence TEXT, last_verified TEXT, "
+     "UNIQUE(company_id, req_id))"),
+    "CREATE INDEX IF NOT EXISTS idx_posting_status ON posting(status, last_verified)",
+    ("CREATE TABLE IF NOT EXISTS application ("
+     "id INTEGER PRIMARY KEY, posting_id INTEGER NOT NULL REFERENCES posting(id), "
+     "submitted_at TEXT, alias_used TEXT, channel TEXT, package_path TEXT, "
+     "status TEXT NOT NULL DEFAULT 'draft', status_raw TEXT, notes TEXT, next_action TEXT, "
+     "company_raw TEXT, role_raw TEXT, link_raw TEXT, contact_raw TEXT, applied_raw TEXT, "
+     "source_row TEXT, outcome_at TEXT, outcome_reason TEXT, outcome_source TEXT, "
+     "UNIQUE(posting_id, submitted_at))"),
+    "CREATE INDEX IF NOT EXISTS idx_application_status ON application(status)",
+    ("CREATE TABLE IF NOT EXISTS contact ("
+     "id INTEGER PRIMARY KEY, company_id INTEGER REFERENCES company(id), "
+     "name TEXT NOT NULL, role TEXT, email TEXT, phone TEXT, "
+     "is_agency INTEGER NOT NULL DEFAULT 0, never_nudge INTEGER NOT NULL DEFAULT 0, "
+     "nudge_after TEXT, rationale TEXT)"),
+    "CREATE INDEX IF NOT EXISTS idx_contact_email ON contact(lower(email))",
+    ("CREATE TABLE IF NOT EXISTS interaction ("
+     "id INTEGER PRIMARY KEY, application_id INTEGER REFERENCES application(id), "
+     "contact_id INTEGER REFERENCES contact(id), message_id INTEGER, "
+     "kind TEXT NOT NULL, at TEXT NOT NULL, summary TEXT, artifacts TEXT)"),
+    ("CREATE TABLE IF NOT EXISTS backlog_item ("
+     "id INTEGER PRIMARY KEY, closes_claim TEXT NOT NULL, build TEXT NOT NULL, "
+     "earns_claim TEXT NOT NULL, does_not_earn TEXT NOT NULL, tier INTEGER, "
+     "status TEXT NOT NULL DEFAULT 'proposed', blocked_by TEXT, artifact_url TEXT, "
+     "shipped_at TEXT)"),
+    ("CREATE TABLE IF NOT EXISTS content_item ("
+     "id INTEGER PRIMARY KEY, pillar TEXT NOT NULL, draft_path TEXT, source_ref TEXT, "
+     "status TEXT NOT NULL DEFAULT 'idea', scheduled_for TEXT, published_url TEXT)"),
 ]
 
 
@@ -1184,8 +1248,15 @@ Rules that matter more than being helpful:
 
 
 def _read_anthropic(user: str, cache_system: bool,
-                    system: str = "", schema: dict | None = None) -> tuple[str, dict]:
-    """The Anthropic path. Explicit cache breakpoint, effort parameter, typed refusals."""
+                    system: "str | list" = "", schema: dict | None = None) -> tuple[str, dict]:
+    """The Anthropic path. Explicit cache breakpoint, effort parameter, typed refusals.
+
+    ⭐ `system` may be a LIST of content blocks the caller has already marked with its own
+    cache_control breakpoints, and it is then passed through untouched. That exists because
+    the largest cacheable thing in this service is not the instructions: it is the candidate
+    profile, which only the triage caller can assemble. A caller that knows where its stable
+    prefix ends places the breakpoint better than this function can guess.
+    """
     import anthropic
 
     system = system or AI_SYSTEM
@@ -1205,8 +1276,13 @@ def _read_anthropic(user: str, cache_system: bool,
     # requests, not from the parameter list. Reasoning from the docs got it wrong twice:
     # first that the prompt was long enough alone, then that the schema could not be part
     # of the prefix because it is not a content block. Both were false.
+    # ⚠️ A caller that passed blocks owns its own breakpoints. Wrapping them again here
+    # would drop them, which is the silent kind of caching failure: the call still works,
+    # costs full price, and nothing in the response says a breakpoint was lost.
     sys_param: object = system
-    if cache_system:
+    if isinstance(system, list):
+        sys_param = system
+    elif cache_system:
         sys_param = [{"type": "text", "text": system,
                       "cache_control": {"type": "ephemeral"}}]
 
@@ -2250,6 +2326,175 @@ def _workday_list(api_url: str) -> dict:
     return {"jobPostings": postings, "total": total}
 
 
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# WORKDAY ADDRESSING. One place, because it was in two and they disagreed.
+#
+# ⚠️ WORKDAY SERVES TWO HOST FORMS AND BOTH OCCUR IN THE WILD:
+#   <tenant>.<wdN>.myworkdayjobs.com/<site>            the common one
+#   <wdN>.myworkdaysite.com/recruiting/<tenant>/<site> a tenant hosting a sub-brand
+# The cxs API path is identical for both; only the public URL differs. The board token
+# says which, by a trailing ":site" marker, because the host cannot be derived from the
+# tenant: a myworkdaysite board built as the first form yields a hostname that does not
+# resolve and the board silently never sweeps.
+#
+# ⭐ EVERY WORKDAY URL IS DERIVABLE OFFLINE, AND THAT IS THE WHOLE POINT. externalPath is
+# both the req_id and the URL suffix, so a row that reached the database with no link can
+# be repaired with no request to anyone. Measured 2026-08-22: 700 of 716 workday candidate
+# rows carried no url at all, and every one of them could be rebuilt from two columns it
+# already had.
+#
+# 🚨 THE ROWS WITH NO URL DID NOT COME FROM THE SWEEP. All 700 share one insert timestamp
+# and came from an out-of-band backfill that read a board-state table holding only board,
+# req_id and title, and inserted candidates without a url, a location or a description. The
+# sweep path has always built the url correctly. So the fix is not a smarter regex, it is
+# giving every writer one addressing helper to call instead of its own idea of the columns.
+#
+# ⚠️ AND THE TWO WRITERS DISAGREE ON WHAT req_id MEANS. The sweep stores the fully
+# qualified "<platform>|<token>:<externalPath>"; the backfill stored the bare externalPath.
+# Both shapes are in the table right now, so anything that reads req_id has to accept both
+# or it silently works on half the rows.
+_WD_CXS_JOBS = re.compile(
+    r"^https://([^.]+)\.(wd\d+)\.myworkdayjobs\.com/wday/cxs/([^/]+)/([^/]+)")
+_WD_CXS_SITE = re.compile(
+    r"^https://(wd\d+)\.myworkdaysite\.com/wday/cxs/([^/]+)/([^/]+)")
+
+
+def workday_bases(board_or_api_url: str) -> tuple[str, str]:
+    """
+    (public_base, cxs_base) for one Workday board, or ("", "") if it cannot be read.
+
+    Accepts either a cxs list URL or a board key, because the sweep holds the first and
+    every stored row holds the second. Board keys are "workday|<tenant>:<wdN>:<site>" and
+    "workday|<tenant>:<wdN>:<site>:site" for the myworkdaysite form; the platform prefix is
+    optional so a bare token works too.
+    """
+    s = (board_or_api_url or "").strip()
+    if not s:
+        return "", ""
+    if s.startswith("https://"):
+        m = _WD_CXS_JOBS.match(s)
+        if m:
+            host_tenant, wd, tenant, site = m.groups()
+            return (f"https://{host_tenant}.{wd}.myworkdayjobs.com/{site}",
+                    f"https://{host_tenant}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}")
+        m = _WD_CXS_SITE.match(s)
+        if m:
+            wd, tenant, site = m.groups()
+            return (f"https://{wd}.myworkdaysite.com/recruiting/{tenant}/{site}",
+                    f"https://{wd}.myworkdaysite.com/wday/cxs/{tenant}/{site}")
+        return "", ""
+    token = s.split("|", 1)[1] if s.startswith("workday|") else s
+    parts = token.split(":")
+    if len(parts) == 3:
+        tenant, wd, site = parts
+        return (f"https://{tenant}.{wd}.myworkdayjobs.com/{site}",
+                f"https://{tenant}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}")
+    if len(parts) == 4 and parts[3] == "site":
+        tenant, wd, site, _ = parts
+        return (f"https://{wd}.myworkdaysite.com/recruiting/{tenant}/{site}",
+                f"https://{wd}.myworkdaysite.com/wday/cxs/{tenant}/{site}")
+    # ⚠️ An unreadable token returns empty rather than guessing. A guessed hostname that
+    # 404s is worse than no URL: it reads as a vanished requisition.
+    return "", ""
+
+
+def workday_path(board: str, req_id: str) -> str:
+    """
+    The externalPath for one row, whichever writer wrote it, or "".
+
+    Handles both stored shapes: "<board>:<externalPath>" from the sweep and a bare
+    "<externalPath>" from the backfill. Anything that does not resolve to a path beginning
+    with "/" yields "", because half a path builds a URL that goes to the wrong posting.
+    """
+    r = (req_id or "").strip()
+    if not r:
+        return ""
+    if board and r.startswith(board + ":"):
+        r = r[len(board) + 1:]
+    elif "|" in r:
+        # A qualified id from some other board key. Take everything from the first slash,
+        # since an externalPath always starts with one and a board key never contains one.
+        i = r.find("/")
+        r = r[i:] if i > 0 else ""
+    return r if r.startswith("/") else ""
+
+
+def workday_job_url(board: str, req_id: str) -> str:
+    """The public posting URL for a stored row, or "". No network."""
+    pub, _ = workday_bases(board)
+    path = workday_path(board, req_id)
+    return f"{pub}{path}" if pub and path else ""
+
+
+def workday_job_api_url(board: str, req_id: str) -> str:
+    """The per-job cxs endpoint for a stored row, or "". No network."""
+    _, cxs = workday_bases(board)
+    path = workday_path(board, req_id)
+    return f"{cxs}{path}" if cxs and path else ""
+
+
+def workday_job_detail(board: str, req_id: str, timeout: int = 0) -> dict:
+    """
+    Read one posting from /wday/cxs/<tenant>/<site>/job/<path>, which carries the full text
+    the list API omits.
+
+    ⚠️ THE LIST CALL IS WHY THIS EXISTS. Workday's list returns titles and locations and
+    nothing else, so every workday candidate was fit-scored on a title and a place name
+    with an empty description. Measured 2026-08-22: 716 of 716 workday rows had no
+    description and 65 of them were sitting at score >= 80. That is a guess in the same
+    column as a measurement.
+
+    🚨 A FAILED READ IS NOT A DEAD REQUISITION, AND ONLY 404 AND 410 MAY SAY OTHERWISE.
+    Measured on three tenants the same afternoon: one returned 200 with 5,918 characters of
+    text, one returned 404 for a requisition that really had gone, and one returned 403 for
+    a posting that is plainly live and whose list endpoint answers normally. Reading that
+    403 as a vanish would delete a real opportunity from the queue on the strength of a
+    tenant's bot rule. 403, 429, 5xx, timeouts and resets are all 'blocked', never 'gone'.
+
+    Returns a dict that always has `state` and never raises:
+        state    ok | gone | blocked | unaddressable
+        evidence what actually happened, for the row that records it
+    plus, on ok: description, url, company, location, posted_at, req_number.
+    """
+    import urllib.error, urllib.request
+    api = workday_job_api_url(board, req_id)
+    if not api:
+        return {"state": "unaddressable", "evidence": "no cxs URL from board and req_id"}
+    req = urllib.request.Request(api, headers={
+        "Accept": "application/json",
+        "User-Agent": "job-search-relay (board watch; one read per posting)"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout or SCAN_TIMEOUT) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 410):
+            return {"state": "gone", "evidence": f"HTTP {e.code} from the per-job endpoint"}
+        return {"state": "blocked", "evidence": f"HTTP {e.code}"}
+    except Exception as e:                                    # noqa: BLE001
+        return {"state": "blocked", "evidence": f"{type(e).__name__}: {e}"}
+
+    jpi = data.get("jobPostingInfo") or {}
+    if not jpi:
+        # A 200 with no posting block is not an answer either way. Saying so is honest;
+        # calling it gone would be the same mistake as calling a 403 gone.
+        return {"state": "blocked", "evidence": "200 with no jobPostingInfo"}
+    loc = jpi.get("location") or ""
+    if not loc:
+        loc = ((jpi.get("jobRequisitionLocation") or {}).get("descriptor") or "")
+    return {
+        "state": "ok",
+        "description": _plain(jpi.get("jobDescription") or ""),
+        # ⭐ externalUrl is the employer's own link. Preferred over the derived one when it
+        # is present, so a tenant with an unusual public path is right rather than close.
+        "url": jpi.get("externalUrl") or workday_job_url(board, req_id),
+        "company": (data.get("hiringOrganization") or {}).get("name") or "",
+        "location": loc,
+        "posted_at": jpi.get("startDate") or "",
+        "req_number": jpi.get("jobReqId") or "",
+        "evidence": "200 from the per-job endpoint",
+    }
+
+
 def _board_reqs(platform: str, api_url: str) -> list[dict]:
     """
     Return one dict per posting on a board.
@@ -2333,25 +2578,12 @@ def _board_reqs(platform: str, api_url: str) -> list[dict]:
                         "location": f"{loc.get('city','')} {loc.get('country','')}".strip(),
                         "url": j.get("applyUrl") or "", "description": ""})
     elif platform == "workday":
-        # api_url is .../wday/cxs/<tenant>/<site>/jobs, so the public site URL is
-        # rebuilt from the same three identifiers rather than stored twice.
-        # ⚠️ WORKDAY SERVES TWO URL FORMS AND BOTH OCCUR IN THE WILD:
-        #   <tenant>.wd3.myworkdayjobs.com/<site>          (Motorola, Harris Computer)
-        #   wd3.myworkdaysite.com/recruiting/<tenant>/<site> (TransTRACK, under Modaxo)
-        # The cxs API path is identical for both, so only the public URL rebuild differs.
-        # The first version handled only the former and produced an empty url for the
-        # latter, which would have stored postings with no link at all.
-        _m = re.search(r"https://([^.]+)\.(wd\d+)\.myworkdayjobs\.com/wday/cxs/"
-                       r"[^/]+/([^/]+)/jobs", api_url)
-        _m2 = re.search(r"https://(wd\d+)\.myworkdaysite\.com/wday/cxs/"
-                        r"([^/]+)/([^/]+)/jobs", api_url)
-        if _m:
-            _base = f"https://{_m.group(1)}.{_m.group(2)}.myworkdayjobs.com/{_m.group(3)}"
-        elif _m2:
-            _base = (f"https://{_m2.group(1)}.myworkdaysite.com/recruiting/"
-                     f"{_m2.group(2)}/{_m2.group(3)}")
-        else:
-            _base = ""
+        # api_url is .../wday/cxs/<tenant>/<site>/jobs, so the public site URL is rebuilt
+        # from the same identifiers rather than stored twice. Both host forms and both
+        # stored req_id shapes live in workday_bases() now: this branch used to carry its
+        # own pair of regexes, a stored row could not be re-addressed by anything else, and
+        # a backfill that did not have them wrote 700 rows with no link.
+        _base, _ = workday_bases(api_url)
         for j in (data.get("jobPostings") or []):
             path = j.get("externalPath") or ""
             loc = j.get("locationsText") or ""
@@ -2974,6 +3206,15 @@ REMOTE_BATCH    = int(os.environ.get("REMOTE_BATCH", "24"))
 REMOTE_EVERY_MIN = int(os.environ.get("REMOTE_EVERY_MIN", "37"))
 COMP_BATCH      = int(os.environ.get("COMP_BATCH", "18"))
 COMP_EVERY_MIN  = int(os.environ.get("COMP_EVERY_MIN", "41"))
+# Workday enrichment. One request per posting, so it is bounded and paced rather than fast.
+WORKDAY_ENRICH_BATCH = int(os.environ.get("WORKDAY_ENRICH_BATCH", "150"))
+WORKDAY_ENRICH_PACE  = float(os.environ.get("WORKDAY_ENRICH_PACE", "1.0"))
+# 🚨 0 MEANS MANUAL ONLY, AND THAT IS THE DEFAULT ON PURPOSE. This job spends hundreds of
+# requests against employers' boards to repair rows an out-of-band backfill wrote badly. It
+# is a data job a human decides to run and watch, not something that should start itself
+# ten seconds after a deploy. Set it to a positive number of minutes only if the enrichment
+# ever needs to become continuous.
+WORKDAY_ENRICH_EVERY_MIN = int(os.environ.get("WORKDAY_ENRICH_EVERY_MIN", "0"))
 # Postings per model call. ⚠️ Bounded by OUTPUT, not by input: measured output was ~3,090
 # tokens per posting before the unused `matched` and `role_family` fields were dropped, and
 # a truncated reply loses the whole pack. 5 against a raised 24,000-token ceiling leaves
@@ -3268,6 +3509,24 @@ def ai_triage_batch(cands: list, profile: str, vocab: list) -> list:
     reads. Sending it once for N postings is the only change that divides that by N, and it
     needs no model swap to do it.
 
+    ⭐ AND THE PROFILE IS NOW IN THE CACHED PREFIX, WHICH IS THE OTHER HALF OF THAT.
+    Measured 2026-08-22 across 1,207 triaged rows: 5,888 input tokens attributed per
+    posting, of which about 4,580 is the profile, against an average of 302 cached tokens.
+    Five percent. The profile used to sit at the front of the USER message, so on the
+    Anthropic path the one breakpoint covered the system prompt and the schema (about 1,426
+    tokens) and never reached the thing that actually costs money.
+
+    🚨 THE FIX IS ORDERING, NOT RETRIEVAL. Building a retriever over the profile was
+    considered and rejected: the strongest matches this system has produced came from one
+    buried sentence in a 1,000-line document that no query for the posting's own subject
+    would have returned. Caching keeps the whole document in every call and stops paying
+    full price for it. Retrieval would cut the bill by dropping the sentences that matter.
+
+    ⭐ IT ALSO MOVES THE TRUST BOUNDARY THE RIGHT WAY. The profile is the operator's own
+    document and the posting text is written by strangers. Putting the trusted half in the
+    system message and leaving only the untrusted half in the user message is what the
+    <posting_text untrusted="true"> tag was already claiming.
+
     ⚠️ Aligned by the ECHOED index, never by position. A model that drops or reorders one
     entry would otherwise shift every later answer onto the wrong posting, and a wrong score
     attached to a real job is worse than no score: it is indistinguishable from a right one.
@@ -3285,19 +3544,55 @@ def ai_triage_batch(cands: list, profile: str, vocab: list) -> list:
             "<posting_text untrusted=\"true\">\n"
             f"{(c.get('description') or '')[:AI_MAX_BODY_CHARS]}\n"
             "</posting_text>\n</posting>")
-    user = (
+
+    # The stable half. Byte-identical from one call to the next until the operator edits
+    # the Inventory or the vocabulary, which is exactly what a cache prefix has to be.
+    reference = (
         "<candidate_profile>\n" + profile + "\n</candidate_profile>\n\n"
         "<gap_vocabulary>\nUse ONLY these slugs, or \"other\".\n" + vocab_lines +
-        "\n</gap_vocabulary>\n\n"
+        "\n</gap_vocabulary>")
+    # The varying half. Nothing above this line depends on which postings are in the pack.
+    user = (
         f"Score each of the {len(cands)} postings below INDEPENDENTLY. Return one result "
         "per posting, echoing its index. Judge each against the profile alone; one posting "
         "must never influence another's score.\n\n" + "\n\n".join(blocks))
 
     if AI_PROVIDER == "anthropic":
-        text, usage = _read_anthropic(user, len(cands) > 1, TRIAGE_SYSTEM,
+        # ⭐ TWO BREAKPOINTS, NOT ONE, AND THE ORDER IS THE POINT. Block one is the
+        # instructions, which change when this file changes. Block two is the profile,
+        # which changes when the operator edits his own document. Splitting them means an
+        # Inventory edit re-writes only the second prefix and the first still reads from
+        # cache. One breakpoint at the end would throw both away on every edit.
+        #
+        # ⚠️ Cached UNCONDITIONALLY now, where it used to be `len(cands) > 1`. That test
+        # made sense when the cacheable prefix was 1,426 tokens and a single-posting call
+        # could not repay a cache write. With ~24,000 tokens in the prefix the next call
+        # repays it whatever this call's pack size was, and single-posting calls are
+        # precisely the re-scores that follow a failed pack.
+        sys_blocks = [
+            {"type": "text", "text": TRIAGE_SYSTEM,
+             "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": reference,
+             "cache_control": {"type": "ephemeral"}},
+        ]
+        text, usage = _read_anthropic(user, False, sys_blocks,
                                       triage_schema_for("anthropic"))
     elif AI_PROVIDER == "openai_compat":
-        text, usage = _read_openai_compat(user, TRIAGE_SYSTEM,
+        # ⚠️ THIS IS THE PATH PRODUCTION ACTUALLY RUNS, and it has no breakpoint parameter
+        # to set. OpenAI-compatible endpoints cache automatically on the longest matching
+        # PREFIX of the request, so the only lever is what comes first and whether it is
+        # byte-identical between calls. Concatenating the reference into the system message
+        # puts about 24,000 stable tokens ahead of every posting, where before the prefix
+        # was one short system message and the profile sat inside a user message that also
+        # carried the postings.
+        #
+        # 🚨 A PREFIX HIT IS NOT GUARANTEED AND MUST BE MEASURED, NOT ASSUMED. Automatic
+        # caches expire on a few minutes of idle and a gateway may route two calls to
+        # different providers. cache_read_tokens is already recorded per candidate row, so
+        # the honest check after deploy is to read that column and compare it against the
+        # 302-token average above. If it has not moved, the prefix is not being reused and
+        # the answer is the pacing of the triage job, not another prompt edit.
+        text, usage = _read_openai_compat(user, TRIAGE_SYSTEM + "\n\n" + reference,
                                           triage_schema_for("openai_compat"), "job_triage")
     else:
         raise RuntimeError(f"unknown AI_PROVIDER {AI_PROVIDER!r}")
@@ -3740,6 +4035,115 @@ _PAYWORDS = re.compile(
 def _nums_in(text: str) -> set:
     return {int(x.replace(",", "").replace("$", ""))
             for x in re.findall(r"\$?\d[\d,]{2,}", text or "")}
+
+
+def job_workday_enrich() -> str:
+    """
+    Give every Workday candidate row the link and the posting text it should have had.
+
+    Two halves, and only the second costs a request:
+
+    1. **The URL, free and offline.** Rebuilt from board plus req_id by workday_job_url().
+       No network, no failure mode, and it repairs a row whose posting has already been
+       taken down, which is exactly when the link matters most because it is the only
+       record of what was there.
+    2. **The description, one GET per posting** against /wday/cxs/<tenant>/<site>/job/<path>.
+       Workday's list API omits it, so these rows were fit-scored on a title and a place
+       name and nothing else.
+
+    🚨 IT DOES NOT RE-TRIAGE AND MUST NOT. `triaged` is left exactly as it was found, so
+    running this changes no score and spends nothing on a model. Re-scoring the rows that
+    now have text is a separate, deliberate, paid step for a human to start once they have
+    read what this wrote. A job that quietly re-triaged would turn a repair into a bill.
+
+    🚨 IT NEVER MARKS A REQUISITION DEAD. workday_job_detail() distinguishes 404 and 410
+    from 403, 429, 5xx and timeouts, and this only records the distinction in the run
+    summary. Writing a vanish from a single failed read is how a throttled host becomes a
+    lost opportunity, and this project has already paid that price twice.
+
+    ⚠️ Bounded and paced on purpose: WORKDAY_ENRICH_BATCH rows per run, WORKDAY_ENRICH_PACE
+    seconds between requests. Running it repeatedly is the intended way to work through a
+    backlog, because a run that fails halfway has still committed everything before the
+    failure.
+    """
+    rows = []
+    with db() as con:
+        try:
+            rows = con.execute(
+                "SELECT id, board, req_id, url, description, company, company_source, "
+                "       location, comp_min "
+                "  FROM scan_candidate "
+                " WHERE board LIKE 'workday|%' "
+                "   AND ((url IS NULL OR url = '') OR (description IS NULL OR description = '')) "
+                " ORDER BY (score IS NULL), score DESC, id "
+                " LIMIT ?", (WORKDAY_ENRICH_BATCH,)).fetchall()
+        except Exception as e:                                # noqa: BLE001
+            if "no such table" in str(e).lower():
+                return "skipped: no scan_candidate table in this database"
+            raise
+    if not rows:
+        return "nothing to enrich"
+
+    done = {"url": 0, "text": 0, "priced": 0, "named": 0,
+            "gone": 0, "blocked": 0, "unaddressable": 0}
+    for i, c in enumerate(rows):
+        c = dict(c)
+        board, rid = c["board"], c["req_id"]
+        derived = workday_job_url(board, rid)
+        if derived and not (c["url"] or "").strip():
+            with db() as con:
+                con.execute("UPDATE scan_candidate SET url=? WHERE id=?", (derived, c["id"]))
+            done["url"] += 1
+        if (c["description"] or "").strip():
+            continue                      # the link was the only thing it was missing
+        if i:
+            time.sleep(WORKDAY_ENRICH_PACE)
+        got = workday_job_detail(board, rid)
+        if got["state"] != "ok":
+            done[got["state"]] = done.get(got["state"], 0) + 1
+            continue
+        text = got["description"]
+        if not text:
+            done["blocked"] += 1
+            continue
+        # ⭐ The free comp read, on text that did not exist until now. This is the same
+        # reader the insert path runs, so a band recovered here is indistinguishable from
+        # one recovered at write time and carries the same comp_source provenance.
+        band = _comp_at_insert({"comp": None, "description": text})
+        sets = ["description=?"]
+        args: list = [text[:AI_MAX_BODY_CHARS]]
+        if got["url"]:
+            sets.append("url=?"); args.append(got["url"])
+        if got["location"] and not (c["location"] or "").strip():
+            sets.append("location=?"); args.append(got["location"])
+        # ⚠️ Only upgrades a name the board token guessed. A name the ATS already stated is
+        # never overwritten, because company_source has to keep meaning what it says.
+        if got["company"] and (c["company_source"] or "token") in ("token", "registry", ""):
+            sets.append("company=?"); args.append(got["company"])
+            sets.append("company_source=?"); args.append("ats")
+            done["named"] += 1
+        if band and c["comp_min"] is None:
+            sets += ["comp_min=?", "comp_max=?", "comp_basis=?", "comp_evidence=?",
+                     "comp_source=?"]
+            args += list(band)
+            done["priced"] += 1
+        args.append(c["id"])
+        with db() as con:
+            con.execute(f"UPDATE scan_candidate SET {', '.join(sets)} WHERE id=?", tuple(args))
+        done["text"] += 1
+
+    left = 0
+    with db() as con:
+        left = con.execute(
+            "SELECT count(*) n FROM scan_candidate WHERE board LIKE 'workday|%' "
+            "AND ((url IS NULL OR url = '') OR (description IS NULL OR description = ''))"
+        ).fetchone()["n"]
+    return (f"{len(rows)} row(s) read; {done['url']} url(s) rebuilt offline, "
+            f"{done['text']} description(s) fetched, {done['priced']} pay band(s) read free, "
+            f"{done['named']} employer name(s) upgraded to the ATS name; "
+            f"{done['gone']} gone (404/410), {done['blocked']} blocked or throttled "
+            f"(NOT recorded dead), {done['unaddressable']} unaddressable; {left} still to do. "
+            f"Nothing was re-triaged.")
 
 
 def job_comp() -> str:
@@ -4387,7 +4791,12 @@ def job_table() -> list:
             ("triage", TRIAGE_EVERY_MIN * 60, job_triage),
             ("remote_check", REMOTE_EVERY_MIN * 60, job_remote_check),
             ("comp", COMP_EVERY_MIN * 60, job_comp),
-            ("place", PLACE_EVERY_MIN * 60, job_place)]
+            ("place", PLACE_EVERY_MIN * 60, job_place),
+            # ⚠️ INTERVAL 0 MEANS MANUAL ONLY, and this is the first job to use it. It is
+            # registered here rather than left as a loose function for the reason recorded
+            # above: a job that is not in this table cannot be triggered by hand either,
+            # and the runbook then documents a command that returns 404.
+            ("workday_enrich", WORKDAY_ENRICH_EVERY_MIN * 60, job_workday_enrich)]
 
 
 async def _scheduler() -> None:
@@ -4402,6 +4811,14 @@ async def _scheduler() -> None:
     await asyncio.sleep(10)                      # let the app finish coming up
     while True:
         for name, interval, fn in jobs:
+            # 🚨 INTERVAL 0 IS "MANUAL ONLY", NOT "AS OFTEN AS POSSIBLE". Without this line
+            # a zero interval means the elapsed time always exceeds it, so a job registered
+            # to be triggerable by hand would instead run in a tight loop from ten seconds
+            # after boot. It must be a floor test, not a truthiness test: a job whose
+            # interval was misread as disabled and one that runs continuously look the same
+            # in /diag/jobs until the bill arrives.
+            if interval <= 0:
+                continue
             if time.time() - last[name] < interval:
                 continue
             last[name] = time.time()
@@ -4591,14 +5008,23 @@ def diag_jobs(request: Request, authorization: str | None = Header(None)):
             # has NEVER run is stale only once the process has been up long enough for it
             # to have been due, otherwise every deploy alarms on the 24-hour jobs.
             limit = interval * STALE_FACTOR
-            is_stale = (age is None and uptime > limit) or (age is not None and age > limit)
+            # ⚠️ A MANUAL-ONLY JOB (interval 0) CAN NEVER BE STALE, because nothing ever
+            # scheduled it. Without this the limit is zero, a job that has never run is
+            # overdue the instant the process starts, and `ok` goes false forever on a job
+            # that is behaving exactly as designed. An alarm that is always on is an alarm
+            # nobody reads, which would cost the eight jobs that DO have a schedule.
+            is_stale = interval > 0 and (
+                (age is None and uptime > limit) or (age is not None and age > limit))
             # ⚠️ STUCK IS NOT STALE, and it is the more urgent of the two. A wedged job holds
             # its lock forever, so it never records a success, and staleness alone would blame
             # the schedule when the real answer is "it started four hours ago and never
             # returned". A job legitimately mid-run is not stuck until it outlives its window.
             started = _JOB_STARTED.get(name)
             running_for = int(time.time() - started) if started else None
-            is_stuck = running_for is not None and running_for > limit
+            # ⚠️ A manual-only job has no interval to outlive, so it gets an explicit
+            # window instead. Zero would call it stuck the second it started.
+            stuck_after = limit if interval > 0 else MANUAL_JOB_STUCK_AFTER_S
+            is_stuck = running_for is not None and running_for > stuck_after
             if is_stuck:
                 stuck.append(name)
             elif is_stale:
@@ -4783,7 +5209,9 @@ def get_backup(name: str, request: Request, authorization: str | None = Header(N
 # Jobs that routinely outlive an HTTP request. Everything else answers synchronously.
 # ⚠️ place joins these because it walks the whole candidate table. Its first run
 # was killed by the CDN at sixty seconds while still writing eligibility.
-ASYNC_JOBS = {"scan", "backup", "place"}
+# ⚠️ workday_enrich joins these because it paces one HTTP request per posting: a full
+# batch is minutes of wall clock, and the CDN closes the connection at sixty seconds.
+ASYNC_JOBS = {"scan", "backup", "place", "workday_enrich"}
 _RUNS: dict = {}
 _RUNS_GUARD = threading.Lock()
 

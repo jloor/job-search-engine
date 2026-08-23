@@ -507,3 +507,174 @@ CREATE TABLE IF NOT EXISTS message_application_match (
 );
 CREATE INDEX IF NOT EXISTS message_application_match_msg
   ON message_application_match (message_id, created_at DESC);
+
+-- ═══════════════════════════════════════════════════════════════════════════════════════
+-- THE PIPELINE TABLES. Added 2026-08-22.
+--
+-- 🚨 THE ENGINE DECLARED NONE OF THESE AND THAT WAS A LIVE RESTORE RISK. company, posting,
+-- application, contact, interaction, backlog_item and content_item existed only as a fenced
+-- SQL block in the operator's private SPEC, applied once by a rollout script that reads that
+-- file. A database rebuilt from init_db() therefore came up with the mail tables and the scan
+-- tables and NO PIPELINE AT ALL: no applications, no postings, no companies.
+--
+-- ⚠️ THE BACKUP GUARD WOULD HAVE PASSED THAT DATABASE. job_backup() counts rows in
+-- application, posting, company and message and refuses to ship a dump missing them, but a
+-- table that does not exist counts as None and None is skipped. The one check written to
+-- notice a dump losing the pipeline cannot notice a database that never had it. Declaring
+-- the tables here is what makes that guard mean something.
+--
+-- ⭐ TAKEN FROM THE LIVE DATABASE'S sqlite_master, NOT RETYPED FROM THE SPEC. The two were
+-- compared statement by statement on 2026-08-22 and the seven tables are identical once
+-- comments are removed, so the column text below is the deployed truth and not a hopeful
+-- copy. Three objects DID differ and are handled explicitly:
+--   * idx_application_status  the SPEC declares it, the live database never had it. Declared
+--                             here, so a rebuild gets the index the SPEC always intended.
+--   * scan_observation        declared by the SPEC, absent from the live database and
+--   * idx_scan_at             superseded by board_state plus scan_change above. NOT revived:
+--                             re-creating an abandoned table in every fresh database would
+--                             make the rebuild disagree with production in the other
+--                             direction.
+--
+-- 📌 THIS SERVICE STILL DOES NOT OWN THEM. It reads them and it narrowly updates
+-- application status on inbound mail. Declaring a table and owning its contents are
+-- different things: the point here is that a restore produces a database the operator's own
+-- tools can write into, not that the relay starts managing the pipeline.
+
+CREATE TABLE IF NOT EXISTS company (
+  id            INTEGER PRIMARY KEY,
+  name          TEXT NOT NULL UNIQUE,
+  ats_platform  TEXT,                    -- greenhouse|ashby|lever|workday|other
+  ats_token     TEXT,
+  board_url     TEXT,
+  api_url       TEXT,
+  email_alias   TEXT,                    -- the per-company address, per company not per application
+  watch_state   TEXT NOT NULL DEFAULT 'active',   -- active|watching|ghosted|closed
+  watch_cadence TEXT,
+  next_check    TEXT,
+  hiring_model  TEXT,                    -- rolling|cohort. Changes how silence is read.
+  notes_path    TEXT                     -- the company note in the operator's repo
+);
+
+CREATE TABLE IF NOT EXISTS posting (
+  id             INTEGER PRIMARY KEY,
+  company_id     INTEGER NOT NULL REFERENCES company(id),
+  title          TEXT NOT NULL,
+  req_id         TEXT,
+  -- ⚠️ These three are nullable on purpose. Postings exist before they are archived: a
+  -- recruiter names a role before sending a link, and 14 of the 38 historical tracker rows
+  -- had no URL at all. Absence is data, so it is recorded as NULL rather than blocking the
+  -- row or inviting a placeholder.
+  canonical_url  TEXT,
+  apply_url      TEXT,
+  captured_at    TEXT NOT NULL,
+  posted_at      TEXT,
+  closes_at      TEXT,
+  archive_path   TEXT,                   -- the verbatim JD file. The text is NOT stored here.
+  archive_sha256 TEXT,                   -- detects an archive edited after capture
+  comp_min       INTEGER,
+  comp_max       INTEGER,
+  comp_currency  TEXT DEFAULT 'USD',
+  comp_source    TEXT,                   -- published|recruiter|estimate|none
+                                         -- ⚠️ an aggregator is never 'published'
+  location       TEXT,
+  work_model     TEXT,                   -- remote|hybrid|onsite, normalised
+  work_model_raw TEXT,                   -- ⭐ the remote claim verbatim. Remote is the hard
+                                         -- filter and this cell usually holds the evidence
+                                         -- (what the posting claims against what the ATS
+                                         -- location field says). Never reduce it to one word.
+  hours_stated   TEXT,
+  gate_remote    INTEGER,                -- the three gates, evaluated once and stored
+  gate_hours     INTEGER,
+  gate_comp      INTEGER,
+  status         TEXT NOT NULL DEFAULT 'unknown',  -- live|unlisted|pulled|filled|unknown
+  status_evidence TEXT,
+  last_verified  TEXT,
+  UNIQUE(company_id, req_id)
+);
+CREATE INDEX IF NOT EXISTS idx_posting_status ON posting(status, last_verified);
+
+CREATE TABLE IF NOT EXISTS application (
+  id            INTEGER PRIMARY KEY,
+  posting_id    INTEGER NOT NULL REFERENCES posting(id),
+  submitted_at  TEXT,
+  alias_used    TEXT,                    -- the per-company address. Answers "which thread is this?"
+  channel       TEXT,                    -- cold|warm_intro|referral|inbound|recruiter
+  package_path  TEXT,
+  status        TEXT NOT NULL DEFAULT 'draft',
+  status_raw    TEXT,                    -- ⭐ the tracker's own words, kept verbatim. The
+                                         -- normalised status is a derived convenience; when
+                                         -- the two disagree this column is the record.
+  notes         TEXT,                    -- often the only place a decision's reasoning is written
+  next_action   TEXT,
+  -- The nine tracker cells, each exactly as written. Company and Role carry per-row
+  -- decoration that belongs to this row and not to the company, and Link carries display
+  -- text a bare URL loses. With all nine stored, regenerating the markdown is an identity
+  -- operation rather than a flattening.
+  company_raw   TEXT,
+  role_raw      TEXT,
+  link_raw      TEXT,
+  contact_raw   TEXT,                    -- the Contact cell as written
+  applied_raw   TEXT,                    -- the Applied cell as written, carrying the alias
+                                         -- used and qualifiers a bare date column throws away
+  -- 🚨 The whole original markdown row, verbatim. The first import was lossy and silently
+  -- dropped the remote cell, which holds the evidence for one of the three gates. The
+  -- structured columns are a derived INDEX over this; this is the record, and it is what
+  -- makes rendering the markdown back out lossless rather than destructive.
+  source_row    TEXT,
+  outcome_at    TEXT,
+  outcome_reason TEXT,
+  outcome_source TEXT,                   -- stated|form_email|none. 'none' is the honest default.
+  UNIQUE(posting_id, submitted_at)
+);
+-- ⚠️ DECLARED BY THE SPEC AND MISSING FROM THE LIVE DATABASE, found 2026-08-22 by diffing
+-- sqlite_master against the SPEC block. Harmless to create and it is what the SPEC always
+-- said; recorded here so the next diff does not re-discover it.
+CREATE INDEX IF NOT EXISTS idx_application_status ON application(status);
+
+CREATE TABLE IF NOT EXISTS contact (
+  id         INTEGER PRIMARY KEY,
+  company_id INTEGER REFERENCES company(id),
+  name       TEXT NOT NULL,
+  role       TEXT,
+  email      TEXT,
+  phone      TEXT,
+  is_agency  INTEGER NOT NULL DEFAULT 0,
+  never_nudge INTEGER NOT NULL DEFAULT 0,
+  nudge_after TEXT,
+  rationale  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_contact_email ON contact(lower(email));
+
+CREATE TABLE IF NOT EXISTS interaction (
+  id             INTEGER PRIMARY KEY,
+  application_id INTEGER REFERENCES application(id),
+  contact_id     INTEGER REFERENCES contact(id),
+  message_id     INTEGER,                -- message.id above, same database
+  kind           TEXT NOT NULL,          -- screen|interview|email|call|form_reply
+  at             TEXT NOT NULL,
+  summary        TEXT,
+  artifacts      TEXT                    -- JSON array of paths
+);
+
+CREATE TABLE IF NOT EXISTS backlog_item (
+  id             INTEGER PRIMARY KEY,
+  closes_claim   TEXT NOT NULL,          -- the capability slug this build closes
+  build          TEXT NOT NULL,
+  earns_claim    TEXT NOT NULL,
+  does_not_earn  TEXT NOT NULL,          -- ⚠️ rung discipline: the tier above, denied in advance
+  tier           INTEGER,
+  status         TEXT NOT NULL DEFAULT 'proposed',  -- proposed|building|shipped|abandoned
+  blocked_by     TEXT,
+  artifact_url   TEXT,
+  shipped_at     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS content_item (
+  id            INTEGER PRIMARY KEY,
+  pillar        TEXT NOT NULL,           -- the content pillar this item belongs to
+  draft_path    TEXT,
+  source_ref    TEXT,
+  status        TEXT NOT NULL DEFAULT 'idea',
+  scheduled_for TEXT,
+  published_url TEXT
+);

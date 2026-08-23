@@ -387,23 +387,16 @@ On Wed, Aug 12, 2026 the candidate wrote:
     _p = _o.environ.get("DB_PATH"); _o.environ["DB_PATH"] = _d
     try:
         _a = load_app(); _a.init_db()
-        # The pipeline tables belong to rollout.py, not to this service. The relay only
-        # reads and narrowly updates them, so the test creates the minimum it touches.
-        with _a.db() as con:
-            con.execute("CREATE TABLE IF NOT EXISTS posting (id INTEGER PRIMARY KEY)")
-            # ⚠️ The outcome columns are part of the pipeline schema, not this service's,
-            # and job_track writes them when it closes an application on a rejection. The
-            # fixture has to carry every column the relay writes or the test fails on the
-            # schema rather than on the behaviour.
-            con.execute("CREATE TABLE IF NOT EXISTS application ("
-                        "id INTEGER PRIMARY KEY, posting_id INTEGER, status TEXT, "
-                        "alias_used TEXT, company_raw TEXT, role_raw TEXT, "
-                        "source_row TEXT, submitted_at TEXT, applied_raw TEXT, "
-                        "status_raw TEXT, outcome_at TEXT, outcome_reason TEXT, "
-                        "outcome_source TEXT)")
+        # ⭐ THE FIXTURE NO LONGER DECLARES THE PIPELINE TABLES, BECAUSE init_db() DOES.
+        # It used to hand-roll a cut-down posting and application, which meant the test
+        # passed against a schema the service had never actually built. Seeding real rows
+        # against the real declarations is what makes NOT NULL and the UNIQUE key part of
+        # what is under test, rather than something only production discovers.
         def seed(alias, status, rid):
             with _a.db() as con:
-                con.execute("INSERT INTO posting (id) VALUES (?)", (rid,))
+                con.execute("INSERT INTO company (id,name) VALUES (?,?)", (rid, f"Acme {rid}"))
+                con.execute("INSERT INTO posting (id,company_id,title,captured_at) "
+                            "VALUES (?,?,?,?)", (rid, rid, "Engineer", "2026-01-01"))
                 con.execute("INSERT INTO application (id,posting_id,status,alias_used,"
                             "company_raw,role_raw,source_row) VALUES (?,?,?,?,?,?,?)",
                             (rid, rid, status, alias, "Acme", "Engineer", "| original |"))
@@ -595,11 +588,9 @@ On Wed, Aug 12, 2026 the candidate wrote:
         for _m in app.MIGRATIONS:
             try: _c3.execute(_m)
             except Exception: pass
-        # `company` is the pipeline registry and lives in rollout.py, not schema.sql. The
-        # scanner only reads four of its columns, so the test declares just those rather
-        # than importing a schema it does not exercise.
-        _c3.execute("CREATE TABLE company (id INTEGER PRIMARY KEY, name TEXT, "
-                    "ats_platform TEXT, ats_token TEXT, api_url TEXT)")
+        # ⭐ `company` comes from schema.sql now. The fixture used to declare its own
+        # four-column version, which is how a test can keep passing against a table the
+        # service does not build.
         _c3.execute("INSERT INTO company (name,ats_platform,ats_token,api_url) "
                     "VALUES ('Acme','greenhouse','acme','https://example.invalid/b')")
         _c3.commit(); _c3.close()
@@ -1727,8 +1718,18 @@ On Wed, Aug 12, 2026 the candidate wrote:
         # a scheduler that never started, which is the outage this endpoint exists for.
         _app9.BOOTED_AT = _tm9.time() - (max(_iv9.values()) * _app9.STALE_FACTOR + 60)
         _r9b = _app9.diag_jobs(_Req9(), "Bearer admin-tok")
-        check("once they were due and did not run, every job is stale",
-              sorted(_r9b["stale"]), sorted(_names9))
+        # ⚠️ EVERY SCHEDULED JOB, NOT EVERY REGISTERED JOB. A manual-only job (interval 0)
+        # was never due, so it can never be overdue. Before this distinction existed its
+        # limit was zero, it went stale the instant the process booted, and `ok` would have
+        # been false forever on a job that was behaving exactly as designed.
+        _sched9 = sorted(n for n in _names9 if _iv9[n] > 0)
+        _manual9 = sorted(n for n in _names9 if _iv9[n] <= 0)
+        check("once they were due and did not run, every SCHEDULED job is stale",
+              sorted(_r9b["stale"]), _sched9)
+        check("...and there is at least one manual-only job to prove the exemption bites",
+              len(_manual9) > 0, True)
+        check("...and a manual-only job is never stale",
+              [n for n in _manual9 if n in _r9b["stale"]], [])
         check("...and ok flips to false", _r9b["ok"], False)
 
         # Case 3: a recent run clears exactly one job and leaves the rest alarming.
@@ -1885,8 +1886,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
         for _m in app.MIGRATIONS:
             try: _c5.execute(_m)
             except Exception: pass
-        _c5.execute("CREATE TABLE company (id INTEGER PRIMARY KEY, name TEXT, "
-                    "ats_platform TEXT, ats_token TEXT, api_url TEXT)")
+        # `company` comes from schema.sql, same as the sweep fixture above.
         _c5.execute("INSERT INTO company (name,ats_platform,ats_token,api_url) "
                     "VALUES ('Flaky','greenhouse','flaky','https://example.invalid/b')")
         _c5.commit(); _c5.close()
@@ -2114,8 +2114,14 @@ On Wed, Aug 12, 2026 the candidate wrote:
     for _m in app.MIGRATIONS:
         try: _bc.execute(_m)
         except Exception: pass
-    _bc.execute("CREATE TABLE application (id INTEGER PRIMARY KEY, x TEXT)")
-    _bc.execute("INSERT INTO application (x) VALUES ('irreplaceable')")
+    # ⭐ `application` comes from schema.sql now, so the dump is checked against the real
+    # table rather than a two-column stand-in. company and posting are seeded because the
+    # real declaration has a NOT NULL posting_id, which the stand-in did not.
+    _bc.execute("INSERT INTO company (id,name) VALUES (1,'Acme')")
+    _bc.execute("INSERT INTO posting (id,company_id,title,captured_at) "
+                "VALUES (1,1,'irreplaceable','2026-01-01')")
+    _bc.execute("INSERT INTO application (id,posting_id,notes) "
+                "VALUES (1,1,'irreplaceable')")
     # More than one page of the huge regenerable table, and of a kept one.
     _bc.executemany("INSERT INTO board_state (board,req_id,first_seen,last_seen,title) "
                     "VALUES (?,?,?,?,?)", [("b", str(i), "t", "t", "x") for i in range(5000)])
@@ -2990,6 +2996,334 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("job_track widened its WHERE for it",
           "OR resolved_application_id IS NOT NULL" in _tk, True)
     check("a human match is recorded as its own outcome_source", "human_match" in _tk, True)
+
+    # ------------------------------------------------------- the pipeline tables
+    # 🚨 THE ENGINE DECLARED NONE OF THESE UNTIL 2026-08-22, so a database rebuilt from
+    # init_db() came up with mail and scan and NO PIPELINE AT ALL. That is a restore risk
+    # and it is invisible: nothing raises, the service starts, /health is green, and the
+    # only symptom is that job_track declines and the backup guard has nothing to count.
+    print("\npipeline tables are declared by the engine:")
+    import os as _op, sqlite3 as _sp, tempfile as _tp
+    _PIPE = ("company", "posting", "application", "contact", "interaction",
+             "backlog_item", "content_item")
+
+    _dp = _tp.NamedTemporaryFile(suffix=".db", delete=False).name
+    _prev_p = _op.environ.get("DB_PATH"); _op.environ["DB_PATH"] = _dp
+    try:
+        _appp = load_app()
+        _appp.init_db()
+        with _appp.db() as con:
+            _have = {r["name"] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+        check("init_db() creates every pipeline table",
+              sorted(t for t in _PIPE if t in _have), sorted(_PIPE))
+
+        # ⭐ NOT JUST PRESENT, USABLE. A table that exists but rejects the rows the
+        # operator's tools write is the same outage with a longer path to it.
+        with _appp.db() as con:
+            con.execute("INSERT INTO company (id,name) VALUES (1,'Acme')")
+            con.execute("INSERT INTO posting (id,company_id,title,captured_at) "
+                        "VALUES (1,1,'Support Engineer','2026-01-01')")
+            con.execute("INSERT INTO application (id,posting_id,status,source_row) "
+                        "VALUES (1,1,'submitted','| a row |')")
+        with _appp.db() as con:
+            check("a seeded application round-trips",
+                  con.execute("SELECT source_row FROM application WHERE id=1"
+                              ).fetchone()["source_row"], "| a row |")
+            # ⚠️ The archive hook, empty on every live row, is at least DECLARED. A column
+            # the tools write but nothing declares vanishes on the next rebuild.
+            check("posting carries the archive hook",
+                  [c["name"] for c in con.execute("PRAGMA table_info(posting)")
+                   if c["name"] in ("archive_path", "archive_sha256")],
+                  ["archive_path", "archive_sha256"])
+
+        # 🚨 THE BACKUP GUARD WAS VACUOUS AND THIS IS WHY IT MATTERS. job_backup() counts
+        # rows in application, posting, company and message and refuses a dump missing
+        # them, but a table that does not exist counts as None and None is skipped. On a
+        # database with no pipeline the guard passed having checked nothing. With the
+        # tables declared, a real row exists to be counted and lost.
+        import backup as _bkp
+        with _appp.db() as con:
+            _dump = _bkp.dump_sql(con)
+        check("the pipeline reaches the backup dump",
+              "INSERT INTO application" in _dump and "INSERT INTO posting" in _dump, True)
+    finally:
+        if _prev_p is None:
+            _op.environ.pop("DB_PATH", None)
+        else:
+            _op.environ["DB_PATH"] = _prev_p
+        _op.unlink(_dp)
+
+    # 🚨 DECLARED TWICE, SO THE TWO COPIES ARE COMPARED RATHER THAN TRUSTED. Same reasoning
+    # as auto_application above: schema.sql builds a fresh database and the MIGRATIONS
+    # entry is what an existing production database actually runs. A column in one and not
+    # the other is invisible until a write fails in production against a table a local
+    # rebuild says is fine.
+    _appq = load_app()
+
+    def _pipe_cols(build):
+        q = _tp.NamedTemporaryFile(suffix=".db", delete=False).name
+        con = _sp.connect(q)
+        try:
+            build(con)
+            return {t: [(r[1], (r[2] or "").upper(), r[3], r[5])
+                        for r in con.execute(f"PRAGMA table_info({t})")] for t in _PIPE}
+        finally:
+            con.close(); _op.unlink(q)
+
+    _pipe_schema = _pipe_cols(lambda c: c.executescript(
+        (pathlib.Path(_appq.__file__).parent / "schema.sql").read_text()))
+
+    def _pipe_from_migrations(c):
+        for m in _appq.MIGRATIONS:
+            try:
+                c.execute(m)
+            except Exception:                                 # noqa: BLE001
+                pass
+
+    _pipe_migs = _pipe_cols(_pipe_from_migrations)
+    for _t in _PIPE:
+        check(f"{_t}: schema.sql and MIGRATIONS agree",
+              _pipe_schema[_t], _pipe_migs[_t])
+        check(f"{_t}: MIGRATIONS declares it at all", len(_pipe_migs[_t]) > 0, True)
+
+    # ------------------------------------------------------- Workday addressing
+    # 🚨 700 OF 716 WORKDAY CANDIDATE ROWS CARRIED NO URL, and every one of them could be
+    # rebuilt offline from two columns it already had. The rows did not come from the
+    # sweep: they came from a backfill that had its own idea of the columns and no way to
+    # build a link. One addressing helper is what stops that recurring.
+    print("\nWorkday addressing:")
+    _appw = load_app()
+
+    # Both host forms, from the cxs list URL.
+    check("api url, myworkdayjobs form",
+          _appw.workday_bases(
+              "https://acme.wd5.myworkdayjobs.com/wday/cxs/acme/Careers/jobs"),
+          ("https://acme.wd5.myworkdayjobs.com/Careers",
+           "https://acme.wd5.myworkdayjobs.com/wday/cxs/acme/Careers"))
+    # ⚠️ The second form is a real shape, not a hypothetical: a parent tenant hosting a
+    # sub-brand. Building the first form for it yields a hostname that does not resolve.
+    check("api url, myworkdaysite form",
+          _appw.workday_bases(
+              "https://wd3.myworkdaysite.com/wday/cxs/parentco/SubBrand/jobs"),
+          ("https://wd3.myworkdaysite.com/recruiting/parentco/SubBrand",
+           "https://wd3.myworkdaysite.com/wday/cxs/parentco/SubBrand"))
+    # ⭐ And from a stored board key, which is all a repair job has.
+    check("board key, three parts",
+          _appw.workday_bases("workday|acme:wd5:Careers")[0],
+          "https://acme.wd5.myworkdayjobs.com/Careers")
+    check("board key, four parts marks the other host",
+          _appw.workday_bases("workday|parentco:wd3:SubBrand:site")[0],
+          "https://wd3.myworkdaysite.com/recruiting/parentco/SubBrand")
+    check("a bare token works too",
+          _appw.workday_bases("acme:wd5:Careers")[0],
+          "https://acme.wd5.myworkdayjobs.com/Careers")
+    # 🚨 An unreadable token yields nothing rather than a guess. A guessed hostname that
+    # 404s reads as a vanished requisition, which is worse than no URL at all.
+    for _bad in ("", "workday|acme", "workday|a:b:c:d", "https://example.invalid/x",
+                 "greenhouse|acme"):
+        check(f"unreadable board {_bad!r} yields no base",
+              _appw.workday_bases(_bad), ("", ""))
+
+    # ⚠️ TWO WRITERS, TWO req_id SHAPES, BOTH IN THE TABLE RIGHT NOW. The sweep stores the
+    # qualified id; the backfill stored the bare externalPath. Anything reading req_id has
+    # to accept both or it silently works on half the rows.
+    _bk = "workday|acme:wd5:Careers"
+    _path = "/job/Remote/Support-Engineer_R1"
+    check("qualified req_id resolves to the path",
+          _appw.workday_path(_bk, f"{_bk}:{_path}"), _path)
+    check("bare req_id resolves to itself", _appw.workday_path(_bk, _path), _path)
+    check("a req_id qualified by a DIFFERENT board still yields its path",
+          _appw.workday_path(_bk, f"workday|other:wd1:Site:{_path}"), _path)
+    check("a req_id with no path at all yields nothing",
+          _appw.workday_path(_bk, "R1234"), "")
+    check("the two shapes build the SAME url",
+          _appw.workday_job_url(_bk, f"{_bk}:{_path}"),
+          _appw.workday_job_url(_bk, _path))
+    check("and it is the public url, not the api one",
+          _appw.workday_job_url(_bk, _path),
+          "https://acme.wd5.myworkdayjobs.com/Careers/job/Remote/Support-Engineer_R1")
+    check("the api url is the cxs one",
+          _appw.workday_job_api_url(_bk, _path),
+          "https://acme.wd5.myworkdayjobs.com/wday/cxs/acme/Careers"
+          "/job/Remote/Support-Engineer_R1")
+
+    # 🚨 DEAD AGAINST THROTTLED. Measured on three real tenants the same afternoon: one
+    # answered 200 with the full text, one answered 404 for a requisition that had really
+    # gone, and one answered 403 for a posting that is plainly live and whose list endpoint
+    # works normally. Reading that 403 as a vanish deletes a real opportunity on the
+    # strength of a bot rule, and this project has already paid that price twice.
+    import urllib.error as _uwe, urllib.request as _uw
+    _real_open = _uw.urlopen
+
+    def _stub(status_or_body):
+        def _f(req, *a, **k):
+            if isinstance(status_or_body, int):
+                raise _uwe.HTTPError(req.full_url, status_or_body, "no", None, None)
+            body = json.dumps(status_or_body).encode()
+
+            class R:
+                def read(self): return body
+                def __enter__(self): return self
+                def __exit__(self, *e): return False
+            return R()
+        return _f
+
+    _ok_payload = {
+        "jobPostingInfo": {
+            "title": "Support Engineer",
+            "jobDescription": "<p>Read <b>HL7</b> feeds.</p>",
+            "location": "Remote, United States",
+            "startDate": "2026-08-18", "jobReqId": "R1",
+            "externalUrl": "https://acme.wd5.myworkdayjobs.com/Careers/job/x"},
+        "hiringOrganization": {"name": "Acme Health"}}
+    try:
+        _uw.urlopen = _stub(_ok_payload)
+        _got = _appw.workday_job_detail(_bk, _path)
+        check("a 200 is read", _got["state"], "ok")
+        check("...and the html is flattened to text",
+              "HL7" in _got["description"] and "<b>" not in _got["description"], True)
+        check("...and the employer's own link wins over the derived one",
+              _got["url"], "https://acme.wd5.myworkdayjobs.com/Careers/job/x")
+        check("...and the ATS states the employer", _got["company"], "Acme Health")
+
+        _uw.urlopen = _stub(404)
+        check("404 is the ONLY kind of gone", _appw.workday_job_detail(_bk, _path)["state"],
+              "gone")
+        _uw.urlopen = _stub(410)
+        check("410 too", _appw.workday_job_detail(_bk, _path)["state"], "gone")
+        # ⚠️ Each of these was a live requisition somewhere. None may be recorded dead.
+        # 403 is the one measured in the wild: a tenant whose list endpoint answers
+        # normally and whose per-job endpoint refuses everything.
+        for _code in (403, 429, 500, 502, 503):
+            _uw.urlopen = _stub(_code)
+            check(f"HTTP {_code} is blocked, never gone",
+                  _appw.workday_job_detail(_bk, _path)["state"], "blocked")
+        _uw.urlopen = _stub({"userAuthenticated": False})
+        check("a 200 with no posting block is blocked, not gone",
+              _appw.workday_job_detail(_bk, _path)["state"], "blocked")
+
+        def _boom(req, *a, **k):
+            raise TimeoutError("timed out")
+        _uw.urlopen = _boom
+        check("a timeout is blocked, never gone",
+              _appw.workday_job_detail(_bk, _path)["state"], "blocked")
+    finally:
+        _uw.urlopen = _real_open
+
+    check("an unaddressable row never reaches the network",
+          _appw.workday_job_detail("greenhouse|acme", "R1")["state"], "unaddressable")
+
+    # ⚠️ The sweep must still build urls, and through the same helper. A second copy of
+    # this logic is what produced two answers in the first place.
+    _wsrc = _src_of(_appw._board_reqs)
+    check("the sweep uses the shared helper", "workday_bases(api_url)" in _wsrc, True)
+    check("...and no longer carries its own hostname regexes",
+          "myworkdayjobs.com/wday/cxs" in _wsrc, False)
+
+    # 🚨 THE REPAIR JOB MUST NOT RE-TRIAGE AND MUST NOT RECORD A VANISH. Re-scoring is a
+    # paid step a human starts deliberately; writing a vanish from one failed read is how
+    # a throttled host becomes a lost opportunity.
+    _esrc = _src_of(_appw.job_workday_enrich)
+    check("the enrichment never writes triaged", "triaged=" in _esrc, False)
+    check("...and never writes a vanish", "vanished" in _esrc, False)
+    check("...and is registered so it can be triggered by hand",
+          "workday_enrich" in [n for n, _, _ in _appw.job_table()], True)
+    check("...but is NOT on the scheduler by default",
+          {n: i for n, i, _ in _appw.job_table()}["workday_enrich"], 0)
+    check("...and the scheduler skips a zero interval rather than looping on it",
+          "if interval <= 0:" in _src_of(_appw._scheduler), True)
+
+    # ------------------------------------------------------- the cached prefix
+    # ⭐ THE SINGLE LARGEST COST LEVER, AND IT IS ORDERING, NOT RETRIEVAL. Measured
+    # 2026-08-22 over 1,207 triaged rows: 5,888 input tokens per posting, about 4,580 of it
+    # the candidate profile, against 302 cached. The profile sat at the front of the USER
+    # message where no breakpoint could reach it and no prefix stayed stable.
+    print("\nthe profile is in the cached prefix:")
+    _appc = load_app()
+    _sent: dict = {}
+
+    def _cap_anthropic(user, cache_system, system="", schema=None):
+        _sent.clear(); _sent.update(kind="anthropic", user=user, system=system,
+                                    cache_system=cache_system)
+        return ('{"results":[]}', {"input_tokens": 1, "output_tokens": 1,
+                                   "cache_read": 0, "cache_write": 0, "model": "m"})
+
+    def _cap_openai(user, system="", schema=None, schema_name=""):
+        _sent.clear(); _sent.update(kind="openai", user=user, system=system)
+        return ('{"results":[]}', {"input_tokens": 1, "output_tokens": 1,
+                                   "cache_read": 0, "cache_write": 0, "model": "m"})
+
+    _PROFILE = "PROFILE-SENTINEL: he has run HL7 interfaces for twenty years."
+    _VOCAB = [{"slug": "go", "label": "Go", "rung": "none", "buildable": "yes"}]
+    _CANDS = [{"title": "Support Engineer", "location": "Remote",
+               "description": "POSTING-SENTINEL untrusted text"}]
+
+    _ra, _ro = _appc._read_anthropic, _appc._read_openai_compat
+    _prov = _appc.AI_PROVIDER
+    try:
+        _appc._read_anthropic, _appc._read_openai_compat = _cap_anthropic, _cap_openai
+
+        _appc.AI_PROVIDER = "anthropic"
+        _appc.ai_triage_batch(_CANDS, _PROFILE, _VOCAB)
+        check("anthropic: the system is a list of blocks", isinstance(_sent["system"], list),
+              True)
+        check("...and EVERY block carries a cache breakpoint",
+              all(b.get("cache_control") for b in _sent["system"]), True)
+        # ⚠️ Two, not one. The instructions and the profile change for different reasons,
+        # so an edit to his own document must not also throw away the instruction prefix.
+        check("...and there are two of them, split where the reasons differ",
+              len(_sent["system"]), 2)
+        check("the profile is in the prefix",
+              any("PROFILE-SENTINEL" in b["text"] for b in _sent["system"]), True)
+        check("🚨 and NOT in the user message", "PROFILE-SENTINEL" in _sent["user"], False)
+        # ⭐ The trust boundary moves the right way: the operator's document is in the
+        # system message, and text written by strangers stays in the user message.
+        check("the untrusted posting text stays in the user message",
+              "POSTING-SENTINEL" in _sent["user"], True)
+        check("...and never reaches the system message",
+              any("POSTING-SENTINEL" in b["text"] for b in _sent["system"]), False)
+        # 🚨 Was `len(cands) > 1`. With ~24,000 tokens in the prefix a single-posting call
+        # repays the write on the next call, and single-posting calls are exactly the
+        # re-scores that follow a failed pack.
+        check("caching is no longer conditional on the pack size",
+              _sent["cache_system"], False)
+
+        _appc.AI_PROVIDER = "openai_compat"
+        _appc.ai_triage_batch(_CANDS, _PROFILE, _VOCAB)
+        # ⚠️ THIS IS THE PATH PRODUCTION RUNS. It has no breakpoint to set, so the only
+        # lever is the prefix: a byte-identical system message ahead of every posting.
+        check("openai_compat: the system is a plain string",
+              isinstance(_sent["system"], str), True)
+        check("...and it carries the profile",
+              "PROFILE-SENTINEL" in _sent["system"], True)
+        check("🚨 ...and the user message does not",
+              "PROFILE-SENTINEL" in _sent["user"], False)
+        check("...and the posting is still the user message",
+              "POSTING-SENTINEL" in _sent["user"], True)
+
+        # ⭐ THE PREFIX MUST BE BYTE-IDENTICAL ACROSS PACKS OR NONE OF THIS CACHES. Two
+        # calls with different postings must produce exactly the same system message.
+        _appc.ai_triage_batch(_CANDS, _PROFILE, _VOCAB)
+        _first = _sent["system"]
+        _appc.ai_triage_batch([{"title": "Other", "description": "OTHER-SENTINEL"},
+                               {"title": "Third", "description": "THIRD-SENTINEL"}],
+                              _PROFILE, _VOCAB)
+        # Compared by length and equality rather than printed: the prefix is the whole
+        # system prompt plus the profile, and dumping it into the log buries the result.
+        check("a different pack produces a byte-identical prefix",
+              (_sent["system"] == _first, len(_first) > 1000), (True, True))
+        check("...while the user message did change",
+              "POSTING-SENTINEL" in _sent["user"], False)
+    finally:
+        _appc._read_anthropic, _appc._read_openai_compat = _ra, _ro
+        _appc.AI_PROVIDER = _prov
+
+    # ⚠️ A caller that passes blocks owns its breakpoints, and _read_anthropic must not
+    # re-wrap them. Dropping a breakpoint is the silent kind of caching failure: the call
+    # still works, costs full price, and nothing in the response says one was lost.
+    check("_read_anthropic passes a block list straight through",
+          "isinstance(system, list)" in _src_of(_appc._read_anthropic), True)
 
     print()
     if failures:
