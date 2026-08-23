@@ -338,6 +338,73 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("disagreements surface in the job's own output",
           "DISAGREEMENT" in src_job, True)
 
+    # 🚨 ...AND IN THE TOOL HE ACTUALLY READS. The line above checks the JOB's output. The
+    # tool he queries is recent_mail, and until 2026-08-23 that returned ONLY the rules
+    # label. Three regex mistakes therefore reached him as facts on one day: two ordinary
+    # confirmations reported as REJECTIONS and a third as an INCOMPLETE APPLICATION. The
+    # model had already read all three correctly, with high confidence, and had no way to
+    # say so.
+    #
+    # 📌 The fixtures below are anonymised on purpose. The subject lines are the real
+    # SHAPES, which is what the assertions need; the employers are not, because naming
+    # them publishes one person's application history in a public repository.
+    #
+    # ⚠️ The triggers were phrases that live INSIDE confirmations: "if you are not selected
+    # for this position" matched the rejection rule, and "thank you for taking the time to
+    # complete your application" matched the incomplete rule. A conditional future and a
+    # past-tense compliment, both read as present-tense verdicts.
+    print("\nrecent_mail shows both readers:")
+    import os as _oR, tempfile as _tR, sqlite3 as _sR
+    _dR = _tR.NamedTemporaryFile(suffix=".db", delete=False).name
+    _pR = _oR.environ.get("DB_PATH"); _oR.environ["DB_PATH"] = _dR
+    try:
+        _appR = load_app()
+        _cR = _sR.connect(_dR)
+        _cR.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+        for _m in _appR.MIGRATIONS:
+            try: _cR.execute(_m)
+            except Exception: pass
+        for _mid, _subj, _rules, _ai, _conf in [
+                (143, "Thank you for applying to Employer A!",  "rejection",              "confirmation", "high"),
+                (146, "Thank you for applying to Employer B",   "incomplete_application", "confirmation", "high"),
+                (145, "We received your Employer C application!", "unknown",             "confirmation", "high"),
+                (149, "Thank you for applying to Employer D",   "confirmation",           "confirmation", "high"),
+                (150, "Security code for your application",   "otp",                    None,           None)]:
+            _cR.execute("INSERT INTO message (id,received_at,to_alias,raw_payload,from_addr,"
+                        "subject,classification,application_ref,auth_dmarc,auth_warn,needs_human) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,0,1)",
+                        (_mid, f"2026-08-23T1{_mid % 10}:00:00+00:00",
+                         "acme@jobs.example.com", "{}", "no-reply@example.com",
+                         _subj, _rules, "acme", "pass"))
+            if _ai:
+                _cR.execute("INSERT INTO ai_reading (message_id,created_at,model,classification,"
+                            "confidence,raw_json) VALUES (?,?,?,?,?,?)",
+                            (_mid, "2026-08-23T18:00:00+00:00", "test-model", _ai, _conf, "{}"))
+        _cR.commit(); _cR.close()
+
+        _out = _appR._mcp_call("recent_mail", {"limit": 10})
+        check("the header counts the disagreements",
+              "3 of 5 shown have the two readers disagreeing" in _out, True)
+        check("each disagreeing row names the second reading",
+              all("DISAGREEMENT" in _out.split(f"[{m}]")[1].split("[")[0] for m in (143, 146, 145)),
+              True)
+        check("...and quotes its label and confidence",
+              "second reading says 'confirmation'" in _out and "high confidence" in _out, True)
+        # ⭐ Displaying a label grants it no authority. ai_reading proposes only, because a
+        # model reading untrusted mail is MORE injectable than a regex, not less: a sender
+        # can write label words into a body, and a probe has already steered classify().
+        check("it refuses to adjudicate", "Neither is authoritative" in _out, True)
+        # Agreement is stated, so "no flag" cannot be misread as "the model never looked".
+        check("agreement is stated explicitly",
+              "second reading agrees (confirmation)" in _out.split("[149]")[1], True)
+        check("an unread message says so",
+              "not read by the model" in _out.split("[150]")[1], True)
+        check("the rules label is still shown, and labelled as the rules label",
+              "rules=rejection" in _out and "rules=incomplete_application" in _out, True)
+    finally:
+        if _pR is None: _oR.environ.pop("DB_PATH", None)
+        else: _oR.environ["DB_PATH"] = _pR
+
     # A reading is only valid for the text it was made from. This is asserted against a
     # real sqlite file rather than by reading the source, because the bug it prevents was
     # a live one: two readings survived a body correction and had to be deleted by hand.
@@ -2426,7 +2493,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
          "After careful review, we will not be moving forward with your application for "
          "this role. To support your career journey we offer free interview prep.",
          "rejection"),
-        ("Thank You for Interviewing with Kizen",
+        ("Thank You for Interviewing with Employer E",
          "Thank you for the time you put into our interview process. After careful "
          "consideration, we have decided to move forward with another candidate.",
          "rejection"),
@@ -2455,7 +2522,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
         ("Gracias por participar", "lamentamos informarte que en esta ocasion no podremos "
          "avanzar con tu candidatura", "rejection"),
         # ⭐ Recoverable, so it must NOT be swallowed by the promoted rejection rule.
-        ("Incomplete Assessment - Product Support Specialist at Clay",
+        ("Incomplete Assessment - Product Support Specialist at Employer F",
          "The take home assessment portion of your application was not completed, so we "
          "unfortunately cannot move forward with the process. That said, feel free to "
          "reapply with a complete assessment.", "incomplete_application"),
@@ -2630,12 +2697,12 @@ On Wed, Aug 12, 2026 the candidate wrote:
     try:
         _c7.execute("CREATE TABLE application (id INTEGER PRIMARY KEY, company_raw TEXT, "
                     "role_raw TEXT, status TEXT, alias_used TEXT)")
-        for _i, _co, _st in ((1, "**Labcorp** (NYSE: LH)", "interview"),
+        for _i, _co, _st in ((1, "**Employer G** (NYSE: XX)", "interview"),
                              (2, "ReadMe", "interview"),
                              (3, "Acme Health", "rejected")):
             _c7.execute("INSERT INTO application VALUES (?,?,?,?,?)",
                         (_i, _co, "Engineer", _st, f"a{_i}@x"))
-        _msg = {"subject": "Update from Labcorp", "body_text": "regarding your application",
+        _msg = {"subject": "Update from Employer G", "body_text": "regarding your application",
                 "body_reply": None, "from_addr": "noreply@labcorp.com"}
         _got = [a["id"] for a in _appm._match_candidates(_c7, _msg)]
         check("shortlist finds the named employer", _got, [1])
@@ -2818,13 +2885,13 @@ On Wed, Aug 12, 2026 the candidate wrote:
         _build_from_migrations(_c6)
         _ins = ("INSERT INTO auto_application(source,company_raw,role_raw,occurrence,"
                 "captured_at) VALUES (?,?,?,?,?)")
-        _c6.execute(_ins, ("aiapply", "Adoreal", "Implementation Specialist", 1, "t"))
-        _c6.execute(_ins, ("aiapply", "Adoreal", "Implementation Specialist", 2, "t"))
+        _c6.execute(_ins, ("aiapply", "Employer H", "Implementation Specialist", 1, "t"))
+        _c6.execute(_ins, ("aiapply", "Employer H", "Implementation Specialist", 2, "t"))
         check("an identical repeat survives", _c6.execute(
             "SELECT count(*) FROM auto_application").fetchone()[0], 2)
         _dup = "no error"
         try:
-            _c6.execute(_ins, ("aiapply", "Adoreal", "Implementation Specialist", 1, "t"))
+            _c6.execute(_ins, ("aiapply", "Employer H", "Implementation Specialist", 1, "t"))
         except Exception as e:                                        # noqa: BLE001
             _dup = "rejected" if "unique" in str(e).lower() else str(e)
         check("re-importing the same row is refused", _dup, "rejected")
@@ -2839,7 +2906,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
             "SELECT count(*) FROM auto_application WHERE url IS NULL").fetchone()[0], 4)
         # 🚨 TWO APPLICATIONS TO ONE POSTING MUST BE STORABLE. The url index was UNIQUE and
         # made this impossible, which is the exact case `occurrence` exists to record:
-        # Adoreal and AssistIQ each had two applications to a single requisition. Row-level
+        # Two employers each had two applications to a single requisition. Row-level
         # dedupe is UNIQUE(source, company_raw, role_raw, occurrence), asserted above.
         _c6.execute(_iu, ("aiapply", "C Co", "C Role", 1, "t", "https://x/1"))
         _c6.execute(_iu, ("aiapply", "C Co", "C Role", 2, "t", "https://x/1"))
@@ -2876,10 +2943,10 @@ On Wed, Aug 12, 2026 the candidate wrote:
                     "role_raw TEXT, status TEXT)")
         _cA.execute("CREATE TABLE message (id INTEGER PRIMARY KEY, resolved_application_id INTEGER)")
         for _i, _co, _ro, _st in ((1, "Cyclops", "Technical Support Engineer (Remote)", "submitted"),
-                                  (2, "Labcorp", "EDI Senior Specialist", "interview"),
+                                  (2, "Employer G", "EDI Senior Specialist", "interview"),
                                   (3, "Alpha", "Support Engineer", "draft"),
-                                  (4, "AssistIQ", "Implementation Manager", "submitted"),
-                                  (5, "AssistIQ", "Sr. Implementation Manager", "submitted")):
+                                  (4, "Employer I", "Implementation Manager", "submitted"),
+                                  (5, "Employer I", "Sr. Implementation Manager", "submitted")):
             _cA.execute("INSERT INTO application VALUES (?,?,?,?)", (_i, _co, _ro, _st))
         _cA.commit()
 
@@ -2909,7 +2976,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
              _msg(body_reply=_good_body, classification="unknown"), _prop()),
             ("missing application refused", _msg(body_reply=_good_body), _prop(application_id=99)),
             ("🚨 LIVE INTERVIEW refused",
-             _msg(body_reply="Your EDI Senior Specialist application at Labcorp. Unfortunately no."),
+             _msg(body_reply="Your EDI Senior Specialist application at Employer G. Unfortunately no."),
              _prop(application_id=2, candidate_ids="2")),
             ("rejection onto a draft refused",
              _msg(body_reply="Your Support Engineer application at Alpha. Unfortunately no."),
@@ -2918,7 +2985,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
              _msg(body_reply="Regarding your application at Cyclops, unfortunately no."), _prop()),
             ("rival role in the email refused",
              _msg(body_reply="We reviewed you for the Implementation Manager and the Sr. "
-                             "Implementation Manager roles at AssistIQ. Unfortunately no."),
+                             "Implementation Manager roles at Employer I. Unfortunately no."),
              _prop(application_id=4, candidate_ids="4,5")),
         ):
             _r = _apr.auto_accept_reason(_cA, _m, _p)
@@ -3422,6 +3489,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
 
     print("all passed")
     return 0
+
 
 
 if __name__ == "__main__":

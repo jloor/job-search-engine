@@ -459,7 +459,7 @@ CREATE TABLE IF NOT EXISTS auto_application (
 -- already does that, and the importer updates on that key rather than inserting. What the
 -- unique url index actually did was make the legitimate case unstorable: TWO applications
 -- to ONE posting, which is precisely what `occurrence` exists to record. Measured on the
--- first real batch of pasted links, Adoreal and AssistIQ each had two applications to a
+-- first real batch of pasted links, two employers each had two applications to a
 -- single requisition and the second could never carry its url.
 CREATE INDEX IF NOT EXISTS auto_application_url
   ON auto_application (source, url);

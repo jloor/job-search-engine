@@ -968,13 +968,13 @@ RULES = [
                          # Every wording below came off a real rejection in the 2026-08-19
                          # forward of 101 messages. Each one was filed as unknown,
                          # scheduling, or confirmation before it was added.
-                         r"won.?t be moving forward|to not move forward|"      # Junction, Waystar, DoorDash
-                         r"not been selected|pursue another|"                  # WEX, Huntington
-                         r"other talents|moving ahead in our search|closer match|"  # n8n, Qventus
-                         r"(?:was|is)n.?t the right fit|not the right fit for|"     # Adoreal
-                         r"won.?t be inviting|not be inviting|not be pursuing|"     # Transmit, Mount Sinai
-                         r"unable to offer you|consider additional applications|"   # Motorola, Workday tpl
-                         r"not currently permitting remote|"                        # Mosaic Life Care
+                         r"won.?t be moving forward|to not move forward|"      # 3 employers
+                         r"not been selected|pursue another|"                  # 2 employers
+                         r"other talents|moving ahead in our search|closer match|"  # 2 employers
+                         r"(?:was|is)n.?t the right fit|not the right fit for|"     # 1 employer
+                         r"won.?t be inviting|not be inviting|not be pursuing|"     # 2 employers
+                         r"unable to offer you|consider additional applications|"   # 1 employer, 1 Workday tpl
+                         r"not currently permitting remote|"                        # 1 employer
                          # One employer replied in Spanish. A rule that only reads English
                          # silently files those as unknown forever.
                          r"lamentamos informarte|no podremos avanzar|"
@@ -993,7 +993,7 @@ RULES = [
                          r"(?:finish|complete|resume|continue) your application|"
                          r"you (?:started|began) an application|"
                          r"did ?n.?t (?:finish|complete)|application (?:was )?not submitted|"
-                         # Clay, 2026-08-19: "the take home assessment portion of your
+                         # One employer, 2026-08-19: "the take home assessment portion of your
                          # application was not completed ... feel free to reapply with a
                          # complete assessment". Recoverable, so it must outrank rejection.
                          r"was not completed|reapply with a complete)\b"),
@@ -5977,8 +5977,11 @@ MCP_TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "company": {"type": "string"}, "role": {"type": "string"}}, "required": ["company"]}},
     {"name": "recent_mail",
-     "description": "Recent inbound messages with classification and DMARC verdict. "
-                    "Messages flagged auth_warn are possible spoofs.",
+     "description": "Recent inbound messages with BOTH readings: the rules label and the "
+                    "model's second reading, flagged when they disagree. A disagreement is "
+                    "the signal to open the message; neither reader is authoritative and "
+                    "the rules label has been confidently wrong. Messages flagged auth_warn "
+                    "are possible spoofs.",
      "inputSchema": {"type": "object", "properties": {
          "limit": {"type": "integer", "default": 15}, "unhandled_only": {"type": "boolean"}}}},
     # ⭐ THE SCAN QUEUE WAS NOT REACHABLE AT ALL. Every tool above reads `application`,
@@ -6192,18 +6195,66 @@ def _mcp_call(name: str, args: dict) -> str:
                                                         if len(text) > 18000 else text)
 
     if name == "recent_mail":
-        q = ("SELECT id,received_at,from_addr,subject,classification,application_ref,"
-             "auth_dmarc,auth_warn,needs_human FROM message")
+        # 🚨 SHOW BOTH READERS, AND SAY WHEN THEY DISAGREE. Until 2026-08-23 this returned
+        # only the rules label, so a regex mistake reached him as a fact. That day it
+        # reported two confirmations as REJECTIONS and a third as an INCOMPLETE
+        # APPLICATION. All three were ordinary confirmations, and the model had already read
+        # all three correctly, with high confidence, and been ignored.
+        #
+        # 📌 Employer names are deliberately absent throughout this file. Naming who sent a
+        # rejection publishes one person's application history in a public repository, and
+        # the engineering fact ("this wording came off a real rejection") survives without it.
+        #
+        # The triggers were precise and both are phrases that live in CONFIRMATIONS:
+        # "if you are not selected for this position, please keep an eye on our careers site"
+        # matched the rejection rule, and "thank you for taking the time to complete your
+        # application" matched the incomplete rule. A conditional future and a past-tense
+        # compliment, read as present-tense verdicts.
+        #
+        # ⭐ THE DISAGREEMENT IS THE PRODUCT. Two independent readers that conflict is the
+        # highest-signal human queue here, and it was invisible. Neither label gains any
+        # authority from being displayed: `ai_reading` still proposes only, because a model
+        # reading untrusted mail is MORE injectable than a regex, not less. A sender can
+        # write label words into a body, and a probe has already steered classify() that way.
+        q = ("SELECT m.id,m.received_at,m.from_addr,m.subject,m.classification,"
+             "m.application_ref,m.auth_dmarc,m.auth_warn,m.needs_human,"
+             "(SELECT r.classification FROM ai_reading r WHERE r.message_id=m.id"
+             "  ORDER BY r.id DESC LIMIT 1) AS ai_label,"
+             "(SELECT r.confidence FROM ai_reading r WHERE r.message_id=m.id"
+             "  ORDER BY r.id DESC LIMIT 1) AS ai_conf "
+             "FROM message m")
         if args.get("unhandled_only"):
-            q += " WHERE handled_at IS NULL AND needs_human=1"
-        q += " ORDER BY received_at DESC LIMIT ?"
+            q += " WHERE m.handled_at IS NULL AND m.needs_human=1"
+        q += " ORDER BY m.received_at DESC LIMIT ?"
         rows = _rows(q, (max(1, min(int(args.get("limit", 15)), 100)),))
         if not rows:
             return "no messages"
-        return "\n".join(
-            f"[{r['id']}] {r['received_at']} {r['from_addr']} — {r['subject']}\n"
-            f"     {r['classification']} · app={r['application_ref']} · dmarc={r['auth_dmarc']}"
-            + ("  ⚠️ AUTH WARNING, possible spoof" if r["auth_warn"] else "") for r in rows)
+
+        out, clashes = [], 0
+        for r in rows:
+            ai, conf = r["ai_label"], r["ai_conf"]
+            line = (f"     rules={r['classification']} · app={r['application_ref']} "
+                    f"· dmarc={r['auth_dmarc']}")
+            if ai and ai != r["classification"]:
+                clashes += 1
+                # ⚠️ Say which is which and claim nothing about who is right. The one case
+                # measured where the RULES won was a Workday account-activation link the
+                # model declined to label; six of seven went the other way. Six of seven is
+                # a signal, not a verdict, and this line must not read as one.
+                line += (f"\n     ⚖️ DISAGREEMENT — second reading says '{ai}'"
+                         f"{' (' + conf + ' confidence)' if conf else ''}. Neither is "
+                         f"authoritative; read the message.")
+            elif ai:
+                line += f" · second reading agrees ({ai})"
+            else:
+                line += " · not read by the model"
+            if r["auth_warn"]:
+                line += "\n     ⚠️ AUTH WARNING, possible spoof"
+            out.append(f"[{r['id']}] {r['received_at']} {r['from_addr']} — {r['subject']}\n"
+                       + line)
+        head = (f"⚖️ {clashes} of {len(rows)} shown have the two readers disagreeing.\n\n"
+                if clashes else "")
+        return head + "\n".join(out)
 
     raise ValueError(f"unknown tool {name}")
 
