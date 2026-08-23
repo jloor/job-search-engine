@@ -3929,9 +3929,6 @@ def job_remote_check() -> str:
     """
     if not TRIAGE_ENABLED:
         return "disabled"
-    if not any(os.environ.get(k, "").strip() for k in
-               ("AI_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY")):
-        return "skipped: no AI key"
     try:
         import candidate as _C
         import gates as _G
@@ -3940,6 +3937,63 @@ def job_remote_check() -> str:
     cfg = _C.load()
     if not cfg:
         return "skipped: no candidate config"
+    # ⚠️ The AI-key check moved BELOW the free pass on 2026-08-23. A rule that needs no model
+    # must not be gated behind a model credential; that is how a free improvement ends up
+    # depending on a paid one and quietly stops running when a key rotates.
+    _have_key = any(os.environ.get(k, "").strip() for k in
+                    ("AI_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY"))
+
+    # ⭐ THE FREE PASS. A posting whose location is in the metro and which says nothing at all
+    # about remote is ONSITE, by definition, and no model is needed to say so.
+    #
+    # 🚨 WHY THIS WAS MISSING AND WHY IT MATTERS. The model selection below reads only postings
+    # that MENTION remote, hybrid, WFH, distributed or anywhere, on the reasoning that the rest
+    # were settled by the location gate. Under a remote-only policy that was right: a New York
+    # onsite role was rejected and needed no verdict. Under a policy that accepts a commutable
+    # onsite role it is wrong, because a verdict is what feeds cascade_hybrid, and a row with no
+    # verdict never cascades and never reaches the shortlist. Measured 2026-08-23: 167 strong
+    # candidates had no verdict at all and roughly 40 of them were in New York, which is 52 to 63
+    # minutes away by transit. The job reported "nothing to check" every run.
+    #
+    # ⚠️ It only ever ADDS a verdict where there was none, and it hands the decision straight to
+    # cascade_hybrid, which is the one place that owns whether a location is reachable. If the
+    # policy is remote_only, cascade_hybrid returns "onsite" unchanged and the row is still out.
+    # 📌 Free. No model call, no HTTP. It runs before the paid path and shrinks its queue.
+    metro = _C.metro_re(cfg)
+    rule_done = {"n": 0, "cascaded": 0}
+    if metro:
+        with db() as con:
+            plain = [dict(r) for r in con.execute(
+                "SELECT id,location,description FROM scan_candidate "
+                " WHERE cast(score as int) >= ? AND remote_verdict IS NULL "
+                "   AND location IS NOT NULL AND location <> '' "
+                # The inverse of the mention filter below: anything that talks about remote at
+                # all belongs to the model, not to a rule.
+                "   AND lower(coalesce(description,'')) NOT LIKE '%remote%' "
+                "   AND lower(location) NOT LIKE '%remote%' "
+                "   AND lower(coalesce(description,'')) NOT LIKE '%hybrid%' "
+                "   AND lower(coalesce(description,'')) NOT LIKE '%work from home%' "
+                "   AND lower(coalesce(description,'')) NOT LIKE '%anywhere%' "
+                " ORDER BY cast(score as int) DESC LIMIT ?",
+                (TRIAGE_BAND_MIN, REMOTE_BATCH * 4)).fetchall()]
+            for c in plain:
+                if not metro.search(c["location"] or ""):
+                    continue
+                after = _G.cascade_hybrid("onsite", c["location"], None, cfg)
+                con.execute("UPDATE scan_candidate SET remote_verdict=?, remote_evidence=? "
+                            "WHERE id=?",
+                            (after, f"onsite by rule: the posting says nothing about remote and "
+                                    f"its location ({(c['location'] or '')[:120]}) is in the "
+                                    f"metro. No model was asked.", c["id"]))
+                rule_done["n"] += 1
+                if after != "onsite":
+                    rule_done["cascaded"] += 1
+
+    if not _have_key:
+        return (f"{rule_done['n']} settled free by the metro rule "
+                f"({rule_done['cascaded']} cascaded to commutable); "
+                f"no AI key, so nothing was read"
+                if rule_done["n"] else "skipped: no AI key")
 
     with db() as con:
         rows = [dict(r) for r in con.execute(
@@ -3970,7 +4024,9 @@ def job_remote_check() -> str:
             if _G.REMOTE_TXT.search((r["description"] or "") + " " + (r["location"] or ""))
             or re.search(r"\bhybrid\b", r["description"] or "", re.I)]
     if not rows:
-        return "nothing to check"
+        return (f"{rule_done['n']} settled free by the metro rule "
+                f"({rule_done['cascaded']} cascaded to commutable); nothing left for the model"
+                if rule_done["n"] else "nothing to check")
 
     origin = (cfg.get("commute") or {}).get("origin", "")
     sysmsg = REMOTE_SYSTEM + f"\n\nThe candidate's origin is: {origin}."
@@ -4015,7 +4071,9 @@ def job_remote_check() -> str:
                             "remote_evidence=? WHERE id=?",
                             (after, ((g.get("residency_requirement") or "") + " | " +
                                      ev)[:600], c["id"]))
-    return (f"read {done['ok'] + done['unverified']} posting(s); "
+    return (f"{rule_done['n']} settled free by the metro rule "
+            f"({rule_done['cascaded']} cascaded to commutable); "
+            f"read {done['ok'] + done['unverified']} posting(s); "
             f"{done['cascaded']} hybrid role(s) cascaded to commutable; "
             f"{done['unverified']} had an unverifiable quote and were set to unclear")
 

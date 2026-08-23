@@ -1202,9 +1202,24 @@ On Wed, Aug 12, 2026 the candidate wrote:
           _g.cascade_hybrid("remote_with_residency", "Salt Lake City, Utah",
                             "Greater Salt Lake City area", _cfg),
           "remote_with_residency")
+    # ⭐ ONSITE CASCADES TOO, and job_remote_check now sets it by rule for a posting that says
+    # nothing about remote at all. Before 2026-08-23 such a posting got NO verdict, because the
+    # model selection only reads postings that MENTION remote. A row with no verdict never
+    # reaches this function, so 167 strong candidates sat unclassified and about 40 of them
+    # were in the metro, 52 to 63 minutes away.
+    check("onsite in the metro cascades to commutable",
+          _g.cascade_hybrid("onsite", "New York, NY", None, _cfg), "hybrid_commutable")
+    check("...and an onsite role far away does not",
+          _g.cascade_hybrid("onsite", "Bangalore, Karnataka, India", None, _cfg), "onsite")
+    check("...nor one in a US city that is not commutable",
+          _g.cascade_hybrid("onsite", "San Francisco, CA", None, _cfg), "onsite")
     _cfg_ro = dict(_cfg, remote=dict(_cfg["remote"], policy="remote_only"))
     check("remote_only does NOT cascade a hybrid",
           _g.cascade_hybrid("hybrid", "New York, NY", "", _cfg_ro), "hybrid")
+    # 🚨 The policy still governs. Accepting a commutable onsite role is a CHOICE recorded in
+    # config, not a behaviour baked into the engine.
+    check("...and does NOT cascade an onsite either",
+          _g.cascade_hybrid("onsite", "New York, NY", None, _cfg_ro), "onsite")
     check("the title filter comes from config, not a literal",
           bool(_cand.title_re(_cfg).search("Implementation Analyst")), True)
     check("...and rejects an off-target title",
