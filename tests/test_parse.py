@@ -469,8 +469,12 @@ On Wed, Aug 12, 2026 the candidate wrote:
                             (rid, rid, status, alias, "Acme", "Engineer", "| original |"))
         def mail(alias, label, mid):
             with _a.db() as con:
+                # ⚠️ classification_source='model' is now REQUIRED for job_track to act. A row
+                # without it carries the provisional rules label, and since 2026-08-23 that
+                # decides nothing. The gate itself is asserted separately below.
                 con.execute("INSERT INTO message (id,received_at,to_alias,raw_payload,"
-                            "classification,application_ref,needs_human) VALUES (?,?,?,?,?,?,1)",
+                            "classification,classification_source,application_ref,needs_human) "
+                            "VALUES (?,?,?,?,?,'model',?,1)",
                             (mid, "2026-08-14T12:00:00+00:00", alias, "{}", label,
                              _a.resolve_application(alias)))
         def status_of(rid):
@@ -2951,8 +2955,12 @@ On Wed, Aug 12, 2026 the candidate wrote:
         _cA.commit()
 
         def _msg(**kw):
+            # classification_source='model' is the default here because every OTHER gate in
+            # auto_accept_reason is what these cases are testing. The source gate has its own
+            # case below, so it must not silently short-circuit the rest.
             base = dict(id=10, subject="Fwd: update", body_text="", body_reply="",
-                        classification="rejection", auth_warn=0, resolved_application_id=None)
+                        classification="rejection", classification_source="model",
+                        auth_warn=0, resolved_application_id=None)
             base.update(kw); return base
 
         def _prop(**kw):
@@ -2964,6 +2972,24 @@ On Wed, Aug 12, 2026 the candidate wrote:
 
         check("clean proposal is accepted",
               _apr.auto_accept_reason(_cA, _msg(body_reply=_good_body), _prop()), None)
+
+        # 🚨 THE 2026-08-23 REGRESSION. A message still carrying the provisional rules label
+        # decides nothing, whatever else is clean. That day job_track ran on rules labels
+        # every 10 minutes while the model read every 15, so the rules were never a second
+        # opinion here: they auto-rejected two applications from confirmation emails, one of
+        # them the highest band in the batch.
+        check("a provisional rules label is refused",
+              _apr.auto_accept_reason(
+                  _cA, _msg(body_reply=_good_body, classification_source="rules"), _prop())
+              is not None, True)
+        check("...and says why",
+              "waiting for the model" in (_apr.auto_accept_reason(
+                  _cA, _msg(body_reply=_good_body, classification_source="rules"), _prop()) or ""),
+              True)
+        # A row predating the column is treated as provisional, not as trusted.
+        _no_col = _msg(body_reply=_good_body); _no_col.pop("classification_source")
+        check("a row with no source column is provisional too",
+              _apr.auto_accept_reason(_cA, _no_col, _prop()) is not None, True)
 
         for _label, _m, _p in (
             ("medium confidence refused", _msg(body_reply=_good_body), _prop(confidence="medium")),

@@ -317,6 +317,18 @@ class _RS:
 # "duplicate column" error is the expected no-op on an up-to-date database.
 MIGRATIONS = [
     "ALTER TABLE message ADD COLUMN body_reply TEXT",
+    # 2026-08-23: THE MODEL OWNS message.classification NOW. The rules label is still
+    # written at ingest, because something must label a message the instant it lands and
+    # ai_read is a scheduled batch up to AI_READ_EVERY_MIN behind. But it is kept here for
+    # audit rather than left as the thing every consumer reads.
+    #
+    # 🚨 WHY THIS CHANGED. On 2026-08-23 the rules called two confirmations rejections, and
+    # job_track auto-rejected both applications, one of them the highest band in the batch.
+    # The model had read both correctly with high confidence and had no way to say so,
+    # because job_track runs every 10 minutes and ai_read every 15: the rules were not a
+    # second opinion, they were the ONLY opinion at the moment the decision was made.
+    "ALTER TABLE message ADD COLUMN rules_classification TEXT",
+    "ALTER TABLE message ADD COLUMN classification_source TEXT",
     # Added 2026-08-13 with prompt caching. A breakpoint that fails to engage is invisible
     # without these, so they are recorded per reading rather than inferred from the bill.
     "ALTER TABLE ai_reading ADD COLUMN cache_write_tokens INTEGER",
@@ -1638,6 +1650,15 @@ def auto_accept_reason(con, msg, proposal) -> str | None:
         return "the model reports the body tried to instruct it"
     if msg["classification"] not in ("confirmation", "rejection"):
         return f"classification {msg['classification']!r} would change nothing"
+    # 🚨 Same rule as job_track: a provisional rules label decides nothing. This path can
+    # attach a message to an application it did not arrive at, so acting on a label the
+    # model has not confirmed compounds two guesses instead of one.
+    try:
+        src = msg["classification_source"]
+    except (KeyError, IndexError):
+        src = None
+    if (src or "rules") != "model":
+        return "the label is still the provisional rules label; waiting for the model"
     row = con.execute("SELECT id, company_raw, role_raw, status FROM application "
                       " WHERE id = ?", (aid,)).fetchone()
     if row is None:
@@ -1763,8 +1784,8 @@ def job_match_application() -> str:
             # have resolved it by hand while the model call was in flight, and the guard
             # must see that.
             fresh = dict(con.execute(
-                "SELECT id, subject, body_text, body_reply, classification, auth_warn, "
-                "       resolved_application_id FROM message WHERE id=?", (m["id"],)).fetchone())
+                "SELECT id, subject, body_text, body_reply, classification, classification_source, "
+                "       auth_warn, resolved_application_id FROM message WHERE id=?", (m["id"],)).fetchone())
             why = auto_accept_reason(con, fresh, obj)
             if why is None:
                 aid = obj["application_id"]
@@ -1801,7 +1822,8 @@ def job_match_application() -> str:
     swept = 0
     with db() as con:
         pending = [dict(x) for x in con.execute(
-            "SELECT m.id, m.subject, m.body_text, m.body_reply, m.classification, m.auth_warn, "
+            "SELECT m.id, m.subject, m.body_text, m.body_reply, m.classification, "
+            "       m.classification_source, m.auth_warn, "
             "       m.resolved_application_id, x.proposed_application_id, x.confidence, "
             "       x.candidate_ids, x.prompt_injection_suspected, x.model "
             "  FROM message m "
@@ -1930,9 +1952,36 @@ def job_ai_read() -> str:
             # at nuance and can still be wrong. This records the pair and puts it in the
             # audit log so a human decides, and so the set of disagreements is available
             # later as the evidence for improving RULES.
+            # 🚨 THE MODEL NOW OWNS message.classification. Jonathan's decision, 2026-08-23,
+            # after the rules auto-rejected two applications from confirmation emails.
+            #
+            # ⚠️ Three gates still apply, and none of them is about which reader is smarter:
+            #   high confidence      — an uncertain reading must not overwrite anything
+            #   no injection flag    — a body that tried to steer the reader labels nothing
+            #   DMARC not warned     — a spoofable message never writes, whatever it says
+            # The rules label survives in rules_classification, so this is recoverable and
+            # auditable rather than a destructive overwrite.
+            ai_label = (out.get("classification") or "").strip()
+            took_over = False
+            if (ai_label
+                    and (out.get("confidence") or "").lower() == "high"
+                    and not out.get("prompt_injection_suspected")
+                    and not r["auth_warn"]):
+                with db() as con2:
+                    con2.execute(
+                        "UPDATE message SET classification=?, classification_source='model', "
+                        "                   needs_human=? WHERE id=?",
+                        (ai_label, needs_human_for(ai_label, bool(r["auth_warn"])), r["id"]))
+                took_over = True
+                if ai_label != (r["classification"] or ""):
+                    audit("ai_label_adopted",
+                          f"message {r['id']}: classification {r['classification']!r} -> "
+                          f"{ai_label!r} (model, high confidence)")
+
             if (out.get("classification") or "") != (r["classification"] or ""):
                 disagreed.append(f"msg {r['id']}: rules={r['classification']} "
-                                 f"model={out.get('classification')}")
+                                 f"model={out.get('classification')}"
+                                 f"{' ADOPTED' if took_over else ' NOT adopted'}")
                 audit("ai_disagreement",
                       f"message {r['id']} ({r['to_alias']}): rules said "
                       f"{r['classification']!r}, model said {out.get('classification')!r} "
@@ -2166,15 +2215,37 @@ def job_track() -> str:
         raise
 
     with db() as con:
+        # 🚨 THE MODEL DECIDES, SO WAIT FOR IT. classification_source must be 'model'.
+        #
+        # This is the whole fix for 2026-08-23. The rules label is written at ingest and the
+        # model reads on a scheduler, so for up to AI_READ_EVERY_MIN a message carries only
+        # a provisional label. This job runs every TRACK_EVERY_MIN, which is SHORTER, so it
+        # used to reach the message first every single time. The rules were never a second
+        # opinion here; they were the only opinion, and they auto-rejected two applications
+        # from confirmation emails. One was the highest band in the batch.
+        #
+        # ⚠️ Skipping is not a loss. The message stays selected and the next cycle picks it
+        # up once the reading has landed. Ten minutes of latency on a rejection costs
+        # nothing; a false rejection deletes live pipeline and rewrites his history.
+        #
+        # ⭐ AND IT FAILS SAFE. With AI_READ_ENABLED=0, or no API key, no message ever gets a
+        # model label and this job moves nothing at all, rather than falling back to the
+        # reader that caused the incident. That is deliberate: the counted skips below make
+        # it loud instead of silent.
         msgs = con.execute(
             "SELECT id, application_ref, received_at, to_alias, subject, classification, "
-            "       resolved_application_id, resolved_by "
+            "       classification_source, resolved_application_id, resolved_by "
             "  FROM message "
             " WHERE classification IN ('confirmation','rejection') "
             "   AND (application_ref IS NOT NULL OR resolved_application_id IS NOT NULL) "
             " ORDER BY id").fetchall()
 
     moved, skipped = [], []
+    waiting = [m for m in msgs if (m["classification_source"] or "rules") != "model"]
+    if waiting:
+        skipped.append(f"{len(waiting)} message(s) still on a provisional rules label, "
+                       f"waiting for the model: {[m['id'] for m in waiting]}")
+    msgs = [m for m in msgs if (m["classification_source"] or "rules") == "model"]
     for m in msgs:
         ref = (m["application_ref"] or "").lower()
         # ⭐ A HUMAN'S DECISION OUTRANKS THE ALIAS, AND IS THE ONLY THING THAT DOES. The
@@ -5676,6 +5747,9 @@ async def inbound(token: str, request: Request):
 
         # Classify the new text only. body_text keeps everything.
         body_reply = strip_quotes(body_t)
+        # ⚠️ The rules label is PROVISIONAL from here on. It fills message.classification so
+        # nothing reads NULL for the minutes before ai_read arrives, and it is copied to
+        # rules_classification so the model overwriting it does not destroy the evidence.
         label, otp = classify(subject, body_reply or body_h)
         app_ref = resolve_application(to_alias)
         spf, dkim, dmarc, auth_warn = read_auth_results(hdrs, p.get("verdict"))
@@ -5704,11 +5778,12 @@ async def inbound(token: str, request: Request):
             con.execute(
                 """UPDATE message SET to_alias=?,from_addr=?,from_name=?,subject=?,
                    body_text=?,body_reply=?,body_html=?,message_id=?,in_reply_to=?,references_hdr=?,
-                   classification=?,otp_code=?,application_ref=?,needs_human=?,
+                   classification=?,rules_classification=?,classification_source='rules',
+                   otp_code=?,application_ref=?,needs_human=?,
                    auth_spf=?,auth_dkim=?,auth_dmarc=?,auth_warn=?
                    WHERE id=?""",
                 (to_alias, addr, name, subject, body_t, body_reply, body_h, msg_id, in_reply, refs,
-                 label, otp, app_ref,
+                 label, label, otp, app_ref,
                  needs_human_for(label, bool(auth_warn)),
                  spf, dkim, dmarc, auth_warn, mid),
             )
