@@ -2946,7 +2946,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
         _cA.execute("CREATE TABLE application (id INTEGER PRIMARY KEY, company_raw TEXT, "
                     "role_raw TEXT, status TEXT)")
         _cA.execute("CREATE TABLE message (id INTEGER PRIMARY KEY, resolved_application_id INTEGER)")
-        for _i, _co, _ro, _st in ((1, "Cyclops", "Technical Support Engineer (Remote)", "submitted"),
+        for _i, _co, _ro, _st in ((1, "Employer J", "Technical Support Engineer (Remote)", "submitted"),
                                   (2, "Employer G", "EDI Senior Specialist", "interview"),
                                   (3, "Alpha", "Support Engineer", "draft"),
                                   (4, "Employer I", "Implementation Manager", "submitted"),
@@ -2968,7 +2968,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
                         prompt_injection_suspected=0)
             base.update(kw); return base
 
-        _good_body = "Your Technical Support Engineer application at Cyclops. Unfortunately no."
+        _good_body = "Your Technical Support Engineer application at Employer J. Unfortunately no."
 
         check("clean proposal is accepted",
               _apr.auto_accept_reason(_cA, _msg(body_reply=_good_body), _prop()), None)
@@ -3008,7 +3008,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
              _msg(body_reply="Your Support Engineer application at Alpha. Unfortunately no."),
              _prop(application_id=3, candidate_ids="3")),
             ("role title absent refused",
-             _msg(body_reply="Regarding your application at Cyclops, unfortunately no."), _prop()),
+             _msg(body_reply="Regarding your application at Employer J, unfortunately no."), _prop()),
             ("rival role in the email refused",
              _msg(body_reply="We reviewed you for the Implementation Manager and the Sr. "
                              "Implementation Manager roles at Employer I. Unfortunately no."),
