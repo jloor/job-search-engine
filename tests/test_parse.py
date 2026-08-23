@@ -3107,6 +3107,40 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # rebuilt offline from two columns it already had. The rows did not come from the
     # sweep: they came from a backfill that had its own idea of the columns and no way to
     # build a link. One addressing helper is what stops that recurring.
+    # ── the tracker floor, released rather than tripped ─────────────────────────────────
+    # 🚨 REGRESSION TEST FOR A CONFLICT BETWEEN TWO CORRECT BEHAVIOURS. render-tracker refuses
+    # to write when the count of rows carrying a source_row falls, because that is how the
+    # round-trip guard shrinks unnoticed. job_track CLEARS source_row whenever it moves a row,
+    # which is also right: the row is database-authoritative from then on. Measured 2026-08-23,
+    # 19 rows carrying a source_row were submitted or interview, so the next rejection to arrive
+    # would have tripped the alarm on an entirely legitimate write. Whoever releases an id must
+    # lower the floor in the same transaction.
+    import sqlite3 as _sq3, json as _j
+    _fl = load_app()
+    _c = _sq3.connect(":memory:")
+    _c.row_factory = _sq3.Row
+    _c.execute("CREATE TABLE tracker_floor (id INTEGER PRIMARY KEY, count INTEGER, "
+               "ids TEXT, updated TEXT)")
+    _c.execute("INSERT INTO tracker_floor VALUES (1, 3, ?, '2026-08-23')",
+               (_j.dumps(["7", "12", "30"]),))
+    _fl._floor_release(_c, 12)
+    _row = dict(_c.execute("SELECT count, ids FROM tracker_floor WHERE id=1").fetchone())
+    check("releasing an id lowers the floor by one", _row["count"], 2)
+    check("...and removes exactly that id", sorted(_j.loads(_row["ids"])), ["30", "7"])
+    # ⚠️ It must never RAISE the floor or rebuild it from what it sees. A floor that recomputes
+    # itself from the current count is not a floor.
+    _fl._floor_release(_c, 999)
+    _row = dict(_c.execute("SELECT count, ids FROM tracker_floor WHERE id=1").fetchone())
+    check("an id that was never in the guard changes nothing", _row["count"], 2)
+    # An uninitialised floor is not an error: nothing is being guarded yet.
+    _c2 = _sq3.connect(":memory:")
+    _c2.row_factory = _sq3.Row
+    _c2.execute("CREATE TABLE tracker_floor (id INTEGER PRIMARY KEY, count INTEGER, "
+                "ids TEXT, updated TEXT)")
+    _fl._floor_release(_c2, 5)
+    check("an empty floor is a no-op, not a crash",
+          _c2.execute("SELECT count(*) n FROM tracker_floor").fetchone()["n"], 0)
+
     print("\nWorkday addressing:")
     _appw = load_app()
 

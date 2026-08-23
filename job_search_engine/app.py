@@ -382,6 +382,45 @@ MIGRATIONS = [
     "ALTER TABLE scan_candidate ADD COLUMN company_source TEXT",
     # 2026-08-23: the ATS tenant code, split out of `company`. See split_ats_company.
     "ALTER TABLE scan_candidate ADD COLUMN company_code TEXT",
+    # ⭐ 2026-08-23. WHO SAID THE STATUS IS WHAT IT IS. job_track moves a row on a real
+    # confirmation at the per-company alias, which is strong evidence. A human saying "I clicked
+    # submit" is weaker but it is the only evidence available when an employer sends no
+    # confirmation at all, and that gap is real: an application sat reading `draft` for two days
+    # while the operator correctly remembered having sent it. Recording the SOURCE lets a later
+    # confirmation UPGRADE a self-report rather than being the only path to `submitted`.
+    #   mail | self_report | human | import
+    "ALTER TABLE application ADD COLUMN status_source TEXT",
+    # ⭐ 2026-08-23. The reference half of artifact storage, which needs no storage container.
+    # 🚨 A PROOF ARTIFACT WITH NO DATABASE REFERENCE IS A FILE NOBODY CAN FIND, and being
+    # findable years later is the entire purpose of a submission record. The BYTES stay in git;
+    # this is the index over them, so "what exactly did I send that employer" is a query.
+    """CREATE TABLE IF NOT EXISTS artifact (
+         id             INTEGER PRIMARY KEY,
+         application_id INTEGER REFERENCES application(id),
+         kind           TEXT NOT NULL,      -- submission_record | resume | cover_letter | jd
+         path           TEXT NOT NULL,      -- repo-relative. Where the bytes actually are.
+         sha256         TEXT NOT NULL,      -- of the bytes, so a silent edit is detectable
+         bytes          INTEGER,
+         created_at     TEXT NOT NULL,
+         note           TEXT,
+         UNIQUE(application_id, kind, sha256)
+       )""",
+    "CREATE INDEX IF NOT EXISTS idx_artifact_app ON artifact(application_id, kind)",
+    # ⭐ 2026-08-23. THE TRACKER FLOOR MOVES OUT OF A FILE AND INTO THE DATABASE, and the reason
+    # is a conflict between two correct behaviours. render-tracker refuses to write when the
+    # count of rows carrying a source_row falls, because that is how the round-trip guard
+    # silently shrinks. But job_track CLEARS source_row deliberately when it moves a row, which
+    # is also right: the row is database-authoritative from that moment. Measured 2026-08-23:
+    # 19 rows carrying a source_row are submitted or interview, so the next rejection to arrive
+    # would have tripped the alarm on an entirely legitimate write.
+    # 🚨 The fix is that whoever legitimately releases an id also lowers the floor, in the same
+    # transaction. That is only possible if the floor lives where the writer is.
+    """CREATE TABLE IF NOT EXISTS tracker_floor (
+         id      INTEGER PRIMARY KEY CHECK (id = 1),
+         count   INTEGER NOT NULL,
+         ids     TEXT NOT NULL,             -- JSON array. The COUNT alone cannot catch a swap.
+         updated TEXT NOT NULL
+       )""",
     "ALTER TABLE place ADD COLUMN ruled_by TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN eligibility TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN eligibility_from TEXT",
@@ -2081,6 +2120,34 @@ def _resolve_one(con, ref: str):
 CLOSEABLE = {"submitted", "interview"}
 
 
+def _floor_release(con, app_id) -> None:
+    """Drop one id from the tracker floor, because its source_row was just cleared on purpose.
+
+    🚨 WHY THIS EXISTS. render-tracker refuses to write when the count of rows carrying a
+    source_row falls, since that is exactly how the round-trip guard shrinks unnoticed. But
+    job_track clears source_row deliberately whenever it moves a row, and that is correct: the
+    row is database-authoritative from that moment. Without this, every legitimate automatic
+    transition would trip an alarm, and an alarm that fires on normal operation stops being read.
+
+    ⚠️ It lowers the floor by exactly one id and never rebuilds it from the current count. A
+    floor that recomputes itself from whatever it sees is not a floor.
+    """
+    import json as _json
+    row = con.execute("SELECT count, ids FROM tracker_floor WHERE id = 1").fetchone()
+    if not row:
+        return                                     # not initialised yet; nothing to release
+    try:
+        ids = _json.loads(row["ids"] or "[]")
+    except Exception:                              # noqa: BLE001
+        return
+    sid = str(app_id)
+    if sid not in ids:
+        return                                     # it was not inside the guard anyway
+    ids = [i for i in ids if i != sid]
+    con.execute("UPDATE tracker_floor SET count = ?, ids = ?, updated = ? WHERE id = 1",
+                (len(ids), _json.dumps(ids), now()))
+
+
 def job_track() -> str:
     """Move an application on inbound mail: draft to submitted, or open to rejected."""
     if not TRACK_ENABLED:
@@ -2166,12 +2233,13 @@ def job_track() -> str:
                 con.execute(
                     "UPDATE application "
                     "   SET status='submitted', submitted_at=?, applied_raw=?, "
-                    "       status_raw=?, source_row=NULL "
+                    "       status_raw=?, source_row=NULL, status_source='mail' "
                     " WHERE id=? AND status='draft'",
                     (m["received_at"], f"{applied} · `{m['to_alias']}`",
                      f"**✅ APPLIED {applied}** — confirmation {how} "
                      f"(message {m['id']}), tracked automatically",
                      app_row["id"]))
+                _floor_release(con, app_row["id"])
             moved.append(f"app {app_row['id']} ({app_row['company_raw']}) "
                          f"draft -> submitted on msg {m['id']}")
             audit("track_submitted",
@@ -2192,7 +2260,8 @@ def job_track() -> str:
             con.execute(
                 "UPDATE application "
                 "   SET status='rejected', outcome_at=?, outcome_reason=?, "
-                "       outcome_source=?, status_raw=?, source_row=NULL "
+                "       outcome_source=?, status_raw=?, source_row=NULL, "
+                "       status_source='mail' "
                 " WHERE id=? AND status IN ('submitted','interview')",
                 (m["received_at"], (m["subject"] or "")[:300],
                  ("model_match" if (m["resolved_by"] or "").startswith("auto:")
@@ -2202,6 +2271,7 @@ def job_track() -> str:
                  f"FORWARDED, the original sender's authentication did not survive the "
                  f"forward, so the outcome rests on the forwarder.",
                  app_row["id"]))
+            _floor_release(con, app_row["id"])
         moved.append(f"app {app_row['id']} ({app_row['company_raw']}) "
                      f"{app_row['status']} -> rejected on msg {m['id']}")
         audit("track_rejected",
