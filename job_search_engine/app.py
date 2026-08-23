@@ -380,6 +380,8 @@ MIGRATIONS = [
     # is the honest fallback.
     "ALTER TABLE scan_candidate ADD COLUMN company TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN company_source TEXT",
+    # 2026-08-23: the ATS tenant code, split out of `company`. See split_ats_company.
+    "ALTER TABLE scan_candidate ADD COLUMN company_code TEXT",
     "ALTER TABLE place ADD COLUMN ruled_by TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN eligibility TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN eligibility_from TEXT",
@@ -2353,6 +2355,29 @@ def _workday_list(api_url: str) -> dict:
 # qualified "<platform>|<token>:<externalPath>"; the backfill stored the bare externalPath.
 # Both shapes are in the table right now, so anything that reads req_id has to accept both
 # or it silently works on half the rows.
+# ⭐ AN ATS TENANT CODE IS NOT PART OF THE COMPANY NAME, so it does not live in the column
+# that holds one. Workday publishes many tenants with an internal code in front of the legal
+# name: "MS0309 GE Healthcare IITS USA Corp.", "LE001 Contoso, Inc.", "5100 Kyndryl Solutions
+# Private Limited". Written straight into `company` the two facts are concatenated, and every
+# consumer that normalises a name for matching stops matching. That happened: the queue dedupe
+# that keeps already-applied companies out stopped recognising 413 rows, including one the
+# operator had an application on file with.
+#
+# 📌 Same discipline as comp_source and the three commute columns. Two facts, two columns, and
+# the original is still reconstructable as code + " " + name, so nothing is lost.
+#
+# ⚠️ The pattern needs two or more digits AND a following space AND then a letter, so a real
+# name beginning with digits survives: 3M, 23andMe, 1Password, 7-Eleven. Verified against all
+# 3,248 distinct company names on record: 119 match and every one is a genuine tenant code.
+_ATS_CODE = re.compile(r"^\s*([A-Z]{0,3}\d{2,6}[A-Z]?)\s+(?=[A-Za-z])")
+
+
+def split_ats_company(name: str) -> tuple[str, str]:
+    """(code, clean_name). code is "" when the name carries no tenant prefix."""
+    m = _ATS_CODE.match(name or "")
+    return (m.group(1), (name or "")[m.end():].strip()) if m else ("", (name or "").strip())
+
+
 _WD_CXS_JOBS = re.compile(
     r"^https://([^.]+)\.(wd\d+)\.myworkdayjobs\.com/wday/cxs/([^/]+)/([^/]+)")
 _WD_CXS_SITE = re.compile(
@@ -4119,8 +4144,14 @@ def job_workday_enrich() -> str:
         # ⚠️ Only upgrades a name the board token guessed. A name the ATS already stated is
         # never overwritten, because company_source has to keep meaning what it says.
         if got["company"] and (c["company_source"] or "token") in ("token", "registry", ""):
-            sets.append("company=?"); args.append(got["company"])
+            # 🚨 Split the tenant code out here, at the only place that knows the name came
+            # from the ATS. Stripping it later, in each reader, is the recompute-per-reader
+            # shape this column was introduced to remove.
+            code, clean = split_ats_company(got["company"])
+            sets.append("company=?"); args.append(clean)
             sets.append("company_source=?"); args.append("ats")
+            if code:
+                sets.append("company_code=?"); args.append(code)
             done["named"] += 1
         if band and c["comp_min"] is None:
             sets += ["comp_min=?", "comp_max=?", "comp_basis=?", "comp_evidence=?",

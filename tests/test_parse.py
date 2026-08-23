@@ -3095,6 +3095,33 @@ On Wed, Aug 12, 2026 the candidate wrote:
     print("\nWorkday addressing:")
     _appw = load_app()
 
+    # ── the tenant code, split off the company name ──────────────────────────────────────
+    # 🚨 REGRESSION TEST. job_workday_enrich wrote the ATS name straight into `company`, and
+    # Workday prefixes many tenants with an internal code. 413 of 716 rows got one, which
+    # silently broke every consumer that normalises a name for matching. The queue dedupe
+    # stopped recognising companies already applied to. Two facts belong in two columns.
+    check("a tenant code is split off",
+          _appw.split_ats_company("MS0309 GE Healthcare IITS USA Corp."),
+          ("MS0309", "GE Healthcare IITS USA Corp."))
+    check("...letters in the code too",
+          _appw.split_ats_company("LE001 Contoso, Inc."), ("LE001", "Contoso, Inc."))
+    check("...and a bare numeric one",
+          _appw.split_ats_company("5100 Kyndryl Solutions Private Limited"),
+          ("5100", "Kyndryl Solutions Private Limited"))
+    check("a name with no code is returned whole, with no code",
+          _appw.split_ats_company("Anthropic"), ("", "Anthropic"))
+    # ⚠️ THE FALSE-POSITIVE GUARD IS THE HALF THAT MATTERS. A splitter that eats a real name
+    # is worse than no splitter, because it corrupts the column it was added to protect.
+    for real in ("3M Health Information Systems", "23andMe", "1Password", "7-Eleven"):
+        check(f"...and does not eat {real!r}", _appw.split_ats_company(real), ("", real))
+    # An internal year is not a prefix, because the match is anchored.
+    check("an internal number survives",
+          _appw.split_ats_company("100032 Callyo 2009 Corp."), ("100032", "Callyo 2009 Corp."))
+    check("nothing in, nothing out", _appw.split_ats_company(""), ("", ""))
+    # Reconstructable, so splitting loses nothing.
+    _c, _n = _appw.split_ats_company("MS0309 GE Healthcare IITS USA Corp.")
+    check("the original is reconstructable", f"{_c} {_n}", "MS0309 GE Healthcare IITS USA Corp.")
+
     # Both host forms, from the cxs list URL.
     check("api url, myworkdayjobs form",
           _appw.workday_bases(
