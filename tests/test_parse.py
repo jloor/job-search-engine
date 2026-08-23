@@ -338,6 +338,82 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("disagreements surface in the job's own output",
           "DISAGREEMENT" in src_job, True)
 
+    # ═══ a forged rejection must not close a live application ═══
+    #
+    # 🚨 A PROBE DID EXACTLY THAT ON 2026-08-23. One email from an unrelated domain closed a
+    # submitted application AND a live interview. Nothing checked the sender, the body never
+    # named the role, and DMARC cannot help: read_auth_results says in its own docstring that
+    # dmarc=pass means the From domain authorised the send and nothing more.
+    #
+    # ⚠️ The likeliest cause is not malice. Any rejection-shaped mail reaching an alias closes
+    # that application, so a rejection for a DIFFERENT role at the same company would do it.
+    print("\na forged rejection cannot close an application:")
+    import os as _oF, tempfile as _tF, sqlite3 as _sF
+
+    def _forge(status, source, warn, sender, name_role):
+        _dF = _tF.mkdtemp() + "/forge.db"
+        _pF = _oF.environ.get("DB_PATH"); _oF.environ["DB_PATH"] = _dF
+        try:
+            _appF = load_app()
+            _c = _sF.connect(_dF)
+            _c.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+            for _m in _appF.MIGRATIONS:
+                try: _c.execute(_m)
+                except Exception: pass
+            _c.executescript("""
+              CREATE TABLE IF NOT EXISTS company(id INTEGER PRIMARY KEY, name TEXT);
+              CREATE TABLE IF NOT EXISTS posting(id INTEGER PRIMARY KEY, company_id INT,
+                     title TEXT, captured_at TEXT);
+              CREATE TABLE IF NOT EXISTS application(id INTEGER PRIMARY KEY, posting_id INT,
+                     status TEXT, alias_used TEXT, company_raw TEXT, role_raw TEXT,
+                     source_row TEXT, notes TEXT, outcome_at TEXT, outcome_reason TEXT,
+                     outcome_source TEXT, status_raw TEXT, applied_raw TEXT, submitted_at TEXT,
+                     status_source TEXT, next_action TEXT);
+              CREATE TABLE IF NOT EXISTS tracker_floor(id INTEGER PRIMARY KEY, count INT,
+                     ids TEXT, updated TEXT);""")
+            _c.execute("INSERT INTO company (id,name) VALUES (1,'Acme')")
+            _c.execute("INSERT INTO posting (id,company_id,title,captured_at) "
+                       "VALUES (1,1,'X','2026-01-01')")
+            _c.execute("INSERT INTO application (id,posting_id,status,alias_used,company_raw,"
+                       "role_raw) VALUES (1,1,?,'acme@jobs.example.com','Acme',"
+                       "'Solutions Architect')", (status,))
+            body = ("Dear Jonathan, After careful consideration we have decided to not move "
+                    "forward with your application at this time.")
+            if name_role:
+                body += " Regarding the Solutions Architect role."
+            _c.execute("INSERT INTO message (id,received_at,to_alias,raw_payload,from_addr,"
+                       "subject,body_text,body_reply,classification,classification_source,"
+                       "application_ref,auth_dmarc,auth_warn,needs_human) "
+                       "VALUES (1,?,?,?,?,?,?,?,'rejection',?,'acme',?,?,1)",
+                       ("2026-08-23T22:00:00+00:00", "acme@jobs.example.com", "{}", sender,
+                        "Update", body, body, source, "fail" if warn else "pass", warn))
+            _c.commit(); _c.close()
+            _appF.job_track()
+            return _sF.connect(_dF).execute(
+                "SELECT status FROM application WHERE id=1").fetchone()[0] == "rejected"
+        finally:
+            if _pF is None: _oF.environ.pop("DB_PATH", None)
+            else: _oF.environ["DB_PATH"] = _pF
+
+    BAD = "careers@totally-not-acme.example"
+    # ⚠️ "totally-not-acme" CONTAINS "acme". The first sender check was a substring test and
+    # this exact address walked through it. The name must match a domain LABEL, not appear
+    # somewhere inside the flattened host.
+    check("an unrelated sender cannot close it", _forge("submitted", "model", 0, BAD, True), False)
+    check("...even when the mail names the role", _forge("submitted", "model", 0, BAD, True), False)
+    check("...and an interview is never auto-closed",
+          _forge("interview", "model", 0, "no-reply@us.greenhouse-mail.io", True), False)
+    check("a rejection that never names the role is held",
+          _forge("submitted", "model", 0, "no-reply@us.greenhouse-mail.io", False), False)
+    # ⭐ AND THE GUARDS MUST NOT EAT A REAL REJECTION. A test that only proves things are
+    # blocked would pass just as well with job_track deleted.
+    check("a real ATS rejection still closes it",
+          _forge("submitted", "model", 0, "no-reply@us.greenhouse-mail.io", True), True)
+    check("...and one from the employer's own domain",
+          _forge("submitted", "model", 0, "careers@acme.com", True), True)
+    check("a provisional rules label still decides nothing",
+          _forge("submitted", "rules", 0, "no-reply@us.greenhouse-mail.io", True), False)
+
     # 🚨 ...AND IN THE TOOL HE ACTUALLY READS. The line above checks the JOB's output. The
     # tool he queries is recent_mail, and until 2026-08-23 that returned ONLY the rules
     # label. Three regex mistakes therefore reached him as facts on one day: two ordinary
@@ -2625,8 +2701,14 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # ⚠️ `draft` is deliberately absent. A rejection referencing an application that was
     # never submitted is suspicious rather than authoritative, and a pre-existing test in
     # the job_track fixture already asserted that a rejection must not move a draft.
-    check("only submitted or interviewing rows close", _appr.CLOSEABLE,
-          {"submitted", "interview"})
+    # 🚨 `interview` WAS HERE AND WAS REMOVED 2026-08-23, after a probe closed a live
+    # interview with one forged email from an unrelated domain. An interview is a human
+    # relationship, and he has real ones running. A genuine rejection recorded a day late
+    # costs nothing; a false one deletes the relationship and rewrites his history.
+    # job_track now holds those for a human and says so in the audit log.
+    check("only submitted rows close automatically", _appr.CLOSEABLE, {"submitted"})
+    check("...and an interview is held for a human",
+          "interview" not in _appr.CLOSEABLE, True)
     # ⚠️ `passed` and `suspended` were HIS decisions and `superseded` was ours. An employer
     # rejection arriving afterwards must not rewrite why the row stopped.
     for _st in ("draft", "passed", "suspended", "superseded", "ghosted", "rejected"):

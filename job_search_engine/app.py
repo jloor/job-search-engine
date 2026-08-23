@@ -2166,7 +2166,60 @@ def _resolve_one(con, ref: str):
 # Statuses a rejection may close. Anything else is left alone and reported.
 # ⚠️ `passed` and `suspended` were HIS decisions and `superseded` was ours. An employer
 # rejection arriving afterwards does not rewrite why the row stopped.
-CLOSEABLE = {"submitted", "interview"}
+# 🚨 AN INTERVIEW IS NEVER CLOSED AUTOMATICALLY, 2026-08-23.
+#
+# A probe closed a live interview with one forged email from careers@totally-not-acme.example,
+# a domain with no relationship to the employer. Nothing checked the sender, and DMARC cannot
+# help: read_auth_results says so in its own docstring, dmarc=pass means the From domain
+# authorised the send and nothing more.
+#
+# ⭐ THE ASYMMETRY DECIDES IT. A real rejection recorded a day late costs nothing. A false one
+# deletes a live relationship and rewrites his history, which is the exact harm the ghosting
+# rule exists to prevent. He has real interviews running.
+#
+# ⚠️ And the likeliest cause is not malice. Any rejection-shaped mail reaching an alias closes
+# that application: a rejection for a DIFFERENT role at the same company would do it.
+CLOSEABLE = {"submitted"}
+INTERVIEW_NEEDS_HUMAN = "an interview is never closed automatically; a human reads this one"
+
+# 📌 Senders that are plausibly an employer's recruiting system. A rejection from anywhere else
+# is not refused, it is handed to a human: employers do mail from their own domains, and a
+# denylist of the world is not writable. This only decides AUTOMATIC action.
+ATS_SENDER_DOMAINS = (
+    "greenhouse-mail.io", "greenhouse.io", "ashbyhq.com", "lever.co", "hire.lever.co",
+    "myworkday.com", "myworkdayjobs.com", "workday.com", "icims.com", "smartrecruiters.com",
+    "successfactors.com", "taleo.net", "breezy.hr", "teamtailor.com", "jazzhr.com",
+    "bamboohr.com", "rippling.com", "paylocity.com", "dayforcehcm.com", "workable.com",
+)
+
+
+def _sender_is_plausible(from_addr: str, company_raw: str) -> bool:
+    """Is this sender the employer, or a recruiting platform employers actually use?
+
+    ⚠️ Deliberately generous. It exists to stop an UNRELATED domain closing an application,
+    not to verify identity, which mail cannot do. A miss costs a human glance; a false pass
+    costs a live application.
+    """
+    dom = (from_addr or "").rsplit("@", 1)[-1].lower().strip()
+    if not dom:
+        return False
+    if any(dom == d or dom.endswith("." + d) for d in ATS_SENDER_DOMAINS):
+        return True
+    # The employer's own domain: acme.com, mail.acme.com, acme-corp.com, careers.acme.co.uk.
+    #
+    # 🚨 NOT A SUBSTRING TEST. The first version asked whether the company name appeared
+    # anywhere in the flattened domain, and the probe walked straight through it:
+    # "totally-not-acme.example" flattens to "totallynotacmeexample", which contains "acme".
+    # A check that a hostile domain can satisfy by including the company name is not a check.
+    #
+    # Each label is compared on its own and must START with the name, so "acme-corp" and
+    # "acmecareers" pass while "totally-not-acme" and "notacme" do not. Hyphens are NOT split
+    # on, because splitting them hands the attacker the same trick back.
+    name = re.sub(r"[^a-z0-9]+", "", re.sub(r"[*_`]|\(.*?\)", "", (company_raw or "").lower()))
+    if len(name) < 3:
+        return False
+    labels = [re.sub(r"[^a-z0-9]+", "", x) for x in dom.split(".")[:-1]]
+    return any(x == name or x.startswith(name) for x in labels if x)
 
 
 def _floor_release(con, app_id) -> None:
@@ -2234,7 +2287,8 @@ def job_track() -> str:
         # it loud instead of silent.
         msgs = con.execute(
             "SELECT id, application_ref, received_at, to_alias, subject, classification, "
-            "       classification_source, resolved_application_id, resolved_by "
+            "       classification_source, resolved_application_id, resolved_by, "
+            "       from_addr, body_text, body_reply "
             "  FROM message "
             " WHERE classification IN ('confirmation','rejection') "
             "   AND (application_ref IS NOT NULL OR resolved_application_id IS NOT NULL) "
@@ -2320,9 +2374,43 @@ def job_track() -> str:
             continue
 
         # --------------------------------------------------------------- rejection
+        if app_row["status"] == "interview":
+            skipped.append(f"msg {m['id']}: application {app_row['id']} is at INTERVIEW; "
+                           f"{INTERVIEW_NEEDS_HUMAN}")
+            audit("track_interview_held",
+                  f"application {app_row['id']} ({app_row['company_raw']}) is at interview and "
+                  f"message {m['id']} reads as a rejection. Not closed automatically.")
+            continue
         if app_row["status"] not in CLOSEABLE:
             skipped.append(f"msg {m['id']}: application {app_row['id']} is "
                            f"{app_row['status']!r}, not closeable")
+            continue
+
+        # 🚨 TWO CHECKS THAT DID NOT EXIST ON THIS PATH UNTIL 2026-08-23.
+        #
+        # auto_accept_reason has guarded the role title for a long time, but only on the MATCH
+        # PROPOSAL path, used when the alias cannot answer. The alias path had nothing: a probe
+        # closed an application with a body that never named the role, from a domain unrelated
+        # to the employer. Both are cheap to require and neither costs a real rejection, which
+        # names the role and comes from the employer or its ATS.
+        #
+        # ⚠️ Neither is refused outright. They fall to a human, because a real employer can mail
+        # from a domain this does not recognise and identity is not something mail can prove.
+        hay = _role_tokens(" ".join(x or "" for x in
+                                    (m["subject"], m["body_reply"] or m["body_text"])))
+        if not _title_in_email(app_row["role_raw"], hay):
+            skipped.append(f"msg {m['id']}: the role title does not appear in the email; "
+                           f"application {app_row['id']} left for a human")
+            audit("track_title_absent",
+                  f"message {m['id']} at {m['to_alias']} reads as a rejection for application "
+                  f"{app_row['id']} but never names {app_row['role_raw']!r}")
+            continue
+        if not _sender_is_plausible(m["from_addr"], app_row["company_raw"]):
+            skipped.append(f"msg {m['id']}: sender {m['from_addr']!r} is neither the employer "
+                           f"nor a known ATS; application {app_row['id']} left for a human")
+            audit("track_sender_implausible",
+                  f"message {m['id']} claims to reject application {app_row['id']} "
+                  f"({app_row['company_raw']}) but came from {m['from_addr']!r}")
             continue
         # 🚨 The status is re-checked in the WHERE clause, not only in Python above it.
         # Two runs racing on one message would otherwise close a row twice and overwrite
