@@ -404,6 +404,30 @@ On Wed, Aug 12, 2026 the candidate wrote:
         if _pQ is None: _oQ.environ.pop("DB_PATH", None)
         else: _oQ.environ["DB_PATH"] = _pQ
 
+    # ═══ the OTP code must actually come out ═══
+    #
+    # 🚨 IT NEVER DID, AND IT FAILED SILENTLY. Five otp messages were classified correctly
+    # between 2026-08-19 and 2026-08-24 and not one had its code extracted. The pattern was
+    # r"\b(\d{6}|\d{4}-\d{4}|[A-Z0-9]{6,8})\b", which requires ALL UPPERCASE. Greenhouse's
+    # code is mixed case, so it matched nothing, every time, for a week.
+    #
+    # ⚠️ AND THE OBVIOUS LOOSENING RETURNS THE WRONG STRING. Any 6-10 alphanumeric containing
+    # a digit and a letter matches all five and yields TEN characters: the cid: image hash in
+    # the HTML part. Greenhouse's own mail says eight. A pattern that matches confidently and
+    # returns the wrong value is worse than one that returns nothing.
+    print("\nthe otp code is extracted, and it is the code:")
+    _OTP_BODY = ("![logo abc123def456](cid:6a8cac62cbb6f_c34ed0108243@prod-jben-web-x9f2a-4nt24.mail) "
+                 "Hi Jonathan, Copy and paste this code into the security code field on your "
+                 "application: # Kp7Qm2Rt After you enter the code, resubmit your application.")
+    _lab, _code = app.classify("Security code for your application to Acme", _OTP_BODY)
+    check("it is labelled otp", _lab, "otp")
+    check("...and the code comes out", _code, "Kp7Qm2Rt")
+    # 🚨 the exact trap: the cid hash is longer and appears FIRST in the body
+    check("...not the cid image hash", _code != "6a8cac62cb" and len(_code or "") == 8, True)
+    # a plain six-digit code still works, which is the older shape
+    _l2, _c2 = app.classify("Your verification code", "Your verification code is 481920. It expires in 10 minutes.")
+    check("a six-digit code still works", _c2, "481920")
+
     # ═══ a reading that already exists must be adopted, not stranded ═══
     #
     # 🚨 EIGHT MESSAGES WERE STRANDED ON 2026-08-24, including a time-boxed assessment

@@ -931,7 +931,31 @@ def strip_quotes(body: str) -> str:
     return kept if FORWARD_MARKER.sub("", kept).strip() else body
 
 
-OTP_RE = re.compile(r"\b(\d{6}|\d{4}-\d{4}|[A-Z0-9]{6,8})\b")
+# 🚨 THIS NEVER WORKED, AND IT FAILED SILENTLY. Measured 2026-08-24: five otp messages had
+# been classified correctly since 2026-08-19 and not one had its code extracted. The old
+# pattern was r"\b(\d{6}|\d{4}-\d{4}|[A-Z0-9]{6,8})\b", which requires the code to be ALL
+# UPPERCASE. Greenhouse's is mixed case, so it matched nothing on every one of them.
+#
+# ⚠️ AND THE OBVIOUS LOOSENING IS WRONG. Allowing any 6-10 alphanumeric with a digit and a
+# letter DOES match, on all five, and it returns TEN characters: the cid: image hash in the
+# HTML part. Greenhouse's own email says an eight-character code. A pattern that matches
+# confidently and returns the wrong string is worse than one that returns nothing, because
+# nothing is visibly broken.
+#
+# ⭐ So it anchors on the INSTRUCTION rather than on the shape of the value. The body reads
+# "Copy and paste this code into the security code field on your application: # ABCD1234",
+# where the code is a markdown heading. All three anchors below agree on eight characters
+# across all five messages; the ordering is most-specific first.
+#
+# 📌 WHAT THIS IS FOR. The code lets a HUMAN see it without digging through a raw payload. It
+# is not there so anything automated can answer the challenge: entering a code that exists to
+# prove a human is present is completing bot-detection, and that is not something this system
+# does. Extraction is a convenience for him, not a capability for it.
+OTP_RE = re.compile(
+    r"paste this code[^:]{0,80}:\s*#*\s*([A-Za-z0-9]{4,12})\b"
+    r"|code field[^:]{0,60}:\s*#*\s*([A-Za-z0-9]{4,12})\b"
+    r"|(?:verification|security) code[^:]{0,60}:\s*#*\s*([A-Za-z0-9]{4,12})\b"
+    r"|\b(\d{6}|\d{4}-\d{4})\b", re.I)
 
 # ⭐ MIRRORS THE LABEL SET THE AUTO-APPLIER ALREADY USES, so one inbox does not carry two
 # vocabularies. Its twelve: Application Confirmation, Incomplete Application, Interview
@@ -1119,7 +1143,8 @@ def classify(subject: str, body: str) -> tuple[str, str | None]:
             code = None
             if label == "otp":
                 m = OTP_RE.search(body or "")
-                code = m.group(1) if m else None
+                # several alternatives, only one of which fires; take whichever captured
+                code = next((g for g in (m.groups() if m else ()) if g), None)
             return label, code
     return "unknown", None          # P6: unknown, never guessed
 
