@@ -338,6 +338,66 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("disagreements surface in the job's own output",
           "DISAGREEMENT" in src_job, True)
 
+    # ═══ changing the commute origin must not destroy measurements ═══
+    #
+    # 🚨 IT DID, ON 2026-08-24. Correcting ONE DIGIT of a house number destroyed 591 place
+    # rows carrying 320 verdicts. The sequence was ordinary and will recur: the laptop's
+    # config was fixed first, the container still held the old value, job_place ran on
+    # schedule, saw every row under a "different" origin, and hard-DELETEd them.
+    #
+    # ⚠️ Recovery needed an encrypted snapshot and a surgical merge. The markdown render was
+    # NOT enough on its own: it collapses best_min and judged_min into one column and never
+    # writes judged_conf, so re-importing it would have restored the rows and quietly flattened
+    # the three-layer model the design exists to keep separate.
+    print("\nan origin change retires rows, it does not delete them:")
+    import os as _oP, tempfile as _tP, sqlite3 as _sP
+    _dP = _tP.mkdtemp() + "/place.db"
+    _pP = _oP.environ.get("DB_PATH"); _oP.environ["DB_PATH"] = _dP
+    _pc = _oP.environ.get("CANDIDATE_CONFIG")
+    _oP.environ["CANDIDATE_CONFIG"] = str(HERE.parent / "seed" / "candidate.toml")
+    try:
+        _appP = load_app()
+        import candidate as _CP; _CP._cache.clear()
+        _c = _sP.connect(_dP)
+        _c.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+        for _m in _appP.MIGRATIONS:
+            try: _c.execute(_m)
+            except Exception: pass
+        # one measured row, taken from an origin that is about to change
+        _c.execute("INSERT INTO place (origin,board,location,postings,judged_min,judged_conf,"
+                   "drive_min,transit_min,best_min,verdict,verdict_from) "
+                   "VALUES ('OLD ADDRESS','','Nashville, TN',7,55,'high',61,72,61,"
+                   "'commutable','measurement')")
+        _c.commit(); _c.close()
+
+        _appP.job_place()
+
+        _c2 = _sP.connect(_dP); _c2.row_factory = _sP.Row
+        row = _c2.execute("SELECT * FROM place WHERE location='Nashville, TN'").fetchone()
+        check("the row still exists", row is not None, True)
+        if row is not None:
+            check("...it is retired, not deleted", bool(row["retired_at"]), True)
+            # ⭐ what it was measured FROM is kept, so a revert is one UPDATE and not a
+            # re-measurement. That is the difference between a mistake and an outage.
+            check("...and remembers its old origin", row["retired_origin"], "OLD ADDRESS")
+            check("...the measurement survives", (row["drive_min"], row["transit_min"],
+                                                  row["best_min"]), (61, 72, 61))
+            check("...and so does the model layer", (row["judged_min"], row["judged_conf"]),
+                  (55, "high"))
+        # 🚨 AND A RETIRED ROW MUST NOT DECIDE ANYTHING. Left visible it would reject a live
+        # posting on a trip measured from an address he no longer lives at, which is worse
+        # than deleting it. Every FROM place reader is asserted to filter, by source, because
+        # one unfiltered query is all it takes.
+        _src = pathlib.Path(HERE.parent / "job_search_engine" / "app.py").read_text().splitlines()
+        _unfiltered = [i + 1 for i, l in enumerate(_src) if "FROM place" in l
+                       and "retired_at" not in " ".join(_src[i:i + 4])]
+        check("every FROM place reader filters retired rows", _unfiltered, [])
+    finally:
+        if _pP is None: _oP.environ.pop("DB_PATH", None)
+        else: _oP.environ["DB_PATH"] = _pP
+        if _pc is None: _oP.environ.pop("CANDIDATE_CONFIG", None)
+        else: _oP.environ["CANDIDATE_CONFIG"] = _pc
+
     # ═══ a forged rejection must not close a live application ═══
     #
     # 🚨 A PROBE DID EXACTLY THAT ON 2026-08-23. One email from an unrelated domain closed a
@@ -1517,11 +1577,20 @@ On Wed, Aug 12, 2026 the candidate wrote:
         _o7.environ["COMMUTE_ORIGIN"] = "1 Test St, Dumont, NJ"
         _app7.job_place()
         with _app7.db() as c:
-            _after = c.execute("SELECT count(*) n FROM place WHERE origin='Somewhere Else, NJ'"
+            # ⚠️ This asserted `_after == 0` because the rows were DELETED. They are retired
+            # now, 2026-08-24, after a one-digit origin correction destroyed 591 real rows.
+            # What must be zero is the count of stale rows still VISIBLE, not the count that
+            # still exists: invisible is what correctness needs, gone is what cost the data.
+            _after = c.execute("SELECT count(*) n FROM place "
+                               " WHERE origin='Somewhere Else, NJ' AND retired_at IS NULL"
                                ).fetchone()["n"]
+            _kept = c.execute("SELECT count(*) n FROM place "
+                              " WHERE origin='Somewhere Else, NJ' AND retired_at IS NOT NULL"
+                              ).fetchone()["n"]
             _fresh = c.execute("SELECT count(*) n FROM place WHERE origin='1 Test St, Dumont, NJ'"
                                ).fetchone()["n"]
-        check("rows measured from a previous origin are dropped", _after, 0)
+        check("rows from a previous origin stop being visible", _after, 0)
+        check("...but they are retired, not destroyed", _kept > 0, True)
         # 🚨 A RULE-DECIDED VERDICT IS ONLY AS GOOD AS THE RULES BEHIND IT. verdict_from says
         # which LAYER decided; ruled_by says which engine's rules. Without the second, a
         # gates.py change leaves no way to target the rows it invalidated, which is the gap

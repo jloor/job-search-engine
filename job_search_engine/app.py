@@ -327,6 +327,9 @@ MIGRATIONS = [
     # The model had read both correctly with high confidence and had no way to say so,
     # because job_track runs every 10 minutes and ai_read every 15: the rules were not a
     # second opinion, they were the ONLY opinion at the moment the decision was made.
+    # 🚨 SOFT DELETE FOR place, 2026-08-24. See job_place for the incident.
+    "ALTER TABLE place ADD COLUMN retired_at TEXT",
+    "ALTER TABLE place ADD COLUMN retired_origin TEXT",
     "ALTER TABLE message ADD COLUMN rules_classification TEXT",
     "ALTER TABLE message ADD COLUMN classification_source TEXT",
     # Added 2026-08-13 with prompt caching. A breakpoint that fails to engage is invisible
@@ -3299,7 +3302,7 @@ def _commute_too_far() -> set:
             with db() as con:
                 rows = con.execute(
                     "SELECT location FROM place WHERE origin = ? AND board = '' "
-                    "AND verdict = 'too_far'", (origin,)).fetchall()
+                    "AND verdict = 'too_far' AND retired_at IS NULL", (origin,)).fetchall()
             if rows:
                 _COMMUTE_FAR.update(set={r["location"] for r in rows}, db_at=now,
                                     origin=origin)
@@ -4866,19 +4869,39 @@ def job_place() -> str:
             " GROUP BY location", (PLACE_MIN_SCORE,)).fetchall()
         known = {r["location"] for r in
                  con.execute("SELECT DISTINCT location FROM place "
-                             "WHERE origin = ?", (origin,)).fetchall()}
+                             "WHERE origin = ? AND retired_at IS NULL",
+                             (origin,)).fetchall()}
         todo = [dict(r) for r in cand if r["location"] not in known]
 
         # 🚨 A MEASUREMENT IS ONLY TRUE OF THE ORIGIN IT WAS TAKEN FROM. Changing the origin
         # invalidates every one of them, and that is correct rather than a bug: they measured
         # the trip from somewhere else. The rows are matched on `origin` above, so a changed
-        # origin simply makes them invisible and they are re-measured as if new. Stale rows
-        # are DELETED rather than left beside the new ones, because two rows for one location
-        # with different origins is exactly the ambiguity `verdict_from` exists to prevent.
-        stale = con.execute("SELECT count(*) n FROM place WHERE origin <> ?",
+        # origin makes them invisible and they are re-measured as if new. They must not be
+        # left VISIBLE beside the new ones, because two rows for one location with different
+        # origins is exactly the ambiguity `verdict_from` exists to prevent.
+        #
+        # 🚨 THEY ARE RETIRED, NOT DELETED, SINCE 2026-08-24. This was a hard DELETE, and on
+        # that day correcting ONE DIGIT of a house number destroyed 591 rows carrying 320
+        # verdicts. The sequence was ordinary: the laptop's config was fixed first, the
+        # container still held the old value, this job ran on schedule, saw every row under a
+        # "different" origin, and removed them. Recovery took an encrypted snapshot and a
+        # surgical merge. The markdown render was NOT sufficient, because it collapses
+        # best_min and judged_min into one column and never writes judged_conf at all.
+        #
+        # ⭐ THE ASYMMETRY IS THE WHOLE ARGUMENT. A retired row costs a few kilobytes and one
+        # WHERE clause. A deleted row costs model calls, Maps calls, and a restore. Nothing
+        # here is expensive enough to be worth destroying, and an origin change is exactly
+        # when a human is most likely to be mid-edit across two writers.
+        #
+        # ⚠️ retired_origin keeps what the row was measured FROM, so a revert costs one UPDATE
+        # rather than a re-measurement. Reviving is deliberately not automatic: an origin that
+        # came back could be a correction or a genuine second move, and this job cannot tell.
+        stale = con.execute("SELECT count(*) n FROM place "
+                            " WHERE origin <> ? AND retired_at IS NULL",
                             (origin,)).fetchone()["n"]
         if stale:
-            con.execute("DELETE FROM place WHERE origin <> ?", (origin,))
+            con.execute("UPDATE place SET retired_at = ?, retired_origin = origin "
+                        "  WHERE origin <> ? AND retired_at IS NULL", (now(), origin))
             dropped_stale = stale
             # ⚠️ The audit is written AFTER this block, not inside it. audit() opens its own
             # connection, and on the sqlite backend that deadlocks against the one still held
@@ -4986,11 +5009,11 @@ def job_place() -> str:
                 "   AND sc.location IS NOT NULL AND sc.location <> '' "
                 " GROUP BY sc.board, sc.location", (PLACE_MIN_SCORE,)).fetchall()
             have_pair = {(r["board"], r["location"]) for r in con.execute(
-                "SELECT board, location FROM place WHERE board <> '' AND origin = ?",
-                (origin,)).fetchall()}
+                "SELECT board, location FROM place WHERE board <> '' AND origin = ? "
+                "AND retired_at IS NULL", (origin,)).fetchall()}
             city = {r["location"]: dict(r) for r in con.execute(
                 "SELECT location, verdict, best_min, measured_to FROM place "
-                "WHERE board = '' AND origin = ?",
+                "WHERE board = '' AND origin = ? AND retired_at IS NULL",
                 (origin,)).fetchall()}
 
         todo_addr = []
@@ -6288,7 +6311,8 @@ def _mcp_call(name: str, args: dict) -> str:
             "SELECT location, board, verdict, verdict_from, judged_min, judged_mode, "
             "judged_conf, judged_note, drive_min, transit_min, best_min, best_mode, "
             "address, address_status, postings, note FROM place "
-            "WHERE lower(location) LIKE ? ORDER BY COALESCE(postings,0) DESC LIMIT ?",
+            "WHERE lower(location) LIKE ? AND retired_at IS NULL "
+            "ORDER BY COALESCE(postings,0) DESC LIMIT ?",
             (f"%{args['location'].lower()}%",
              max(1, min(int(args.get("limit", 10)), 50))))
         if not rows:
