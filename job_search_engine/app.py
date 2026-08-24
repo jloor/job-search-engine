@@ -1975,7 +1975,13 @@ def job_ai_read() -> str:
         # of rows; if the mailbox ever grows, store the hash on `message` instead and
         # make this a pure SQL join.
         cand = con.execute(
+            # ⚠️ auth_warn is SELECTED because the adoption block below gates on it. It was
+            # missing until 2026-08-24 and every read raised KeyError: 'auth_warn' AFTER the
+            # model call had already been paid for. The job still reported ok, because a
+            # per-message exception is collected into `failed` rather than raised, so the
+            # symptom was "read 0 of 3" in a detail line nobody was reading.
             "SELECT m.id, m.subject, m.body_reply, m.body_text, m.to_alias, m.classification, "
+            "       m.auth_warn, "
             "       (SELECT a.body_sha256 FROM ai_reading a WHERE a.message_id = m.id "
             "         ORDER BY a.id DESC LIMIT 1) AS last_hash "
             "  FROM message m WHERE 1=1" + scope_sql +

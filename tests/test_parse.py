@@ -404,6 +404,33 @@ On Wed, Aug 12, 2026 the candidate wrote:
         if _pQ is None: _oQ.environ.pop("DB_PATH", None)
         else: _oQ.environ["DB_PATH"] = _pQ
 
+    # ═══ the read loop must select every column it reads ═══
+    #
+    # 🚨 IT DID NOT, AND THE JOB STILL REPORTED OK. The v0.27.0 adoption block added
+    # r["auth_warn"] inside job_ai_read's read loop, and that loop's SELECT never fetched the
+    # column. Every read raised KeyError: 'auth_warn' AFTER the model call had been paid for.
+    #
+    # ⚠️ WHY IT HID. A per-message exception is collected into `failed` rather than raised, so
+    # the job returned {"ok": true} with the truth buried in a detail line: "read 0 of 3 ...
+    # FAILED [msg 170: KeyError: 'auth_warn', ...]". Nothing alerts on read 0 of 3. It was
+    # found by eye, in passing, while checking something else.
+    #
+    # ⭐ Asserted against the SOURCE rather than by running a model call, because the bug is
+    # structural: a column referenced but not selected. That check is free and catches the
+    # next one too.
+    print("\nthe ai_read loop selects every column it reads:")
+    _src = (HERE.parent / "job_search_engine" / "app.py").read_text().splitlines()
+    _i = next(i for i, l in enumerate(_src)
+              if "SELECT m.id, m.subject, m.body_reply, m.body_text" in l)
+    _sel = " ".join(_src[_i:_i + 12])
+    _body = " ".join(_src[_i:_i + 180])
+    _need = set(__import__("re").findall(r'r\["(\w+)"\]', _body))
+    _missing = [c for c in sorted(_need)
+                if f"m.{c}" not in _sel and f'"{c}"' not in _sel.split("FROM")[0]]
+    check("no column is read without being selected", _missing, [])
+    check("...and auth_warn specifically, which was the one that broke",
+          "m.auth_warn" in _sel, True)
+
     # ═══ the OTP code must actually come out ═══
     #
     # 🚨 IT NEVER DID, AND IT FAILED SILENTLY. Five otp messages were classified correctly
