@@ -6241,8 +6241,11 @@ MCP_TOOLS = [
     # the ~350 that clear every gate, could only be seen by running a script on his laptop.
     # That is the half of the system a front-end is actually for.
     {"name": "search_queue",
-     "description": "Scored, gated job candidates NOT yet applied to. This is the queue, not "
-                    "the application pipeline. Filter by pay floor, remote mode, title or "
+     "description": "Scored, gated job candidates NOT yet applied to: roles already in the "
+                    "application pipeline are excluded, matched on canonical URL and on "
+                    "company plus title, and the count hidden is reported. This is the "
+                    "queue, not the application pipeline. Filter by pay floor, remote mode, "
+                    "title or "
                     "company. Pay carries its provenance: a 'board' band was published by "
                     "the employer, 'body_regex' was recovered from the posting text, 'model' "
                     "was read by a model. A missing band means the employer published "
@@ -6265,6 +6268,19 @@ MCP_TOOLS = [
          "location": {"type": "string", "description": "a location string, or part of one"},
          "limit": {"type": "integer", "default": 10}}, "required": ["location"]}},
 ]
+
+
+def _norm_key(s: str) -> str:
+    """Flatten a company or a title so two spellings of one thing compare equal.
+
+    ⚠️ Deliberately aggressive. "Sr. Solutions Architect" and "Senior Solutions Architect"
+    are the same requisition to a human and must be to this, or the dedupe misses the case
+    it exists for. Over-matching costs one queue row that could be re-surfaced by title
+    search; under-matching costs a duplicate application at a company already in flight.
+    """
+    t = re.sub(r"[*_`]|\(.*?\)", " ", (s or "").lower())
+    t = re.sub(r"\b(sr|senior|jr|junior|staff|lead|principal|associate)\b", " ", t)
+    return re.sub(r"[^a-z0-9]+", "", t)
 
 
 def _mcp_call(name: str, args: dict) -> str:
@@ -6343,15 +6359,58 @@ def _mcp_call(name: str, args: dict) -> str:
             w.append("c.comp_max IS NOT NULL AND c.comp_max >= ? "
                      "AND COALESCE(c.comp_basis,'') NOT LIKE '%/hour'")
             params.append(int(args["min_pay"]))
-        params.append(max(1, min(int(args.get("limit", 25)), 100)))
+        want = max(1, min(int(args.get("limit", 25)), 100))
+        # 🚨 OVER-FETCH, THEN DEDUPE. The exclusion cannot be expressed cleanly in SQLite,
+        # because matching a company and a title needs normalisation that nested replace()
+        # calls make unreadable. Fetching a multiple and trimming afterwards keeps the filter
+        # honest and still returns a full page.
+        params.append(want * 6)
         rows = _rows(
-            "SELECT c.title, c.board, c.location, c.score, c.remote_verdict, c.url, "
+            "SELECT c.title, c.board, c.company, c.location, c.score, c.remote_verdict, c.url, "
             "c.comp_min, c.comp_max, c.comp_basis, c.comp_source FROM scan_candidate c "
             "WHERE " + " AND ".join(w) +
             " ORDER BY c.comp_max DESC NULLS LAST, cast(c.score as int) DESC LIMIT ?",
             tuple(params))
+
+        # 🚨 EXCLUDE WHAT HE HAS ALREADY APPLIED TO. This tool's description has always said
+        # "NOT yet applied to" and the SQL never did it. Measured 2026-08-24: 64 of 658 gated
+        # rows were live applications, including Deepgram Solutions Architect, submitted that
+        # morning and confirmed by email four hours before it appeared here as an opportunity.
+        #
+        # ⚠️ A DESCRIPTION THAT CLAIMS A FILTER IT DOES NOT APPLY IS WORSE THAN NO FILTER,
+        # because it invites exactly the trust that produces a duplicate application. Working
+        # down this queue would have re-applied to roles already in flight, silently.
+        #
+        # ⭐ TWO KEYS, BECAUSE NEITHER IS ENOUGH. The canonical URL caught 61 and company plus
+        # title caught 49; the union was 64, so each finds rows the other misses. A URL differs
+        # by query string, board mirror and aggregator; a title differs in punctuation and
+        # seniority prefixes. Both are normalised before comparison.
+        applied_urls, applied_ct = set(), set()
+        with db() as con:
+            for a in con.execute(
+                    "SELECT a.company_raw, a.role_raw, p.canonical_url "
+                    "  FROM application a JOIN posting p ON p.id = a.posting_id"):
+                u = (a["canonical_url"] or "").split("?")[0].rstrip("/").lower()
+                if u:
+                    applied_urls.add(u)
+                ct = (_norm_key(a["company_raw"]), _norm_key(a["role_raw"]))
+                if all(ct):
+                    applied_ct.add(ct)
+
+        kept, dropped = [], 0
+        for r in rows:
+            u = (r["url"] or "").split("?")[0].rstrip("/").lower()
+            ct = (_norm_key(r["company"] or r["board"]), _norm_key(r["title"]))
+            if (u and u in applied_urls) or (all(ct) and ct in applied_ct):
+                dropped += 1
+                continue
+            kept.append(r)
+            if len(kept) >= want:
+                break
+        rows = kept
         if not rows:
-            return "no queued roles match"
+            return ("no queued roles match"
+                    + (f" ({dropped} excluded as already applied to)" if dropped else ""))
         out = []
         for r in rows:
             if r["comp_min"] is not None:
@@ -6367,9 +6426,14 @@ def _mcp_call(name: str, args: dict) -> str:
                        f"  fit {r['score']} | {r['remote_verdict'] or 'unknown'} | "
                        f"{(r['location'] or '')[:44]}\n  {pay}\n  {r['url'] or ''}")
         note = ""
+        # ⭐ SAY WHAT WAS EXCLUDED. A silent filter is how the missing one went unnoticed for
+        # so long: nothing in the output ever suggested the list might be wrong.
+        if dropped:
+            note += (f"\n\n📌 {dropped} role(s) hidden because he has already applied to them, "
+                     f"matched on canonical URL or on company and title.")
         if args.get("min_pay"):
-            note = ("\n\n⚠️ A pay floor excludes every role with no published band, and "
-                    "hourly bands are excluded rather than annualised.")
+            note += ("\n\n⚠️ A pay floor excludes every role with no published band, and "
+                     "hourly bands are excluded rather than annualised.")
         return "\n".join(out) + note
 
     if name == "commute_check":

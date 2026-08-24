@@ -338,6 +338,72 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("disagreements surface in the job's own output",
           "DISAGREEMENT" in src_job, True)
 
+    # ═══ the queue must not offer a role he has already applied to ═══
+    #
+    # 🚨 IT DID, AND THE DESCRIPTION SAID IT DID NOT. search_queue has always been documented
+    # as "NOT yet applied to" and the SQL never joined `application` at all. Measured
+    # 2026-08-24: 64 of 658 gated rows were live applications, including a Solutions Architect
+    # role submitted that morning and confirmed by the employer four hours before it appeared
+    # in the queue as an opportunity.
+    #
+    # ⚠️ A DESCRIPTION THAT CLAIMS A FILTER IT DOES NOT APPLY IS WORSE THAN NO FILTER. It
+    # invites exactly the trust that produces a duplicate application at a company already in
+    # flight, and the output gave no hint the list might be wrong.
+    print("\nthe queue excludes what he has already applied to:")
+    import os as _oQ, tempfile as _tQ, sqlite3 as _sQ
+    _dQ = _tQ.mkdtemp() + "/queue.db"
+    _pQ = _oQ.environ.get("DB_PATH"); _oQ.environ["DB_PATH"] = _dQ
+    try:
+        _appQ = load_app()
+        _c = _sQ.connect(_dQ)
+        _c.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+        for _m in _appQ.MIGRATIONS:
+            try: _c.execute(_m)
+            except Exception: pass
+        _c.executescript("""
+          CREATE TABLE IF NOT EXISTS company(id INTEGER PRIMARY KEY, name TEXT);
+          CREATE TABLE IF NOT EXISTS posting(id INTEGER PRIMARY KEY, company_id INT,
+                 title TEXT, captured_at TEXT, canonical_url TEXT);
+          CREATE TABLE IF NOT EXISTS application(id INTEGER PRIMARY KEY, posting_id INT,
+                 status TEXT, company_raw TEXT, role_raw TEXT);""")
+        # ⚠️ posting.company_id is NOT NULL in the real schema, so the fixture supplies one.
+        # CREATE TABLE IF NOT EXISTS above is a no-op wherever schema.sql already defined it.
+        _c.execute("INSERT INTO company (id,name) VALUES (1,'Acme')")
+        _c.execute("INSERT INTO posting (id,company_id,title,captured_at,canonical_url) "
+                   "VALUES (1,1,'x','2026-01-01','https://jobs.example.com/abc')")
+        _c.execute("INSERT INTO application (id,posting_id,status,company_raw,role_raw) "
+                   "VALUES (1,1,'submitted','**Acme** ⭐','Senior Solutions Architect')")
+
+        def _cand(cid, title, url, company):
+            # ⚠️ verdict must be non-NULL: the filter is `verdict NOT IN (...)`, and in SQL
+            # NULL NOT IN (...) is NULL, which is falsy, so a NULL-verdict row is silently
+            # excluded from the queue. Real triaged rows carry one.
+            _c.execute("INSERT INTO scan_candidate (id,at,req_id,board,title,company,location,"
+                       "score,triaged,verdict,remote_verdict,comp_min,comp_max,url) "
+                       "VALUES (?,?,?,?,?,?,?,?,1,'pass','fully_remote',100000,200000,?)",
+                       (cid, "2026-08-24T00:00:00+00:00", f"r{cid}", "gh|acme", title,
+                        company, "Remote", "90", url))
+
+        _cand(1, "Senior Solutions Architect", "https://jobs.example.com/abc?src=li", "Acme")
+        _cand(2, "Sr. Solutions Architect", "https://elsewhere.example.com/xyz", "Acme")
+        _cand(3, "Platform Support Engineer", "https://jobs.example.com/def", "Beta")
+        _c.commit(); _c.close()
+
+        _out = _appQ._mcp_call("search_queue", {"limit": 25})
+        # ⭐ matched by URL, even though the query string differs: aggregators add their own
+        check("a role already applied to is hidden, matched by URL",
+              "https://jobs.example.com/abc" in _out, False)
+        # ⭐ matched by company and title, even though the URL is a different host entirely
+        # and the title says "Sr." where the application says "Senior"
+        check("...and by company and title on a different host",
+              "elsewhere.example.com" in _out, False)
+        check("an unapplied role is still offered", "Platform Support Engineer" in _out, True)
+        # 🚨 The exclusion is STATED. A silent filter is how the missing one went unnoticed.
+        check("it reports how many it hid", "2 role(s) hidden" in _out, True)
+    finally:
+        if _pQ is None: _oQ.environ.pop("DB_PATH", None)
+        else: _oQ.environ["DB_PATH"] = _pQ
+
     # ═══ a reading that already exists must be adopted, not stranded ═══
     #
     # 🚨 EIGHT MESSAGES WERE STRANDED ON 2026-08-24, including a time-boxed assessment
