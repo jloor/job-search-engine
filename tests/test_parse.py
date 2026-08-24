@@ -338,6 +338,76 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("disagreements surface in the job's own output",
           "DISAGREEMENT" in src_job, True)
 
+    # ═══ a reading that already exists must be adopted, not stranded ═══
+    #
+    # 🚨 EIGHT MESSAGES WERE STRANDED ON 2026-08-24, including a time-boxed assessment
+    # invitation. Adoption happened only inside job_ai_read's read loop, and that job never
+    # re-reads a message it has already read, so any message whose READING predated the
+    # adoption code kept the provisional rules label forever. job_track refuses to act on a
+    # provisional label, by design, so those messages would have been held indefinitely.
+    #
+    # ⚠️ A one-off backfill was the first attempt and it went stale the moment the next
+    # message arrived. The sweep runs every cycle and is idempotent.
+    print("\nan existing reading is adopted, not stranded:")
+    import os as _oA, tempfile as _tA, sqlite3 as _sA
+    _dA = _tA.mkdtemp() + "/adopt.db"
+    _pA = _oA.environ.get("DB_PATH"); _oA.environ["DB_PATH"] = _dA
+    try:
+        _appA = load_app()
+        _c = _sA.connect(_dA)
+        _c.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+        for _m in _appA.MIGRATIONS:
+            try: _c.execute(_m)
+            except Exception: pass
+
+        def _put(mid, rules, ai, conf, warn=0, inj=False):
+            _c.execute("INSERT INTO message (id,received_at,to_alias,raw_payload,from_addr,"
+                       "subject,body_text,body_reply,classification,classification_source,"
+                       "auth_dmarc,auth_warn,needs_human) "
+                       "VALUES (?,?,?,'{}','x@y.example','s','b','b',?,'rules',?,?,1)",
+                       (mid, "2026-08-24T13:00:00+00:00", f"a{mid}@jobs.example.com",
+                        rules, "fail" if warn else "pass", warn))
+            if ai:
+                _c.execute("INSERT INTO ai_reading (message_id,created_at,model,classification,"
+                           "confidence,raw_json) VALUES (?,?,?,?,?,?)",
+                           (mid, "2026-08-24T13:05:00+00:00", "m", ai, conf,
+                            '{"prompt_injection_suspected": true}' if inj else "{}"))
+
+        _put(1, "unknown",  "assessment_invite", "high")            # the real 2026-08-24 case
+        _put(2, "rejection", "confirmation",     "high")            # a label that must flip
+        _put(3, "unknown",  "rejection",         "low")             # too uncertain to adopt
+        _put(4, "unknown",  "rejection",         "high", warn=1)    # DMARC failed
+        _put(5, "unknown",  "rejection",         "high", inj=True)  # body tried to steer it
+        _put(6, "confirmation", None, None)                          # never read at all
+        _c.commit(); _c.close()
+
+        _n, _notes = _appA.adopt_readings()
+        _c2 = _sA.connect(_dA); _c2.row_factory = _sA.Row
+        _g = lambda i: dict(_c2.execute(
+            "SELECT classification, classification_source, rules_classification "
+            "  FROM message WHERE id=?", (i,)).fetchone())
+
+        check("a stranded high-confidence reading is adopted", _g(1)["classification_source"],
+              "model")
+        check("...and its label takes effect", _g(1)["classification"], "assessment_invite")
+        # ⭐ The rules label is kept, so adoption is auditable and reversible rather than a
+        # destructive overwrite.
+        check("...while the rules label is preserved", _g(2)["rules_classification"], "rejection")
+        check("...and the model's label wins", _g(2)["classification"], "confirmation")
+        # The three gates, none of which is about which reader is smarter.
+        check("a low-confidence reading is not adopted", _g(3)["classification_source"], "rules")
+        check("a DMARC-failing message is not adopted", _g(4)["classification_source"], "rules")
+        check("a suspected injection is not adopted", _g(5)["classification_source"], "rules")
+        check("an unread message is untouched", _g(6)["classification_source"], "rules")
+        check("it reports what it changed", _n, 2)
+        # 🚨 IDEMPOTENT. A sweep that re-fires every cycle would rewrite rules_classification
+        # with the model's own answer and destroy the audit trail it exists to keep.
+        _n2, _ = _appA.adopt_readings()
+        check("running it again changes nothing", _n2, 0)
+    finally:
+        if _pA is None: _oA.environ.pop("DB_PATH", None)
+        else: _oA.environ["DB_PATH"] = _pA
+
     # ═══ changing the commute origin must not destroy measurements ═══
     #
     # 🚨 IT DID, ON 2026-08-24. Correcting ONE DIGIT of a house number destroyed 591 place

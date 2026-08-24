@@ -1868,6 +1868,57 @@ def job_match_application() -> str:
     return (f"proposed {done}, declined {declined}, alias already unique {skipped}{tail}")
 
 
+def adopt_readings(limit: int = 500) -> tuple[int, list]:
+    """Give message.classification to the model wherever a reading exists and has not been used.
+
+    🚨 WHY THIS IS A SEPARATE PASS. Adoption used to happen only inside job_ai_read's read
+    loop, and that job never re-reads a message it has already read. So any message whose
+    READING predates the adoption code was stranded on the provisional rules label forever,
+    and job_track, which since v0.27.0 refuses to act on a provisional label, would hold it
+    for good. Measured 2026-08-24: eight messages from one afternoon, including a time-boxed
+    assessment invitation, sat with a high-confidence model reading that nothing would use.
+
+    ⚠️ A one-off backfill is not a fix. That was the first attempt, run by hand, and it went
+    stale the moment the next message arrived. This runs every cycle and is idempotent.
+
+    The gates are the same three as the read path, and none is about which reader is smarter:
+    high confidence, no injection flag, and DMARC not warned. The rules label is preserved in
+    rules_classification, so adoption is auditable and reversible.
+    """
+    changed, notes = 0, []
+    with db() as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT m.id, m.to_alias, m.auth_warn, m.classification, m.rules_classification, "
+            "       r.classification AS ai, r.confidence, r.raw_json "
+            "  FROM message m "
+            "  JOIN ai_reading r ON r.id = (SELECT id FROM ai_reading "
+            "                                WHERE message_id = m.id ORDER BY id DESC LIMIT 1) "
+            " WHERE COALESCE(m.classification_source, 'rules') <> 'model' "
+            " ORDER BY m.id DESC LIMIT ?", (limit,))]
+    for r in rows:
+        ai = (r["ai"] or "").strip()
+        if not ai or (r["confidence"] or "").lower() != "high" or r["auth_warn"]:
+            continue
+        try:
+            if json.loads(r["raw_json"] or "{}").get("prompt_injection_suspected"):
+                continue
+        except Exception:                                   # noqa: BLE001
+            pass
+        with db() as con:
+            con.execute(
+                "UPDATE message "
+                "   SET rules_classification = COALESCE(rules_classification, classification), "
+                "       classification = ?, classification_source = 'model', needs_human = ? "
+                " WHERE id = ?", (ai, needs_human_for(ai, bool(r["auth_warn"])), r["id"]))
+        changed += 1
+        if ai != (r["classification"] or ""):
+            notes.append(f"msg {r['id']}: {r['classification']} -> {ai}")
+            audit("ai_label_adopted",
+                  f"message {r['id']} ({r['to_alias']}): classification "
+                  f"{r['classification']!r} -> {ai!r} (model, high confidence)")
+    return changed, notes
+
+
 def job_ai_read() -> str:
     """
     Read the messages the rules left as unknown and record a proposal for each.
@@ -1909,6 +1960,12 @@ def job_ai_read() -> str:
                 != (c["last_hash"] or "")][:AI_READ_BATCH]
 
     if not rows:
+        # ⚠️ NOT AN EARLY EXIT ANY MORE. "Nothing new to read" is exactly the state in which
+        # a stranded reading sits unused, so the adoption sweep runs first and reports.
+        n, notes = adopt_readings()
+        if n:
+            return (f"nothing unlabelled; adopted {n} existing reading(s)"
+                    + ("; " + "; ".join(notes[:6]) if notes else ""))
         return "nothing unlabelled"
 
     # ⭐ Caching is switched on by batch size, because below two messages it LOSES money.
@@ -1999,6 +2056,15 @@ def job_ai_read() -> str:
             failed.append(f"msg {r['id']}: {type(e).__name__}: {e}")
 
     note = f"read {done} of {len(rows)} (scope={AI_READ_SCOPE})"
+    # ⭐ ALSO ON THE NORMAL PATH. A message read in this very batch is adopted inside the loop,
+    # but one whose reading is older is not, and the loop will never revisit it. Running the
+    # sweep here as well makes the job idempotent: whatever the batch did, every usable
+    # reading is in force by the time it returns.
+    swept, sweep_notes = adopt_readings()
+    if swept:
+        note += f"; adopted {swept} existing reading(s)"
+        if sweep_notes:
+            note += ": " + "; ".join(sweep_notes[:4])
     if disagreed:
         # Say it in the job line, not only in the audit table. A disagreement that is
         # only discoverable by querying is a disagreement nobody looks at.
