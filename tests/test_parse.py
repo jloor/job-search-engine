@@ -1607,6 +1607,52 @@ On Wed, Aug 12, 2026 the candidate wrote:
           _g.cascade_hybrid("onsite", "Bangalore, Karnataka, India", None, _cfg), "onsite")
     check("...nor one in a US city that is not commutable",
           _g.cascade_hybrid("onsite", "San Francisco, CA", None, _cfg), "onsite")
+    # 🚨 A NEAR STATE IS NOT THE METRO. metro_re ORs the place list with `,\s*(NY|NJ|CT|PA)`,
+    # so every one of these matched and cascaded to hybrid_commutable with nothing measured.
+    # A real row was written as commutable on the strength of ", PA" alone; the
+    # measured route to Philadelphia is 145 min driving and 131 by transit against a 90 min
+    # ceiling, and travel_notes says Philadelphia is not commutable at all.
+    for _far in ("Philadelphia, PA", "Pittsburgh, PA", "Albany, NY", "Buffalo, NY",
+                 "Phoenix, AZ; Boston, MA; Philadelphia, PA"):
+        check(f"a near-state city is not the metro: {_far}",
+              _g.cascade_hybrid("onsite", _far, None, _cfg), "onsite")
+    # ...while a CURATED place still cascades, including inside a multi-office string. This is
+    # the CentralReach row: two offices, and the New Jersey one is 79 measured minutes away.
+    check("a curated place still cascades",
+          _g.cascade_hybrid("onsite", "Holmdel, New Jersey", None, _cfg), "hybrid_commutable")
+    check("...and is found among several offices",
+          _g.cascade_hybrid("onsite", "Fort Lauderdale, Florida, United States, "
+                            "Holmdel, New Jersey, United States", None, _cfg),
+          "hybrid_commutable")
+    # ⭐ THE RECALL FILTER IS DELIBERATELY UNCHANGED. gate() must not delete a posting nobody
+    # has ruled on, so a near-state city still passes there. Narrowing both would have turned
+    # a wrong verdict into a silently dropped candidate.
+    check("gate() still keeps a near-state city for review",
+          _g.gate({"location": "Philadelphia, PA"}, _cfg)[0], True)
+    # 🚨 A PLACE NAME IS NOT A PLACE. The curated list holds bare tokens and American city
+    # names repeat across states, so the New Jersey entries matched their namesakes.
+    _cfg2 = dict(_cfg, commute=dict(_cfg["commute"],
+                 metro_places=["new york", "newark", "princeton", "holmdel"]))
+    check("the right Newark cascades",
+          _g.cascade_hybrid("onsite", "Newark, NJ", None, _cfg2), "hybrid_commutable")
+    for _wrong in ("Newark, CA", "Newark, DE", "Princeton, WV"):
+        check(f"the wrong one does not: {_wrong}",
+              _g.cascade_hybrid("onsite", _wrong, None, _cfg2), "onsite")
+    # ⭐ A bare place with no state beside it still cascades. Nothing contradicts it, and
+    # demanding a state would reject the plain "New York" that most postings actually write.
+    check("a bare place with no state still cascades",
+          _g.cascade_hybrid("onsite", "New York", None, _cfg2), "hybrid_commutable")
+    # 🚨 TWO-WORD STATE NAMES. The first version of metro_match used a generic word pattern and
+    # read "New York, Rhode Island" as the state "rhode", decided that was not a state at all,
+    # and accepted the match. A posting whose own text says it will NOT hire in New
+    # Jersey or New York therefore stayed marked commutable through the first fix.
+    check("a two-word state beside the place is recognised",
+          _g.cascade_hybrid("onsite", "Princeton, West Virginia", None, _cfg2), "onsite")
+    check("...and an exclusion list is not a residency requirement",
+          _g.cascade_hybrid("remote_with_residency", "Remote - US",
+                            "open to candidates residing in the US except Connecticut, "
+                            "New Jersey, New York, Rhode Island", _cfg2),
+          "remote_with_residency")
     _cfg_ro = dict(_cfg, remote=dict(_cfg["remote"], policy="remote_only"))
     check("remote_only does NOT cascade a hybrid",
           _g.cascade_hybrid("hybrid", "New York, NY", "", _cfg_ro), "hybrid")

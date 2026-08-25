@@ -103,6 +103,93 @@ def metro_re(cfg: dict | None = None):
     return re.compile("|".join(parts), re.I)
 
 
+def metro_place_re(cfg: dict | None = None):
+    r"""The CURATED place names only. Never the near-state suffix.
+
+    🚨 THIS EXISTS BECAUSE metro_re DECIDES TOO MUCH. metro_re ORs the place list with
+    `,\s*(NY|NJ|CT|PA)`, so ANY city followed by a near-state abbreviation reads as "in the
+    metro". That is right for the recall pre-filter in gate(), whose job is to avoid deleting
+    a posting nobody has ruled on. It is wrong anywhere a verdict is ASSERTED.
+
+    ⚠️ Measured 2026-08-25. A posting located "Phoenix, AZ; Boston, MA;
+    Philadelphia, PA" was written into scan_candidate as `hybrid_commutable` with the evidence
+    "its location is in the metro. No model was asked." It matched on ", PA". The real
+    measurement from the configured origin is 145 minutes by car and 131 by transit, against a
+    90 minute ceiling. `travel_notes` says outright that Philadelphia is not commutable.
+    "Albany, NY" and "Pittsburgh, PA" fail the same way.
+
+    ⭐ near_states is a GEOGRAPHIC PRE-FILTER, not a commutability test. Its own comment says
+    "Only these states CAN CONTAIN a place inside max_minutes" - can contain, not does. The two
+    meanings were collapsed into one regex and the permissive one won.
+
+    📌 The cost of this fix is recall, in the safe direction. A genuinely commutable town that
+    is not on the curated list (Fort Lee, Nyack) no longer gets a free verdict. It keeps no
+    verdict instead of a wrong one, which leaves it for a measurement or a model read. Add the
+    town to metro_places to settle it: that list is a human ruling and outranks both.
+    """
+    cfg = load() if cfg is None else cfg
+    places = (cfg.get("commute") or {}).get("metro_places") or []
+    return re.compile(rf"\b({_alt(places)})\b", re.I) if places else None
+
+
+_US_STATES = {
+    "AL": "alabama", "AK": "alaska", "AZ": "arizona", "AR": "arkansas", "CA": "california",
+    "CO": "colorado", "CT": "connecticut", "DE": "delaware", "FL": "florida", "GA": "georgia",
+    "HI": "hawaii", "ID": "idaho", "IL": "illinois", "IN": "indiana", "IA": "iowa",
+    "KS": "kansas", "KY": "kentucky", "LA": "louisiana", "ME": "maine", "MD": "maryland",
+    "MA": "massachusetts", "MI": "michigan", "MN": "minnesota", "MS": "mississippi",
+    "MO": "missouri", "MT": "montana", "NE": "nebraska", "NV": "nevada",
+    "NH": "new hampshire", "NJ": "new jersey", "NM": "new mexico", "NY": "new york",
+    "NC": "north carolina", "ND": "north dakota", "OH": "ohio", "OK": "oklahoma",
+    "OR": "oregon", "PA": "pennsylvania", "RI": "rhode island", "SC": "south carolina",
+    "SD": "south dakota", "TN": "tennessee", "TX": "texas", "UT": "utah", "VT": "vermont",
+    "VA": "virginia", "WA": "washington", "WV": "west virginia", "WI": "wisconsin",
+    "WY": "wyoming", "DC": "district of columbia"}
+
+
+# 🚨 LONGEST FIRST, AND MATCHED AGAINST REAL STATE NAMES. The first version of the check
+# below used a generic word pattern, and it read "New York, Rhode Island" as the state "rhode",
+# concluded that was not a state at all, and accepted the match. Every two-word state failed the
+# same way: West Virginia, New Mexico, North Carolina. That is how a posting whose own
+# text says it will NOT hire in New Jersey or New York stayed marked commutable even after the
+# first fix. Sorting longest-first is what makes "rhode island" win over nothing.
+_STATE_AFTER = re.compile(
+    r"[\s,]*(" + "|".join(sorted(
+        list(_US_STATES) + list(_US_STATES.values()), key=len, reverse=True)) + r")\b", re.I)
+
+
+def metro_match(location: str | None, cfg: dict | None = None) -> bool:
+    """Does this location name a curated metro place IN A NEAR STATE?
+
+    🚨 A PLACE NAME IS NOT A PLACE. The curated list holds bare tokens, and American city
+    names repeat across states. Measured 2026-08-25, every one of these read as commutable:
+    "Newark, CA" (the Bay Area one), "Newark, DE", "Princeton, WV". Only the UK case was
+    caught, and only because eligibility() rejects it for being foreign, not because anything
+    noticed the city was wrong.
+
+    ⭐ THE RULE: a matched token counts only if the state written beside it is one of
+    near_states, or if no state is written at all. "Holmdel, New Jersey" counts. "Newark, CA"
+    does not. An unqualified "Remote" or a bare "New York" still counts, because there is
+    nothing to contradict.
+
+    📌 It scans EVERY match, not just the first. A posting that lists several offices is the
+    normal case, and the reachable one is often not first: the row that exposed this reads
+    "Fort Lauderdale, Florida, United States, Holmdel, New Jersey, United States".
+    """
+    cfg = load() if cfg is None else cfg
+    place = metro_place_re(cfg)
+    if not place or not location:
+        return False
+    near = {s.upper() for s in ((cfg.get("commute") or {}).get("near_states") or [])}
+    ok = {s.lower() for s in near} | {_US_STATES[s] for s in near if s in _US_STATES}
+    for m in place.finditer(location):
+        st = _STATE_AFTER.match(location[m.end():m.end() + 40])
+        # Nothing recognisable beside it: nothing contradicts the match, so it counts.
+        if not st or st.group(1).lower() in ok:
+            return True
+    return False
+
+
 def near_state_re(cfg: dict | None = None):
     cfg = load() if cfg is None else cfg
     st = (cfg.get("commute") or {}).get("near_states") or []

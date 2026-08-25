@@ -141,12 +141,20 @@ def cascade_hybrid(remote_verdict: str, location: str | None, residency: str | N
         return remote_verdict
     if "hybrid_commutable" not in C.workable_remote(cfg):
         return remote_verdict          # remote_only: no cascade, by policy
-    metro = C.metro_re(cfg)
-    if not metro:
-        return remote_verdict
+    # 🚨 NOT metro_re, and not a bare regex search either. This function ASSERTS
+    # commutability, and it got that wrong two separate ways until 2026-08-25:
+    #   metro_re ORs in `,\s*(NY|NJ|CT|PA)`, so "Philadelphia, PA" and "Albany, NY" read as
+    #     the metro with nothing measured. Philadelphia is 131 measured minutes away.
+    #   the place list holds bare tokens, so "Newark, CA" and "Princeton, WV" matched the
+    #     New Jersey entries by name.
+    # metro_match closes both: a curated token, beside a near state or beside nothing.
+    if not C.metro_place_re(cfg):
+        return remote_verdict          # no places configured: nothing to cascade against
     resid = (residency or "").strip()
-    if resid and not metro.search(resid):
+    if resid and not C.metro_match(resid, cfg):
         return remote_verdict
-    if metro.search(f"{resid} {location or ''}") and eligibility(location) != "ineligible":
+    # 🚨 metro_match, not a bare regex search: the token must sit beside a NEAR state.
+    # "Newark, CA" and "Princeton, WV" both read as commutable until 2026-08-25.
+    if C.metro_match(f"{resid} {location or ''}", cfg) and eligibility(location) != "ineligible":
         return "hybrid_commutable"
     return remote_verdict

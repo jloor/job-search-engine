@@ -4288,7 +4288,10 @@ def job_remote_check() -> str:
     # cascade_hybrid, which is the one place that owns whether a location is reachable. If the
     # policy is remote_only, cascade_hybrid returns "onsite" unchanged and the row is still out.
     # 📌 Free. No model call, no HTTP. It runs before the paid path and shrinks its queue.
-    metro = _C.metro_re(cfg)
+    # 🚨 metro_place_re, NOT metro_re: this path WRITES a verdict with no model and no
+    # measurement, so it must only fire on a curated place name. Under metro_re a bare
+    # ", PA" was enough, and Philadelphia was recorded as commutable.
+    metro = _C.metro_place_re(cfg)
     rule_done = {"n": 0, "cascaded": 0}
     if metro:
         with db() as con:
@@ -4306,7 +4309,9 @@ def job_remote_check() -> str:
                 " ORDER BY cast(score as int) DESC LIMIT ?",
                 (TRIAGE_BAND_MIN, REMOTE_BATCH * 4)).fetchall()]
             for c in plain:
-                if not metro.search(c["location"] or ""):
+                # 🚨 metro_match, not a regex search: this WRITES a verdict with no model and
+                # no measurement, so the token must sit beside a near state.
+                if not _C.metro_match(c["location"] or "", cfg):
                     continue
                 after = _G.cascade_hybrid("onsite", c["location"], None, cfg)
                 con.execute("UPDATE scan_candidate SET remote_verdict=?, remote_evidence=? "
