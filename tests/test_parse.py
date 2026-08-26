@@ -446,6 +446,17 @@ On Wed, Aug 12, 2026 the candidate wrote:
     _OTP_BODY = ("![logo abc123def456](cid:6a8cac62cbb6f_c34ed0108243@prod-jben-web-x9f2a-4nt24.mail) "
                  "Hi Jonathan, Copy and paste this code into the security code field on your "
                  "application: # Kp7Qm2Rt After you enter the code, resubmit your application.")
+    # ⚠️ The noun form. "Application Submission Successful!" matched nothing and was filed
+    # unknown; the list held "application submitted" but not "submission successful".
+    for _s, _b in (("Application Submission Successful!", "Thank you, we got it."),
+                   ("Application received", "Your application was submitted successfully.")):
+        check("a success wording is a confirmation", app.classify(_s, _b)[0], "confirmation")
+    # 🚨 AND A REFUSAL CONTAINING THE WORD SUBMIT MUST NOT READ AS ONE.
+    check("a refusal is not a confirmation",
+          app.classify("We couldn't submit your application",
+                       "Your application submission was flagged as possible spam.")[0]
+          != "confirmation", True)
+
     # 🚨 A CONDITIONAL IS NOT A VERDICT. This exact sentence produced false REJECTIONS on
     # three separate days, and it is standard confirmation boilerplate on at least one major
     # ATS's default template. The mail's own opening says the application was received. On a

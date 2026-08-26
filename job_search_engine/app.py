@@ -1103,6 +1103,14 @@ RULES = [
     ("confirmation",     r"\b(than(?:k you|ks) for (?:applying|your application|submitting)|"
                          r"we(?:'ve| have) received your (?:application|resume|r\xe9sum\xe9|submission)|"
                          r"application (?:was )?(?:received|submitted)|"
+                         # 2026-08-26, the FOURTH miss of this shape. Subject and body both
+                         # read "Application Submission Successful!" and nothing matched, so a
+                         # plain confirmation was filed unknown and raised needs_human. The
+                         # noun form was absent: the list held "application submitted" but not
+                         # "submission successful". Same evening, the page watcher in the
+                         # filler missed the identical wording on the identical page, so one
+                         # phrasing blinded two independent readers at once.
+                         r"submission (?:was )?successful|successfully (?:submitted|applied)|"
                          r"(?:currently|actively) reviewing (?:all )?(?:applications|"
                          r"your application|candidates)|"
                          r"we(?:'ll| will) be in touch if)\b"),
