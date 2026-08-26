@@ -446,6 +446,37 @@ On Wed, Aug 12, 2026 the candidate wrote:
     _OTP_BODY = ("![logo abc123def456](cid:6a8cac62cbb6f_c34ed0108243@prod-jben-web-x9f2a-4nt24.mail) "
                  "Hi Jonathan, Copy and paste this code into the security code field on your "
                  "application: # Kp7Qm2Rt After you enter the code, resubmit your application.")
+    # 🚨 A CONDITIONAL IS NOT A VERDICT. This exact sentence produced false REJECTIONS on
+    # three separate days, and it is standard confirmation boilerplate on at least one major
+    # ATS's default template. The mail's own opening says the application was received. On a
+    # row already marked submitted, job_track acts on the rules label and auto-closes a live
+    # application, which is why displaying both readers was not a fix.
+    for _subj, _body in (
+        ("Thank you for applying!",
+         "We have received your application for the role and are delighted that you would "
+         "consider joining our team. Our team will review your application. If you are not "
+         "selected for further consideration, please visit our careers page."),
+        ("Thanks for applying!",
+         "Thanks so much for applying! Our Recruiting team will review your application and "
+         "will be in touch should your qualifications match our needs for the role. If you "
+         "are not selected for this position, please keep an eye on our careers site."),
+    ):
+        check("a conditional 'if you are not selected' is a confirmation",
+              app.classify(_subj, _body)[0], "confirmation")
+    # ⭐ AND THE VERDICT ITSELF MUST STILL MATCH. The fix strips the conditional clause, not
+    # the vocabulary, so a real rejection stating the decision is unaffected.
+    for _body in (
+        "Unfortunately you were not selected for this position.",
+        "After careful review we have decided to move forward with other candidates.",
+        "We regret to inform you that you have not been selected.",
+    ):
+        check("a stated rejection still matches", app.classify("Update", _body)[0], "rejection")
+    # ⚠️ A conditional must not swallow the sentence after it: the clause is bounded at the
+    # first ., ; ! or ?, so a verdict in the NEXT sentence is still read.
+    check("a verdict after a conditional is still found",
+          app.classify("Update", "If you have questions, contact us. You were not selected."),
+          ("rejection", None))
+
     _lab, _code = app.classify("Security code for your application to Acme", _OTP_BODY)
     check("it is labelled otp", _lab, "otp")
     check("...and the code comes out", _code, "Kp7Qm2Rt")

@@ -1127,6 +1127,13 @@ def needs_human_for(label: str, auth_warn: bool) -> int:
     return 0 if label in AUTO_HANDLED else 1
 
 
+# Conditional clauses, removed before the rejection rules run. Bounded at the clause end so
+# a single "if" cannot swallow a whole message: the verdict in a real rejection sits in its own
+# sentence, never inside the conditional.
+CONDITIONAL_RE = re.compile(
+    r"\b(?:if|should|in the event|in case)\s+(?:you|your|we|there|it)\b[^.;!?]{0,160}", re.I)
+
+
 def classify(subject: str, body: str) -> tuple[str, str | None]:
     """Return (classification, otp_code|None). Order matters: invite beats scheduling."""
     # 🚨 COLLAPSE WHITESPACE FIRST. Email bodies hard-wrap at about 72 characters, and every
@@ -1138,8 +1145,24 @@ def classify(subject: str, body: str) -> tuple[str, str | None]:
     # the likelier it breaks. Measured on 109 real messages, this one line moved more of
     # them than the entire rejection vocabulary did.
     hay = re.sub(r"\s+", " ", f"{subject}\n{body}").lower()
+    # 🚨 A DECISION IS NEVER STATED CONDITIONALLY, and reading one that way has now produced
+    # false REJECTIONS on three separate days. The sentence is standard confirmation
+    # boilerplate: "if you are not selected for this position, keep an eye on our careers
+    # page". It sits inside a mail whose own first line says the application was received.
+    # On 2026-08-23 this was noticed and answered by DISPLAYING both readers in recent_mail,
+    # which helps a human reading the list and does nothing for job_track, which acts on the
+    # rules label alone. On 2026-08-26 it mislabelled two more confirmations twenty minutes
+    # apart, both on the same vendor's default template.
+    #
+    # ⭐ THE FIX IS TO STRIP THE CONDITIONAL BEFORE LOOKING FOR A VERDICT, not to remove the
+    # phrase from the vocabulary: "you were not selected" must keep matching. An "if" clause
+    # describes a future that has not happened, so no rejection is being announced inside it.
+    # ⚠️ Applied ONLY to the rejection rules. Other labels can legitimately live in a
+    # conditional ("if you did not request this code"), and narrowing the haystack for them
+    # would trade one silent miss for another.
+    decisive = CONDITIONAL_RE.sub(" ", hay)
     for label, pattern in RULES:
-        if re.search(pattern, hay, re.I):
+        if re.search(pattern, decisive if label == "rejection" else hay, re.I):
             code = None
             if label == "otp":
                 m = OTP_RE.search(body or "")
