@@ -6558,6 +6558,20 @@ MCP_TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "location": {"type": "string", "description": "a location string, or part of one"},
          "limit": {"type": "integer", "default": 10}}, "required": ["location"]}},
+    # ⭐ THE DAILY CHECK WAS A SCRIPT ON HIS LAPTOP, so it answered only when the laptop was
+    # on and only to whoever typed the command. Its four questions are the ones a session
+    # should start from, and three of them are plain queries. The fourth needed job_verify,
+    # which is why this arrives with it rather than before it.
+    {"name": "morning_report",
+     "description": "The daily check: postings that DIED under a live application, what the "
+                    "overnight scan surfaced, and the pipeline shape. Read this at the start "
+                    "of a session instead of inferring the state from context. Liveness "
+                    "carries its own age and its own uncertainty: 'unknown' means the board "
+                    "could not be read, never that the role is gone.",
+     "inputSchema": {"type": "object", "properties": {
+         "since_hours": {"type": "integer", "default": 24,
+                         "description": "how far back to count new candidates"},
+         "min_score": {"type": "integer", "default": 70}}}},
 ]
 
 
@@ -6863,6 +6877,75 @@ def _mcp_call(name: str, args: dict) -> str:
         head = (f"⚖️ {clashes} of {len(rows)} shown have the two readers disagreeing.\n\n"
                 if clashes else "")
         return head + "\n".join(out)
+
+    if name == "morning_report":
+        hrs = int(args.get("since_hours", 24) or 24)
+        floor = int(args.get("min_score", 70) or 70)
+        cut = (datetime.now(timezone.utc) - timedelta(hours=hrs)).isoformat(timespec="seconds")
+        out = []
+
+        # 1. The most expensive thing to learn late. A req that died under a package he has
+        #    already built or already sent.
+        dead = _rows("""SELECT c.name company, p.title role, a.status, p.status_evidence,
+                               p.last_verified
+                          FROM posting p JOIN application a ON a.posting_id = p.id
+                          JOIN company c ON c.id = p.company_id
+                         WHERE a.status IN ('draft','submitted','interview')
+                           AND p.status = 'dead' ORDER BY p.last_verified DESC""")
+        out.append(f"1. postings that DIED under a live application: {len(dead)}")
+        for r in dead:
+            out.append(f"   🔴 {r['company']} — {r['role']} [{r['status']}] "
+                       f"({r['status_evidence']}, read {(r['last_verified'] or '')[:16]})")
+
+        # ⚠️ Unreadable is NOT dead, and saying how many were unreadable is the difference
+        # between a report and a claim. A silent 'no deaths' over ten blocked boards is a
+        # lie of omission.
+        blind = _rows("""SELECT count(*) n FROM posting p JOIN application a ON a.posting_id = p.id
+                          WHERE a.status IN ('draft','submitted','interview')
+                            AND (p.status IS NULL OR p.status IN ('unknown',''))""")
+        stale = _rows("""SELECT max(last_verified) m FROM posting WHERE last_verified IS NOT NULL""")
+        n_blind = (blind[0]["n"] if blind else 0)
+        out.append(f"   ⚠️ {n_blind} live posting(s) could not be read, or have never been "
+                   f"read. Unreadable is not dead.")
+        out.append(f"   last liveness pass: {((stale[0]['m'] if stale else None) or 'never')[:16]}")
+
+        # 2. Did the scan even run? A report on stale candidates that does not say the sweep
+        #    failed is worse than no report.
+        run = _rows("SELECT at, boards, failed, appeared, status, finished_at "
+                    "FROM scan_run ORDER BY id DESC LIMIT 1")
+        out.append("")
+        if run:
+            r = run[0]
+            fin = r["finished_at"] or ""
+            out.append(f"2. last scan {r['at'][:16]}: {r['boards']} boards, {r['failed']} failed, "
+                       f"{r['appeared']} appeared, status {r['status']}, "
+                       f"{'finished ' + fin[:16] if fin else '🚨 NEVER FINISHED'}")
+        else:
+            out.append("2. 🚨 no scan has ever run")
+
+        # 3. What the sweep surfaced. Excludes anything already in the pipeline, on the same
+        #    canonical URL, so it is a work list rather than a re-read of his own history.
+        new = _rows("""SELECT c.company, c.title, c.score, c.location, c.remote_verdict,
+                              c.comp_min, c.comp_max, c.url
+                         FROM scan_candidate c
+                        WHERE c.at > ? AND c.triaged = 1 AND cast(c.score as int) >= ?
+                          AND c.verdict NOT IN ('out_of_scope','duplicate','error')
+                          AND NOT EXISTS (SELECT 1 FROM posting p WHERE p.canonical_url = c.url)
+                        ORDER BY cast(c.score as int) DESC LIMIT 25""", (cut, floor))
+        out.append("")
+        out.append(f"3. new in the last {hrs}h at score >= {floor}, not already applied to: {len(new)}")
+        for r in new:
+            band = (f"${r['comp_min']:,}-${r['comp_max']:,}" if r["comp_min"] and r["comp_max"]
+                    else "no band stated")
+            out.append(f"   {r['score']:>3}  {(r['company'] or '')[:22]:<22} "
+                       f"{(r['title'] or '')[:38]:<38} {band:<22} {r['remote_verdict'] or '?'}")
+            out.append(f"        {r['url']}")
+
+        # 4. The shape, so a session starts from fact rather than from memory.
+        counts = _rows("SELECT status, count(*) n FROM application GROUP BY status ORDER BY n DESC")
+        out.append("")
+        out.append("4. pipeline: " + "  ".join(f"{r['status']} {r['n']}" for r in counts))
+        return "\n".join(out)
 
     raise ValueError(f"unknown tool {name}")
 

@@ -3992,6 +3992,29 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("blocked becomes unknown, not live",
           '{"ok": "live", "gone": "dead"}' in _vsrc, True)
 
+    # ── morning_report ───────────────────────────────────────────────────────────────
+    # The daily check moves off his laptop, so a session can ask the system instead of
+    # inferring the state from whatever is still in context.
+    _names = [d["name"] for d in _appv.MCP_TOOLS]
+    check("morning_report is a tool", "morning_report" in _names, True)
+    check("every tool has an inputSchema",
+          all(isinstance(d.get("inputSchema"), dict) for d in _appv.MCP_TOOLS), True)
+    check("tool names are unique", len(_names) == len(set(_names)), True)
+    _msrc = _src_of(_appv._mcp_call)
+    # 🚨 A report that says "no deaths" over ten boards it could not read is a lie of
+    # omission. The unreadable count is not optional decoration.
+    check("morning_report reports the blind spot",
+          "could not be read" in _msrc, True)
+    # ⚠️ It must exclude what is already applied to, or it re-reads his own history back
+    # to him as though it were new work.
+    check("morning_report excludes the pipeline",
+          "NOT EXISTS (SELECT 1 FROM posting p WHERE p.canonical_url = c.url)" in _msrc, True)
+    check("morning_report says when the scan never finished",
+          "NEVER FINISHED" in _msrc, True)
+    # It is a reader. Every MCP tool is, and the read token is handed to agents.
+    check("no MCP tool writes",
+          any(w in _msrc for w in ("UPDATE ", "INSERT ", "DELETE ")), False)
+
     print()
     if failures:
         print(f"{len(failures)} FAILED")
