@@ -405,6 +405,11 @@ MIGRATIONS = [
     # confirmation UPGRADE a self-report rather than being the only path to `submitted`.
     #   mail | self_report | human | import
     "ALTER TABLE application ADD COLUMN status_source TEXT",
+    # ⭐ 2026-08-27. THE IDEMPOTENCY KEY FOR THE INTERACTION LOG. The table shipped with no
+    # unique constraint at all, so any job that re-read the mailbox would have doubled every
+    # timeline in silence. A mail-derived row keys on "msg:<id>"; a hand-recorded one supplies
+    # its own. record_interaction() refuses without a key rather than inventing one.
+    "ALTER TABLE interaction ADD COLUMN dedupe_key TEXT",
     # ⭐ 2026-08-23. The reference half of artifact storage, which needs no storage container.
     # 🚨 A PROOF ARTIFACT WITH NO DATABASE REFERENCE IS A FILE NOBODY CAN FIND, and being
     # findable years later is the entire purpose of a submission record. The BYTES stay in git;
@@ -561,6 +566,12 @@ MIGRATIONS = [
      "is_agency INTEGER NOT NULL DEFAULT 0, never_nudge INTEGER NOT NULL DEFAULT 0, "
      "nudge_after TEXT, rationale TEXT)"),
     "CREATE INDEX IF NOT EXISTS idx_contact_email ON contact(lower(email))",
+    # 🚨 UNIQUE. This is the constraint that makes "run it twice" safe, and it is the whole
+    # reason dedupe_key exists. NULLs stay distinct in SQLite, which is why the helper
+    # refuses a null key instead of relying on the index to catch it.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_interaction_dedupe ON interaction(dedupe_key)",
+    # The timeline query: one application, in order. This is what a front-end renders.
+    "CREATE INDEX IF NOT EXISTS idx_interaction_app_at ON interaction(application_id, at)",
     ("CREATE TABLE IF NOT EXISTS interaction ("
      "id INTEGER PRIMARY KEY, application_id INTEGER REFERENCES application(id), "
      "contact_id INTEGER REFERENCES contact(id), message_id INTEGER, "
@@ -5464,6 +5475,101 @@ def job_verify() -> str:
     return note + (f"; DEAD: {', '.join(gone[:8])}" if gone else "")
 
 
+# ─────────────────────────────────────────────────────────────────────────────────────
+# The interaction log.
+#
+# 🚨 THE TABLE WAS DESIGNED CORRECTLY AND NOTHING EVER WROTE TO IT. `interaction` has
+# carried application_id, contact_id, message_id, kind, at, summary and artifacts since
+# the first migration, with zero rows. Meanwhile `application.notes` became the log by
+# accident: 234 rows, 131KB, 72 hand-written dated lines in a convention nobody enforces.
+#
+# ⭐ ONE ROW PER INTERACTION, NEVER ONE ROW THAT ACCUMULATES. The accumulating row already
+# exists and it is `notes`, and it is what failed. A blob cannot be ordered, cannot be
+# joined to the message and contact rows sitting beside it, and cannot answer "how many
+# days has this been silent" — which is the question that would have caught an interview
+# availability request sitting unanswered for 21 hours.
+#
+# ⚠️ APPEND ONLY. An interaction is a fact that happened at a time. If the reading of it
+# changes later, that is a new row or it belongs in `notes`. Rewriting the log is how a
+# log stops being evidence.
+#
+# ⚠️ `at` IS WHEN IT HAPPENED, NOT WHEN WE LEARNED OF IT. Redox's availability request is
+# stamped 2026-08-27T12:29Z, the recruiter's send time, though this system only saw it six
+# hours later through a hand forward. The gap between those two IS the forhire@ blind spot,
+# and it is only visible if `at` stays honest.
+INTERACTION_KINDS = ("inbound_mail", "outbound_mail", "call", "assessment",
+                     "form_submit", "decision", "note")
+INTERACTIONS_EVERY_MIN = int(os.environ.get("INTERACTIONS_EVERY_MIN", "17"))
+
+
+def record_interaction(con, application_id: int, kind: str, at: str, summary: str,
+                       dedupe_key: str, contact_id: int | None = None,
+                       message_id: int | None = None, artifacts: str = "") -> bool:
+    """Append one interaction. Returns True if it was new.
+
+    🚨 dedupe_key IS REQUIRED AND IS THE WHOLE IDEMPOTENCY STORY. There is a unique index on
+    it, and the insert is OR IGNORE, so a job that runs twice writes one row. Without it a
+    re-import doubles the timeline silently, and this project's own rule is that an operation
+    reporting success may have done nothing, or done it twice.
+
+    ⚠️ It never UPDATEs. A second call with the same key is a no-op, not a correction.
+    """
+    if kind not in INTERACTION_KINDS:
+        raise ValueError(f"unknown interaction kind {kind!r}; known: {INTERACTION_KINDS}")
+    if not dedupe_key:
+        raise ValueError("dedupe_key is required")
+    before = con.execute("SELECT count(*) c FROM interaction WHERE dedupe_key=?",
+                         [dedupe_key]).fetchone()
+    if (dict(before)["c"] if before else 0):
+        return False
+    con.execute(
+        "INSERT OR IGNORE INTO interaction"
+        "(application_id, contact_id, message_id, kind, at, summary, artifacts, dedupe_key)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        (application_id, contact_id, message_id, kind, at, (summary or "")[:600],
+         artifacts or "", dedupe_key))
+    return True
+
+
+def job_interactions() -> str:
+    """Turn resolved inbound mail into timeline rows. Inbound only, and only when certain.
+
+    ⭐ WHY ONLY RESOLVED MAIL. 60 of 212 messages carry resolved_application_id; the rest are
+    unattributed or belong to the auto-applier. `message_application_match` holds the MODEL'S
+    PROPOSALS and is not an answer: 158 rows of "which application might this be", many of
+    them explicitly declining to choose. Writing a timeline from proposals would put a guess
+    in the same column as a fact, which is the mistake the commute layers already record.
+
+    🚨 IT CANNOT SEE OUTBOUND MAIL AND MUST NOT PRETEND TO. Replies sent by hand from the
+    operator's own mailbox never reach the relay, so every conversation here is half a
+    conversation. tools/record-interaction.py is how the other half gets in, and the gap is
+    the reason that tool exists rather than an oversight in this one.
+    """
+    with db() as con:
+        msgs = [dict(r) for r in con.execute(
+            "SELECT m.id, m.received_at, m.from_addr, m.from_name, m.subject, "
+            "       m.classification, m.resolved_application_id AS app, c.id AS contact "
+            "  FROM message m "
+            "  LEFT JOIN contact c ON lower(c.email) = lower(m.from_addr) "
+            " WHERE m.resolved_application_id IS NOT NULL "
+            "   AND NOT EXISTS (SELECT 1 FROM interaction i WHERE i.dedupe_key = 'msg:' || m.id)"
+            " ORDER BY m.id")]
+    if not msgs:
+        return "nothing new"
+    made = 0
+    for m in msgs:
+        # The summary is ONE LINE and it is not the message. The verbatim text stays in
+        # `message`, where it already is, and the reasoning stays in `application.notes`.
+        # Three stores, three questions: what happened, what was said, and why it matters.
+        who = (m["from_name"] or m["from_addr"] or "").strip()
+        summary = f"{m['classification'] or 'mail'} from {who}: {(m['subject'] or '')[:140]}"
+        with db() as con:
+            made += record_interaction(
+                con, m["app"], "inbound_mail", m["received_at"], summary,
+                dedupe_key=f"msg:{m['id']}", contact_id=m["contact"], message_id=m["id"])
+    return f"recorded {made} inbound interaction(s) from {len(msgs)} resolved message(s)"
+
+
 def job_table() -> list:
     """
     The one place a scheduled job is declared.
@@ -5494,7 +5600,10 @@ def job_table() -> list:
             # applications, so it is a small job, and it must not compete with scan for the
             # network. A verdict taken after the overnight sweep is worth more than one taken
             # beside it.
-            ("verify", VERIFY_EVERY_MIN * 60, job_verify)]
+            ("verify", VERIFY_EVERY_MIN * 60, job_verify),
+            # Cheap and database-only. It reads resolved mail and writes timeline rows; it
+            # makes no network call and cannot see outbound mail, which arrives by hand.
+            ("interactions", INTERACTIONS_EVERY_MIN * 60, job_interactions)]
 
 
 async def _scheduler() -> None:
@@ -6620,9 +6729,9 @@ def _mcp_call(name: str, args: dict) -> str:
                          f"({r['submitted_at'] or 'no date'}): {(r['status_raw'] or '')[:120]}" for r in rows)
 
     if name == "get_application":
-        rows = _rows("""SELECT c.name company, p.title role, p.work_model_raw, p.canonical_url,
-                               a.status, a.status_raw, a.next_action, a.notes, a.contact_raw,
-                               a.applied_raw
+        rows = _rows("""SELECT a.id, c.name company, p.title role, p.work_model_raw,
+                               p.canonical_url, a.status, a.status_raw, a.next_action,
+                               a.notes, a.contact_raw, a.applied_raw
                           FROM application a JOIN posting p ON p.id=a.posting_id
                           JOIN company c ON c.id=p.company_id
                          WHERE lower(c.name) LIKE ? LIMIT 5""",
@@ -6631,14 +6740,35 @@ def _mcp_call(name: str, args: dict) -> str:
             return f"no application matching {args['company']!r}"
         out = []
         for r in rows:
-            out += [f"# {r['company']} — {r['role']}",
+            out += [f"# APP {r['id']} · {r['company']} — {r['role']}",
                     f"status:  {r['status']}  |  {r['status_raw'] or ''}",
                     f"applied: {r['applied_raw'] or '—'}",
                     f"remote:  {r['work_model_raw'] or '—'}",
                     f"next:    {r['next_action'] or '—'}",
                     f"contact: {r['contact_raw'] or '—'}",
-                    f"link:    {r['canonical_url'] or '—'}",
-                    f"notes:   {r['notes'] or '—'}", ""]
+                    f"link:    {r['canonical_url'] or '—'}"]
+            # ⭐ THE TIMELINE, ABOVE THE NOTES AND SEPARATE FROM THEM. They answer different
+            # questions: the log says what happened and when, `notes` says why it mattered
+            # and what was decided. Merging them is how `notes` became a 3,900-character
+            # blob that nothing could order, join or measure silence against.
+            tl = _rows("""SELECT i.at, i.kind, i.summary, ct.name who
+                            FROM interaction i LEFT JOIN contact ct ON ct.id = i.contact_id
+                           WHERE i.application_id = ? ORDER BY i.at, i.id""", (r["id"],))
+            if tl:
+                out.append(f"timeline ({len(tl)}):")
+                for e in tl:
+                    who = f" · {e['who']}" if e["who"] else ""
+                    out.append(f"  {(e['at'] or '')[:16]}  {e['kind']:<14}{(e['summary'] or '')[:120]}{who}")
+                # ⚠️ Silence is a number a blob cannot produce, and it is the one that
+                # matters: an interview availability request once sat 21 hours unanswered.
+                last = max((e["at"] or "") for e in tl)
+                out.append(f"  last exchange: {last[:16]}")
+            else:
+                # 🚨 Say it plainly. An empty timeline on an active application means nothing
+                # has been RECORDED, never that nothing happened. Outbound mail is sent by
+                # hand and reaches this system only through tools/record-interaction.py.
+                out.append("timeline: NOTHING RECORDED. Not the same as nothing happened.")
+            out += [f"notes:   {r['notes'] or '—'}", ""]
         return "\n".join(out)
 
     if name == "search_queue":

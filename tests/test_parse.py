@@ -4015,6 +4015,80 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("no MCP tool writes",
           any(w in _msrc for w in ("UPDATE ", "INSERT ", "DELETE ")), False)
 
+    # ── the interaction log ──────────────────────────────────────────────────────────
+    # 🚨 The table shipped with the right columns, zero rows, and NO UNIQUE CONSTRAINT.
+    # Without dedupe_key any job that re-read the mailbox doubles every timeline in
+    # silence, which is the failure this project keeps meeting: an operation reports
+    # success and has done nothing, or done it twice.
+    print()
+    print("interaction log:")
+    _schema = "\n".join(s if isinstance(s, str) else s[1] for s in _appv.SCHEMA) \
+        if hasattr(_appv, "SCHEMA") else _src_of(_appv.record_interaction)
+    check("dedupe_key is uniquely indexed",
+          "idx_interaction_dedupe" in " ".join(str(x) for x in _appv.MIGRATIONS) + _schema
+          or "idx_interaction_dedupe" in open(
+              str(HERE.parent / "job_search_engine" / "app.py")).read(), True)
+
+    class _FakeCon:
+        def __init__(self): self.seen, self.rows = [], set()
+        def execute(self, q, p=()):
+            if q.lstrip().upper().startswith("SELECT"):
+                n = 1 if p[0] in self.rows else 0
+                return type("R", (), {"fetchone": lambda s, n=n: {"c": n}})()
+            self.seen.append(p); self.rows.add(p[-1]); return None
+
+    _con = _FakeCon()
+    _first = _appv.record_interaction(_con, 1, "inbound_mail", "2026-08-27T12:29:00+00:00",
+                                      "availability request", dedupe_key="msg:207")
+    _again = _appv.record_interaction(_con, 1, "inbound_mail", "2026-08-27T12:29:00+00:00",
+                                      "availability request", dedupe_key="msg:207")
+    check("first record writes", (_first, len(_con.seen)), (True, 1))
+    # Running it twice must write once. This is the whole point of the key.
+    check("the same key is a no-op", (_again, len(_con.seen)), (False, 1))
+
+    _bad = None
+    try:
+        _appv.record_interaction(_con, 1, "email", "2026-08-27", "x", dedupe_key="k1")
+    except ValueError as e:
+        _bad = "unknown interaction kind" in str(e)
+    check("an unknown kind is refused", _bad, True)
+    _nokey = None
+    try:
+        _appv.record_interaction(_con, 1, "note", "2026-08-27", "x", dedupe_key="")
+    except ValueError as e:
+        _nokey = "dedupe_key is required" in str(e)
+    # ⚠️ It refuses rather than inventing a key. An invented key is a key that collides
+    # differently on every run, which is worse than none.
+    check("a missing dedupe_key is refused", _nokey, True)
+
+    # ⚠️ ASSERT ON CODE, NOT ON PROSE. The first version of the two checks below matched
+    # the words "UPDATE" and "message_application_match" inside the functions' own
+    # docstrings, which explain why neither is used. A source check that a comment can
+    # satisfy is not a check.
+    def _code_only(fn):
+        import ast as _ast, textwrap as _tw
+        m = _ast.parse(_tw.dedent(_src_of(fn)))
+        f = m.body[0]
+        body = f.body[1:] if (f.body and isinstance(f.body[0], _ast.Expr)
+                              and isinstance(getattr(f.body[0], "value", None), _ast.Constant)
+                              and isinstance(f.body[0].value.value, str)) else f.body
+        return "\n".join(_ast.unparse(n) for n in body)
+
+    _isrc = _code_only(_appv.record_interaction)
+    # Append only. A second call is a no-op, never a correction.
+    check("record_interaction never UPDATEs", "UPDATE" in _isrc, False)
+    _jsrc = _code_only(_appv.job_interactions)
+    # ⚠️ Proposals are not answers. message_application_match holds the model's guesses,
+    # many of which explicitly decline to choose, and a guess must not enter the timeline.
+    check("the job reads resolved links only",
+          ("resolved_application_id" in _jsrc, "message_application_match" in _jsrc),
+          (True, False))
+    check("interactions is registered",
+          "interactions" in [n for n, _, _ in _appv.job_table()], True)
+    # An empty timeline must not read as a quiet conversation.
+    check("an empty timeline says so",
+          "NOTHING RECORDED" in _msrc, True)
+
     print()
     if failures:
         print(f"{len(failures)} FAILED")
