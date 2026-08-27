@@ -4112,6 +4112,23 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("the response names the application",
           '"interaction_application_id"' in _ssrc, True)
 
+    # ── the held-mail section ────────────────────────────────────────────────────────
+    # 🚨 Six applications sat at `submitted` under rejections that had already arrived and
+    # been correctly linked. job_track refused to close them because the sender was a
+    # forwarding mailbox rather than the employer or a known ATS, which is right. The
+    # control worked, audited every one by name, and did it into a table nobody reads.
+    check("morning_report surfaces held mail",
+          "HOLDING for you" in _msrc, True)
+    # ⚠️ It must count MESSAGES, not audit events. job_track re-audits the same held
+    # message every run: 1,560 track_sender_implausible events exist for a handful of
+    # distinct messages, and counting events would report an emergency every morning.
+    check("...counted from message, not from event",
+          ("FROM message m" in _msrc, "track_sender_implausible" in _code_only(_appv._mcp_call)),
+          (True, False))
+    # It must say WHY they are held, or the reader tries to fix a control that is working.
+    check("...and says the refusal is deliberate",
+          "on purpose" in _msrc, True)
+
     print()
     if failures:
         print(f"{len(failures)} FAILED")

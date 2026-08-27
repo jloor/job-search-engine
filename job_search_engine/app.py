@@ -7103,6 +7103,43 @@ def _mcp_call(name: str, args: dict) -> str:
         else:
             out.append("2. 🚨 no scan has ever run")
 
+        # 2b. WHAT A CONTROL IS HOLDING FOR HIM.
+        #
+        # 🚨 THIS IS THE HOLE THE OTHER SECTIONS DID NOT COVER, AND IT COST SIX ROWS. On
+        # 2026-08-27 six applications sat at `submitted` under rejections that had already
+        # arrived, been classified by the model, and been resolved to the right application.
+        # job_track refused to close them because every one came from a forwarding mailbox
+        # rather than the employer or a known ATS, which is correct: a forwarded rejection
+        # loses the original sender's authentication, and loosening that check would let
+        # anyone who can mail him close his pipeline.
+        #
+        # ⭐ THE CONTROL WORKED AND SAID SO, EVERY TEN MINUTES, INTO A TABLE NOBODY READS.
+        # A refusal that reaches no human is indistinguishable from never having noticed.
+        # So the fix is to surface it, never to weaken the check.
+        #
+        # ⚠️ It counts MESSAGES, not audit events. job_track re-audits the same held message
+        # on every run, so the event table holds 1,560 track_sender_implausible rows for a
+        # handful of distinct messages, and a count of events would report an emergency.
+        held = _rows("""SELECT m.id, m.classification, m.from_addr, m.received_at,
+                               c.name company, a.id aid, a.status
+                          FROM message m
+                          JOIN application a ON a.id = m.resolved_application_id
+                          JOIN posting p ON p.id = a.posting_id
+                          JOIN company c ON c.id = p.company_id
+                         WHERE m.classification IN ('rejection','confirmation')
+                           AND m.classification_source = 'model'
+                           AND a.status IN ('draft','submitted','interview')
+                         ORDER BY m.received_at""")
+        out.append("")
+        out.append(f"2b. mail a control is HOLDING for you: {len(held)}")
+        for r in held:
+            out.append(f"   ⏸️ APP {r['aid']} {r['company']} [{r['status']}] — "
+                       f"{r['classification']} from {r['from_addr']} "
+                       f"({(r['received_at'] or '')[:10]}), message {r['id']}")
+        if held:
+            out.append("   These are NOT auto-closed on purpose: a forwarded or "
+                       "non-ATS sender cannot prove who it is. Read them and decide.")
+
         # 3. What the sweep surfaced. Excludes anything already in the pipeline, on the same
         #    canonical URL, so it is a work list rather than a re-read of his own history.
         new = _rows("""SELECT c.company, c.title, c.score, c.location, c.remote_verdict,
