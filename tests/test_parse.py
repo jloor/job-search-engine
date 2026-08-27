@@ -3920,6 +3920,78 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("_read_anthropic passes a block list straight through",
           "isinstance(system, list)" in _src_of(_appc._read_anthropic), True)
 
+
+    # ── posting liveness (job_verify) ────────────────────────────────────────────────
+    # 🚨 THE WHOLE POINT OF THIS JOB IS THE DIFFERENCE BETWEEN "GONE" AND "WE COULD NOT
+    # READ IT", so that is what these assert. A liveness check that collapses the two
+    # deletes real opportunities on the strength of a bot rule, and a 403 from a live
+    # posting is not rare: it happened on one of three Workday tenants in one afternoon.
+    print()
+    print("posting liveness:")
+    _appv = load_app()
+    _GH = "https://job-boards.greenhouse.io/singlestore/jobs/7793656"
+    _LV = "https://jobs.lever.co/redoxengine/d8ea5cec-9f2d-4218-ba4e-5fe734579973"
+    _AS = "https://jobs.ashbyhq.com/edia/afedb893-d5a8-4e9d-8327-babb9d36efed"
+    _WD = ("https://kyndryl.wd5.myworkdayjobs.com/KyndrylProfessionalCareers"
+           "/job/Norwalk-CT-USA/Deskside_R-1")
+    _rg, _rb = _appv._live_get, _appv._live_board_exists
+    try:
+        def _state(get, board_ok, url, board=""):
+            _appv._live_get = lambda u, t=0: get
+            _appv._live_board_exists = lambda u, t=0: board_ok
+            return _appv.posting_liveness(url, board)["state"]
+
+        check("gh 200 is live", _state((200, b"{}"), True, _GH), "ok")
+        check("gh 404, board real", _state((404, b""), True, _GH), "gone")
+        # 🚨 The Kizen case: a token guessed from a custom careers hostname 404s, and that
+        # once reported a live requisition as dead. A 404 is only a vanish from a real board.
+        check("gh 404, board unreal", _state((404, b""), False, _GH), "unaddressable")
+        check("gh 403 is NOT gone", _state((403, b""), True, _GH), "blocked")
+        check("gh 429 is NOT gone", _state((429, b""), True, _GH), "blocked")
+        check("gh 503 is NOT gone", _state((503, b""), True, _GH), "blocked")
+        check("gh network error", _state((None, b"x"), True, _GH), "blocked")
+        check("lever 410, board real", _state((410, b""), True, _LV), "gone")
+        check("lever 410, board unreal", _state((410, b""), False, _LV), "unaddressable")
+
+        # Ashby publishes a board rather than a per-posting endpoint, so absence FROM the
+        # board is the vanish and the board read is mandatory, not a fallback.
+        _listed = json.dumps({"jobs": [{"id": "afedb893-d5a8-4e9d-8327-babb9d36efed"},
+                                       {"id": "other"}]}).encode()
+        _absent = json.dumps({"jobs": [{"id": "other"}]}).encode()
+        check("ashby id listed", _state((200, _listed), True, _AS), "ok")
+        check("ashby id absent", _state((200, _absent), True, _AS), "gone")
+        check("ashby bad token", _state((404, b""), True, _AS), "unaddressable")
+        check("ashby throttled", _state((429, b""), True, _AS), "blocked")
+        check("ashby junk json", _state((200, b"<html>"), True, _AS), "blocked")
+
+        check("wd has posting block", _state((200, b'{"jobPostingInfo":{"a":1}}'), True, _WD), "ok")
+        # A 200 with no posting block answers nothing. Calling it gone repeats the 403 mistake.
+        check("wd 200, no block", _state((200, b"{}"), True, _WD), "blocked")
+        check("wd 404", _state((404, b""), True, _WD), "gone")
+
+        # An embed carries the job id and not the token. Guessing the token from the
+        # hostname is exactly what buried the live Kizen req, so it must refuse instead.
+        _emb = "http://www.lob.com/careers/apply?gh_jid=8079963"
+        check("embed, no board on row", _state((200, b"{}"), True, _emb), "unaddressable")
+        check("embed, board on row", _state((200, b"{}"), True, _emb, "greenhouse|lob"), "ok")
+        check("unknown ATS", _state((200, b"{}"), True, "https://example.com/careers"),
+              "unaddressable")
+        check("no URL at all", _state((200, b"{}"), True, ""), "unaddressable")
+    finally:
+        _appv._live_get, _appv._live_board_exists = _rg, _rb
+
+    # ⚠️ The job must never write the application table. This is asserted on the SOURCE
+    # because the rule is structural: a liveness reading is a fact about a requisition, and
+    # turning it into a status change is a decision with a human attached to it.
+    _vsrc = _src_of(_appv.job_verify)
+    check("job_verify writes only posting",
+          ("UPDATE posting SET" in _vsrc, "UPDATE application" in _vsrc), (True, False))
+    check("job_verify is registered",
+          "verify" in [n for n, _, _ in _appv.job_table()], True)
+    # `blocked` must land as `unknown`, never be left as a stale `live`.
+    check("blocked becomes unknown, not live",
+          '{"ok": "live", "gone": "dead"}' in _vsrc, True)
+
     print()
     if failures:
         print(f"{len(failures)} FAILED")

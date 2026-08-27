@@ -5245,6 +5245,225 @@ def job_place() -> str:
             + (f"; {left} left for the next run" if left else ""))
 
 
+# ─────────────────────────────────────────────────────────────────────────────────────
+# Posting liveness.
+#
+# 🚨 THE SCHEMA HAS BEEN READY FOR THIS SINCE THE FIRST MIGRATION AND NOTHING WROTE IT.
+# `posting` carries status, status_evidence and last_verified, and the schema creates
+# idx_posting_status over exactly (status, last_verified). That index IS the query plan for
+# "re-check whatever has not been read lately", and no job existed to run it. The cost of
+# the gap is a tailored package spent on a requisition that no longer exists, which has
+# already happened three times here: Ashby pulled its Product Support Engineer, the OpenAI
+# Codex req died, and Bergen New Bridge removed a posting before it could be submitted to.
+#
+# ⚠️ IT IS A FACT ABOUT THE REQUISITION, NEVER A DECISION ABOUT THE CANDIDATE. This writes
+# `posting` and nothing else. A dead posting does not reject anybody, and an application on
+# a pulled req is ghosted at worst, which is a judgement a human makes.
+VERIFY_EVERY_MIN = int(os.environ.get("VERIFY_EVERY_MIN", "59"))
+VERIFY_BATCH     = int(os.environ.get("VERIFY_BATCH", "20"))
+# How stale a verdict may be before it is re-asked. Under a day on purpose, so the daily
+# report always carries a reading taken AFTER the overnight scan rather than beside it.
+VERIFY_STALE_HRS = int(os.environ.get("VERIFY_STALE_HRS", "20"))
+# One request per posting, paced. These are employers' boards, not an API we are entitled to.
+VERIFY_PACE      = float(os.environ.get("VERIFY_PACE", "1.0"))
+
+_LIVE_ASHBY = re.compile(r"jobs\.ashbyhq\.com/([^/?#]+)/([0-9a-fA-F-]{16,})")
+_LIVE_LEVER = re.compile(r"jobs\.lever\.co/([^/?#]+)/([0-9a-fA-F-]{16,})")
+_LIVE_GH    = re.compile(r"(?:job-boards|boards)\.greenhouse\.io/([^/?#]+)/jobs/(\d+)")
+_LIVE_GHJID = re.compile(r"[?&]gh_jid=(\d+)")
+_LIVE_WD    = re.compile(r"https://([^.]+)\.(wd\d+)\.myworkdayjobs\.com/([^/]+)(/job/.+)$")
+
+
+def _live_get(url: str, timeout: int = 0):
+    """One GET. Returns (code, body) where code is None for anything that is not HTTP.
+
+    ⚠️ Deliberately does NOT raise. Every caller below has to tell 'gone' apart from 'we
+    could not read it', and an exception at this level makes those two look identical.
+    """
+    import urllib.error, urllib.request
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/json",
+        "User-Agent": "job-search-relay (liveness check; one read per posting)"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout or SCAN_TIMEOUT) as r:
+            return r.getcode(), r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, b""
+    except Exception as e:                                    # noqa: BLE001
+        return None, f"{type(e).__name__}: {e}".encode()
+
+
+def _live_board_exists(board_url: str, timeout: int = 0) -> bool:
+    """Does the BOARD answer at all?
+
+    🚨 A GUESSED TOKEN THAT 404s PROVES NOTHING. Deriving a Greenhouse token from a custom
+    careers hostname once reported a live Kizen requisition as dead. A 404 on the per-job
+    endpoint only means 'gone' when the board itself is real; otherwise the token is wrong
+    and the honest answer is that this URL is unaddressable.
+    """
+    code, _ = _live_get(board_url, timeout)
+    return code == 200
+
+
+def posting_liveness(url: str, board: str = "", timeout: int = 0) -> dict:
+    """Is one posting still on its board? Returns {'state', 'evidence'} and never raises.
+
+        ok             the board still serves this requisition
+        gone           404 or 410 from a board that demonstrably exists
+        blocked        403, 429, 5xx, timeout, reset. OUR problem, never theirs
+        unaddressable  no ATS could be identified, or the board token is not real
+
+    🚨 ONLY 404 AND 410 MAY SAY GONE, and only after the board is confirmed. This is the
+    same rule workday_job_detail() states and it is repeated here rather than assumed:
+    measured on three tenants in one afternoon, one returned 200 with real text, one
+    returned 404 for a requisition that had truly gone, and one returned 403 for a posting
+    that is plainly live. Reading that 403 as a vanish deletes a real opportunity on the
+    strength of a bot rule.
+
+    `board` is the scanner's own "platform|token" when the caller knows it. It is the only
+    way to resolve a Greenhouse EMBED (`careers?gh_jid=123`), which carries the job id but
+    not the token, and which no amount of URL parsing can recover.
+    """
+    u = (url or "").strip()
+    if not u:
+        return {"state": "unaddressable", "evidence": "no URL recorded"}
+    tok = board.split("|", 1)[1] if "|" in board else ""
+
+    m = _LIVE_ASHBY.search(u)
+    if m:
+        token, jid = m.group(1), m.group(2).lower()
+        # Ashby publishes a board, not a per-posting endpoint, so absence from the board IS
+        # the vanish. That makes the board read mandatory rather than a fallback.
+        code, body = _live_get(
+            f"https://api.ashbyhq.com/posting-api/job-board/{token}?includeCompensation=true", timeout)
+        if code != 200:
+            return {"state": "unaddressable" if code in (404, 410) else "blocked",
+                    "evidence": f"ashby board {token}: HTTP {code}"}
+        try:
+            jobs = (json.loads(body) or {}).get("jobs") or []
+        except Exception:                                     # noqa: BLE001
+            return {"state": "blocked", "evidence": "ashby board returned unreadable JSON"}
+        for j in jobs:
+            if str(j.get("id", "")).lower() == jid:
+                return {"state": "ok", "evidence": f"listed on the ashby board ({len(jobs)} open)"}
+        return {"state": "gone", "evidence": f"absent from the ashby board ({len(jobs)} open)"}
+
+    m = _LIVE_LEVER.search(u)
+    if m:
+        token, jid = m.group(1), m.group(2)
+        code, _ = _live_get(f"https://api.lever.co/v0/postings/{token}/{jid}?mode=json", timeout)
+        if code == 200:
+            return {"state": "ok", "evidence": "200 from the lever per-posting endpoint"}
+        if code in (404, 410):
+            if not _live_board_exists(f"https://api.lever.co/v0/postings/{token}?mode=json", timeout):
+                return {"state": "unaddressable", "evidence": f"lever board {token} does not answer"}
+            return {"state": "gone", "evidence": f"HTTP {code} from a lever board that exists"}
+        return {"state": "blocked", "evidence": f"HTTP {code}" if code else "network error"}
+
+    m = _LIVE_GH.search(u)
+    jid = m.group(2) if m else (_LIVE_GHJID.search(u).group(1) if _LIVE_GHJID.search(u) else "")
+    ghtok = m.group(1) if m else tok
+    if jid:
+        if not ghtok:
+            # An embed with no board on the row. Saying so beats guessing a token from the
+            # hostname, which is the mistake that once buried a live Kizen requisition.
+            return {"state": "unaddressable",
+                    "evidence": "greenhouse embed with no board token on the row"}
+        code, _ = _live_get(
+            f"https://boards-api.greenhouse.io/v1/boards/{ghtok}/jobs/{jid}?content=true", timeout)
+        if code == 200:
+            return {"state": "ok", "evidence": "200 from the greenhouse per-job endpoint"}
+        if code in (404, 410):
+            if not _live_board_exists(f"https://boards-api.greenhouse.io/v1/boards/{ghtok}", timeout):
+                return {"state": "unaddressable", "evidence": f"greenhouse board {ghtok} does not answer"}
+            return {"state": "gone", "evidence": f"HTTP {code} from a greenhouse board that exists"}
+        return {"state": "blocked", "evidence": f"HTTP {code}" if code else "network error"}
+
+    m = _LIVE_WD.search(u)
+    if m:
+        tenant, wd, site, path = m.groups()
+        # The cxs endpoint is the reliable read; the public page is a JavaScript shell.
+        code, body = _live_get(
+            f"https://{tenant}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}{path}", timeout)
+        if code in (404, 410):
+            return {"state": "gone", "evidence": f"HTTP {code} from the workday cxs endpoint"}
+        if code != 200:
+            return {"state": "blocked", "evidence": f"HTTP {code}" if code else "network error"}
+        try:
+            has = bool((json.loads(body) or {}).get("jobPostingInfo"))
+        except Exception:                                     # noqa: BLE001
+            has = False
+        # ⚠️ A 200 with no posting block is not an answer either way. Calling it gone would
+        # be the same mistake as calling a 403 gone.
+        return ({"state": "ok", "evidence": "200 with jobPostingInfo"} if has else
+                {"state": "blocked", "evidence": "200 with no jobPostingInfo"})
+
+    return {"state": "unaddressable", "evidence": "no supported ATS in the URL"}
+
+
+def job_verify() -> str:
+    """Re-read the postings behind LIVE applications and record whether they still exist.
+
+    ⭐ WHY IT READS FROM `application` AND NOT FROM THE QUEUE. The queue is thousands of rows
+    and most of them will never be applied to; re-probing it would spend a great many
+    requests on employers who are owed none. The expensive failure is narrow and specific: a
+    requisition dying underneath a package he has already built or already sent. That set is
+    small enough to read every day.
+
+    🚨 IT NEVER TOUCHES `application`. `posting.status` is a fact about the requisition.
+    Whether a dead req makes an application ghosted, and whether the company stays on watch,
+    is a decision with a rule of its own and a human attached to it.
+    """
+    stamp = now()
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(hours=VERIFY_STALE_HRS)).isoformat(timespec="seconds")
+    with db() as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT p.id, p.canonical_url, p.status, a.status AS app_status, a.company_raw "
+            "  FROM posting p JOIN application a ON a.posting_id = p.id "
+            # The live half of the pipeline. A rejected or passed row cannot be hurt by its
+            # requisition vanishing, so it is not worth a request against someone's board.
+            " WHERE a.status IN ('draft','submitted','interview') "
+            "   AND p.canonical_url IS NOT NULL AND trim(p.canonical_url) <> '' "
+            "   AND (p.last_verified IS NULL OR p.last_verified < ?) "
+            # NULLs first: a posting never checked is the one we know least about.
+            " ORDER BY p.last_verified IS NOT NULL, p.last_verified LIMIT ?",
+            (cutoff, VERIFY_BATCH))]
+    if not rows:
+        return "nothing due"
+
+    # The scanner's board token, which is the only way to resolve a Greenhouse embed. Matched
+    # on the URL the queue stored, so a row that never came from the queue simply has none.
+    with db() as con:
+        boards = {(dict(r)["url"] or "").split("?")[0].rstrip("/").lower(): dict(r)["board"]
+                  for r in con.execute(
+                      "SELECT url, board FROM scan_candidate WHERE url IS NOT NULL")}
+
+    tally = {"ok": 0, "gone": 0, "blocked": 0, "unaddressable": 0}
+    gone = []
+    for r in rows:
+        key = (r["canonical_url"] or "").split("?")[0].rstrip("/").lower()
+        res = posting_liveness(r["canonical_url"], boards.get(key, ""))
+        tally[res["state"]] = tally.get(res["state"], 0) + 1
+        if res["state"] == "gone":
+            gone.append(f"{(r['company_raw'] or '')[:28]} ({r['app_status']})")
+        # ⚠️ `blocked` is written as `unknown`, never left as the previous verdict. A stale
+        # 'live' that nobody re-read is indistinguishable from a fresh one, and that is the
+        # exact confusion this job exists to remove.
+        state = {"ok": "live", "gone": "dead"}.get(res["state"], "unknown")
+        with db() as con:
+            con.execute("UPDATE posting SET status=?, status_evidence=?, last_verified=? WHERE id=?",
+                        (state, res["evidence"][:400], stamp, r["id"]))
+        if VERIFY_PACE:
+            time.sleep(VERIFY_PACE)
+
+    with db() as con:
+        log_event(con, "verify", json.dumps({"checked": len(rows), **tally, "gone": gone[:20]})[:3500])
+    note = (f"checked {len(rows)}: {tally['ok']} live, {tally['gone']} dead, "
+            f"{tally['blocked']} unreadable, {tally['unaddressable']} unaddressable")
+    return note + (f"; DEAD: {', '.join(gone[:8])}" if gone else "")
+
+
 def job_table() -> list:
     """
     The one place a scheduled job is declared.
@@ -5270,7 +5489,12 @@ def job_table() -> list:
             # registered here rather than left as a loose function for the reason recorded
             # above: a job that is not in this table cannot be triggered by hand either,
             # and the runbook then documents a command that returns 404.
-            ("workday_enrich", WORKDAY_ENRICH_EVERY_MIN * 60, job_workday_enrich)]
+            ("workday_enrich", WORKDAY_ENRICH_EVERY_MIN * 60, job_workday_enrich),
+            # ⭐ Deliberately LAST and on its own hour. It reads only the postings behind live
+            # applications, so it is a small job, and it must not compete with scan for the
+            # network. A verdict taken after the overnight sweep is worth more than one taken
+            # beside it.
+            ("verify", VERIFY_EVERY_MIN * 60, job_verify)]
 
 
 async def _scheduler() -> None:
