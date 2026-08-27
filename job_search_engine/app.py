@@ -7126,9 +7126,18 @@ def _mcp_call(name: str, args: dict) -> str:
                           JOIN application a ON a.id = m.resolved_application_id
                           JOIN posting p ON p.id = a.posting_id
                           JOIN company c ON c.id = p.company_id
-                         WHERE m.classification IN ('rejection','confirmation')
-                           AND m.classification_source = 'model'
-                           AND a.status IN ('draft','submitted','interview')
+                         WHERE m.classification_source = 'model'
+                           -- 🚨 ONLY MAIL A CONTROL ACTUALLY REFUSED. The first version of
+                           -- this asked for every classified message on a live row and
+                           -- returned 20, of which 16 were confirmations on rows already
+                           -- `submitted`. job_track skips those as "already tracked, not
+                           -- ours to move", which is a no-op, not a refusal. A daily list
+                           -- that reports 16 non-problems is a list that gets ignored, and
+                           -- then the four real ones are lost inside it. That is the same
+                           -- failure as counting audit events, made a second way.
+                           AND ((m.classification = 'rejection'
+                                 AND a.status IN ('submitted','interview'))
+                             OR (m.classification = 'confirmation' AND a.status = 'draft'))
                          ORDER BY m.received_at""")
         out.append("")
         out.append(f"2b. mail a control is HOLDING for you: {len(held)}")

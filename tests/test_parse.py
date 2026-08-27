@@ -4128,6 +4128,12 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # It must say WHY they are held, or the reader tries to fix a control that is working.
     check("...and says the refusal is deliberate",
           "on purpose" in _msrc, True)
+    # 🚨 A confirmation on a row that is ALREADY `submitted` is a no-op, not a refusal.
+    # The first version listed 20 items of which 16 were exactly that, which is how a
+    # daily list stops being read and the four real ones get lost inside it.
+    check("...and lists only genuine refusals",
+          ("a.status IN ('submitted','interview')" in _msrc,
+           "a.status = 'draft'" in _msrc), (True, True))
 
     print()
     if failures:
