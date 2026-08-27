@@ -6509,7 +6509,57 @@ async def send(request: Request,
             if p.get("in_reply_to_id"):
                 con.execute("UPDATE message SET handled_at=? WHERE id=?", (now(), p["in_reply_to_id"]))
             log_event(con, "sent", f"draft {did} -> {to_addr} via {transport}", ip)
-        return {"ok": True, "draft_id": did, "message_id": mid_hdr, "transport": transport}
+
+            # ⭐ RECORD THE OUTBOUND HALF, HERE, BECAUSE THIS IS THE ONLY PLACE THAT KNOWS.
+            # The relay watches inbound mail and has never seen anything he sends, so every
+            # conversation in the database was half a conversation. Measured 2026-08-27:
+            # four replies (PermitFlow, SingleStore, and two to Redox) existed only as prose
+            # in a chat session, and two next actions still asked him to do things he had
+            # already done. Recording it by hand works and is forgotten; recording it at the
+            # moment of the send cannot be.
+            #
+            # ⚠️ IT NEVER BLOCKS THE SEND. The mail has already left. A failure to file the
+            # timeline row must not turn a delivered message into a 502, so this is wrapped
+            # and reported rather than raised.
+            recorded = None
+            try:
+                aid = None
+                # Strongest link first: the message being replied to already knows which
+                # application it belongs to, and that link was made by a human or by track.
+                if parent is not None and parent["resolved_application_id"]:
+                    aid = parent["resolved_application_id"]
+                else:
+                    # ⚠️ ONLY WHEN UNAMBIGUOUS. An alias can cover several requisitions at
+                    # one employer (he has repeat applications at Ashby, Fusion Health and
+                    # Tailscale), and filing a reply under the wrong one is worse than not
+                    # filing it: it makes a live thread look answered.
+                    m = [dict(r) for r in con.execute(
+                        "SELECT id FROM application WHERE lower(alias_used)=? "
+                        "  AND status IN ('draft','submitted','interview')",
+                        [from_alias.lower()])]
+                    aid = m[0]["id"] if len(m) == 1 else None
+                ct = con.execute("SELECT id FROM contact WHERE lower(email)=?",
+                                 [to_addr.lower()]).fetchone()
+                if aid:
+                    record_interaction(
+                        con, aid, "outbound_mail", now(),
+                        f"Sent to {to_addr}: {(p['subject'] or '')[:140]}",
+                        dedupe_key=f"draft:{did}",
+                        contact_id=(dict(ct)["id"] if ct else None),
+                        message_id=p.get("in_reply_to_id"))
+                    recorded = aid
+                else:
+                    # 🚨 Say so out loud. A silently unfiled reply is exactly the gap this
+                    # code exists to close, and "no application matched" is a fact the
+                    # caller can act on.
+                    log_event(con, "send_unfiled",
+                              f"draft {did}: no unambiguous application for {from_alias}", ip)
+            except Exception as e:                            # noqa: BLE001
+                log_event(con, "send_unfiled", f"draft {did}: {type(e).__name__}: {e}", ip)
+        return {"ok": True, "draft_id": did, "message_id": mid_hdr, "transport": transport,
+                # ⚠️ Not a boolean. The caller needs to know WHICH application it landed on,
+                # because a wrong one and a missing one need different corrections.
+                "interaction_application_id": recorded}
 
     detail = " | ".join(errors)
     with db() as con:

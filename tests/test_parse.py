@@ -4089,6 +4089,29 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("an empty timeline says so",
           "NOTHING RECORDED" in _msrc, True)
 
+    # ── /send files the outbound half ────────────────────────────────────────────────
+    # ⭐ Recording by hand works and is forgotten. Recording at the moment of the send
+    # cannot be, and /send is the only place that knows a message left.
+    _ssrc = _src_of(_appv.send)
+    check("/send records an outbound interaction",
+          ('record_interaction(' in _ssrc, '"outbound_mail"' in _ssrc), (True, True))
+    check("...keyed on the draft, so a retry cannot double it",
+          'dedupe_key=f"draft:{did}"' in _ssrc, True)
+    # 🚨 THE MAIL HAS ALREADY LEFT BY THEN. A failure to file the timeline row must never
+    # turn a delivered message into a 502, so the block is wrapped and logged.
+    check("filing never blocks a delivered send",
+          ("except Exception as e:" in _ssrc, "send_unfiled" in _ssrc), (True, True))
+    # ⚠️ An alias can cover several requisitions at one employer. Filing a reply under the
+    # wrong one is worse than not filing it: it makes a live thread look answered.
+    check("it refuses an ambiguous alias",
+          "m[0][\"id\"] if len(m) == 1 else None" in _ssrc, True)
+    check("it prefers the parent message's resolved link",
+          'parent["resolved_application_id"]' in _ssrc, True)
+    # The caller needs WHICH application, not whether. A wrong one and a missing one need
+    # different corrections.
+    check("the response names the application",
+          '"interaction_application_id"' in _ssrc, True)
+
     print()
     if failures:
         print(f"{len(failures)} FAILED")
