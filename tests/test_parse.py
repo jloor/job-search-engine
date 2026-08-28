@@ -4089,6 +4089,45 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("an empty timeline says so",
           "NOTHING RECORDED" in _msrc, True)
 
+    # ── job_track upgrades evidence without moving the row ───────────────────────────
+    # 🚨 status_source exists so "a later confirmation UPGRADES a self-report rather than
+    # being the only path to submitted", and for months the code did the opposite: the
+    # confirmation branch returned early on anything that was not a draft. Measured
+    # 2026-08-28, three applications submitted by hand were confirmed by Greenhouse within
+    # eight minutes and all three still read self_report until a human noticed.
+    _tsrc = _code_only(_appv.job_track)
+    check("job_track upgrades self_report to mail",
+          "status_source='mail'" in _tsrc, True)
+    # ⚠️ ONLY that pair. An interview row, a rejected row, or one already sourced from mail
+    # must be untouched, and the WHERE clause repeats both conditions so a second run is a
+    # no-op rather than a rewrite.
+    check("...only on submitted + self_report",
+          ("status='submitted'" in _tsrc, "status_source='self_report'" in _tsrc), (True, True))
+    # ⚠️ ONE COLUMN. Not status, not status_raw, not applied_raw. An evidence upgrade that
+    # rewrites the row's history is not an upgrade, it is a different bug.
+    # ⚠️ Match on the UPGRADE's own WHERE clause, not on "status_source='mail'". The
+    # draft -> submitted UPDATE sets that too and SHOULD also set status_raw and
+    # applied_raw, so a looser match failed against correct code and would have sent
+    # someone to fix a statement that was right.
+    _upd = [l for l in _tsrc.splitlines() if "status_source='self_report'" in l and "UPDATE" in l]
+    check("...and changes nothing else",
+          (len(_upd) == 1,
+           all("status_raw" not in l and "applied_raw" not in l for l in _upd)), (True, True))
+    # status_source is not one of the nine cells render-tracker round-trips, so this cannot
+    # wedge the renderer. It must therefore NOT release the floor either.
+    check("...so it never touches the tracker floor",
+          "_floor_release" in "\n".join(_upd), False)
+    # Reported apart from `moved`, because nothing moved.
+    check("upgrades are counted separately from moves",
+          ("upgraded" in _tsrc, "UPGRADED" in _tsrc), (True, True))
+    # 🚨 The shared lookup must NOT select status_source. This service does not own the
+    # `application` schema, and adding the column there broke the suite instantly on a
+    # database that had not had this engine's migrations applied.
+    check("the shared lookup does not assume the column",
+          "status_source" in _src_of(_appv._resolve_one), False)
+    check("...and the read is guarded where it does happen",
+          "except Exception" in _tsrc and "could not read status_source" in _tsrc, True)
+
     # ── /send files the outbound half ────────────────────────────────────────────────
     # ⭐ Recording by hand works and is forgotten. Recording at the moment of the send
     # cannot be, and /send is the only place that knows a message left.

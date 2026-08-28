@@ -2436,7 +2436,7 @@ def job_track() -> str:
             "   AND (application_ref IS NOT NULL OR resolved_application_id IS NOT NULL) "
             " ORDER BY id").fetchall()
 
-    moved, skipped = [], []
+    moved, skipped, upgraded = [], [], []
     waiting = [m for m in msgs if (m["classification_source"] or "rules") != "model"]
     if waiting:
         skipped.append(f"{len(waiting)} message(s) still on a provisional rules label, "
@@ -2492,6 +2492,60 @@ def job_track() -> str:
 
         if m["classification"] == "confirmation":
             if app_row["status"] != "draft":
+                # ⭐ UPGRADE THE EVIDENCE, DO NOT MOVE THE ROW. A row submitted BY HAND is
+                # marked status_source='self_report', which is the weakest evidence this
+                # system has: he says he clicked. When the employer's own confirmation later
+                # arrives at the per-company alias, that is the strongest evidence there is,
+                # and until now it was thrown away because this branch only ever looked for
+                # a draft.
+                #
+                # 🚨 THE INTENT WAS ALWAYS THIS AND THE CODE NEVER DID IT. status_source was
+                # added so "a later confirmation UPGRADES a self-report rather than being the
+                # only path to submitted". Measured 2026-08-28: three applications submitted
+                # by hand were confirmed by Greenhouse within eight minutes, at the aliases
+                # built to catch exactly that, and all three still read self_report until a
+                # human noticed and corrected them. Silent, cumulative, and it makes every
+                # hand-submitted row look less certain than it is.
+                #
+                # ⚠️ IT CHANGES ONE COLUMN AND NOTHING ELSE. Not status, not status_raw, not
+                # applied_raw. status_source is not one of the nine cells render-tracker.py
+                # round-trips against source_row, so this cannot wedge the renderer and needs
+                # no floor release. A branch that "upgrades evidence" must not quietly
+                # rewrite the row's history while it is there.
+                #
+                # ⚠️ ONLY submitted + self_report. An interview row, a rejected row, or one
+                # already sourced from mail is left alone. The WHERE clause repeats both
+                # conditions so a second run is a no-op rather than a rewrite.
+                # ⚠️ status_source IS READ HERE AND NOT IN THE SHARED LOOKUP. This service
+                # does NOT own the `application` schema; rollout.py imports it and the engine
+                # only reads and narrowly updates it. Adding the column to _resolve_one's
+                # SELECT broke the suite immediately with "no such column", because a
+                # database that has not had this engine's MIGRATIONS applied does not have
+                # it. Keeping the read inside this one branch, guarded, means a database
+                # without the column loses the upgrade and nothing else.
+                if app_row["status"] == "submitted":
+                    try:
+                        with db() as con:
+                            src = con.execute(
+                                "SELECT status_source FROM application WHERE id=?",
+                                (app_row["id"],)).fetchone()
+                            if src is not None and (dict(src)["status_source"] or "") == "self_report":
+                                con.execute(
+                                    "UPDATE application SET status_source='mail' "
+                                    " WHERE id=? AND status='submitted' "
+                                    "   AND status_source='self_report'",
+                                    (app_row["id"],))
+                                upgraded.append(
+                                    f"app {app_row['id']} ({app_row['company_raw']}) "
+                                    f"self_report -> mail on msg {m['id']}")
+                                audit("track_source_upgraded",
+                                      f"application {app_row['id']} "
+                                      f"({app_row['company_raw']}) was submitted by hand and "
+                                      f"is now confirmed by mail: message {m['id']} at "
+                                      f"{m['to_alias']}. Status unchanged.")
+                    except Exception as e:                    # noqa: BLE001
+                        skipped.append(f"msg {m['id']}: could not read status_source "
+                                       f"({type(e).__name__}); evidence not upgraded")
                 continue                          # already tracked, or not ours to move
             # source_row is the byte-for-byte copy of the markdown this row was imported
             # from, and render-tracker.py refuses to write unless every row still renders
@@ -2583,6 +2637,10 @@ def job_track() -> str:
     if not moved and not skipped:
         return "nothing to track"
     note = f"moved {len(moved)}" + ("; " + "; ".join(moved) if moved else "")
+    # ⭐ Reported separately from `moved`, because nothing moved. Folding an evidence upgrade
+    # into a count of status changes would overstate what the job did.
+    if upgraded:
+        note += f"; UPGRADED {len(upgraded)}: " + "; ".join(upgraded)
     if skipped:
         note += f"; AMBIGUOUS {len(skipped)}: " + "; ".join(skipped)
     return note
