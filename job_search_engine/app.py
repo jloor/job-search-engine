@@ -5719,6 +5719,10 @@ HARVEST_MIN_SCORE  = int(os.environ.get("HARVEST_MIN_SCORE", "80"))
 
 def _harvest_call(urls: list) -> dict:
     """POST to the Cloud Run harvester. Never raises; a transport failure is data."""
+    # 📌 Imported inside the function, matching every other outbound caller in this module.
+    # `urllib` is NOT imported at module scope: line 20 imports json, os, re and others by
+    # name, so a module-level `urllib.request.Request(...)` raises NameError at RUN time.
+    import urllib.error, urllib.request
     body = json.dumps({"urls": urls}).encode()
     req = urllib.request.Request(
         f"{HARVESTER_URL}/harvest", data=body,
@@ -5745,7 +5749,7 @@ def _harvest_store(con, candidate_id, res: dict) -> str:
         " read_url=excluded.read_url, at=excluded.at, ats=excluded.ats, tier=excluded.tier,"
         " n_fields=excluded.n_fields, n_written=excluded.n_written, gates=excluded.gates,"
         " fields_json=excluded.fields_json, suspect=excluded.suspect, error=excluded.error",
-        (candidate_id, url, res.get("read_url"), _now(), res.get("ats"), tier,
+        (candidate_id, url, res.get("read_url"), now(), res.get("ats"), tier,
          n_fields, n_written, json.dumps(gates), json.dumps(lists)[:200000],
          res.get("suspect"), res.get("error")))
     if res.get("error"):
