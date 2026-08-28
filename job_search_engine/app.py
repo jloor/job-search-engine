@@ -5779,8 +5779,10 @@ def job_harvest() -> str:
     """
     if not HARVESTER_URL or not HARVEST_TOKEN:
         return "harvest: SKIPPED, HARVESTER_URL or HARVEST_TOKEN is unset"
-    cutoff = (datetime.datetime.now(datetime.timezone.utc)
-              - datetime.timedelta(days=HARVEST_STALE_DAYS)).isoformat()
+    # ⚠️ `from datetime import datetime, timedelta, timezone` at the top of this module, so
+    # `datetime` here is the CLASS. Writing datetime.datetime.now() raised AttributeError at
+    # RUN time, not import time, and no test exercised job_harvest so the suite stayed green.
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=HARVEST_STALE_DAYS)).isoformat()
     with db() as con:
         rows = [dict(r) for r in con.execute(
             "SELECT c.id, c.url FROM scan_candidate c "

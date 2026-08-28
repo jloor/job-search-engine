@@ -4181,6 +4181,18 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # browser read it found zero written answers and called 47 of 49 real harvests tier B,
     # two of which each demand an essay. ease-rank agreed, because ease-rank only ever reads
     # the API and never hit it. Agreement is not correctness.
+    # 🚨 job_harvest MUST BE CALLED, NOT JUST DEFINED. Its first version raised
+    # AttributeError on datetime at RUN time and the suite stayed green because nothing ever
+    # invoked it. This calls it with no harvester configured, which exercises every line
+    # before the network and must return the SKIPPED string rather than raise.
+    _hu, _ht = app.HARVESTER_URL, app.HARVEST_TOKEN
+    app.HARVESTER_URL, app.HARVEST_TOKEN = "", ""
+    try:
+        check("job_harvest skips cleanly when unconfigured",
+              app.job_harvest().startswith("harvest: SKIPPED"), True)
+    finally:
+        app.HARVESTER_URL, app.HARVEST_TOKEN = _hu, _ht
+
     print("\nharvest_tier, both input shapes:")
     _browser_c = {"files": [{"label": "Resume"}],
                   "text": [{"label": "Legal Name", "type": "text"}],
