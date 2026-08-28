@@ -576,6 +576,19 @@ MIGRATIONS = [
      "id INTEGER PRIMARY KEY, application_id INTEGER REFERENCES application(id), "
      "contact_id INTEGER REFERENCES contact(id), message_id INTEGER, "
      "kind TEXT NOT NULL, at TEXT NOT NULL, summary TEXT, artifacts TEXT)"),
+    # 🚨 THE RENDERED FORM, WHICH THE ATS API CANNOT GIVE US. Measured 2026-08-28 over 36
+    # archived form pairs, the board API omits a median of 29% and up to 68% of a form's
+    # fields, and the omissions are GATE-SHAPED: required Country and Location are among
+    # them. So triage could not see a knockout until a human opened a browser. This is where
+    # the browser's answer lives.
+    # ⚠️ ONE ROW PER URL, REPLACED ON RE-READ. A form changes; the freshest read is the only
+    # useful one, and `at` is what makes staleness queryable.
+    ("CREATE TABLE IF NOT EXISTS harvest ("
+     "id INTEGER PRIMARY KEY, candidate_id INTEGER, url TEXT NOT NULL, read_url TEXT, "
+     "at TEXT NOT NULL, ats TEXT, tier TEXT, n_fields INTEGER, n_written INTEGER, "
+     "gates TEXT, fields_json TEXT, suspect TEXT, error TEXT)"),
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_harvest_url ON harvest(url)",
+    "CREATE INDEX IF NOT EXISTS idx_harvest_candidate ON harvest(candidate_id)",
     ("CREATE TABLE IF NOT EXISTS backlog_item ("
      "id INTEGER PRIMARY KEY, closes_claim TEXT NOT NULL, build TEXT NOT NULL, "
      "earns_claim TEXT NOT NULL, does_not_earn TEXT NOT NULL, tier INTEGER, "
@@ -5628,6 +5641,175 @@ def job_interactions() -> str:
     return f"recorded {made} inbound interaction(s) from {len(msgs)} resolved message(s)"
 
 
+
+# ── the ease tier ────────────────────────────────────────────────────────────────────────
+# 🚨 THE ENGINE OWNS THIS RULE NOW, AND ease-rank DEFERS TO IT. The letter used to be computed
+# only on the laptop, so it could not be queried, sorted, or used by the nightly pipeline. It
+# was moved here rather than copied here: two implementations of the same letter is the drift
+# that has cost this project repeatedly.
+#
+# ⚠️ NOTHING PERSONAL CAME WITH IT. These three patterns describe the SHAPE of a form question,
+# not a preference. The title-level exclusions (Pacific/Mountain hours, non-English roles) stay
+# in the private repo, and they never affected the letter anyway: the tier is a function of the
+# written-answer count and the mechanical/gate split, and a title gate only adds a warning line.
+#
+#     A  nothing beyond identity and work authorisation. Resume plus clicks.
+#     B  mechanical only: salary, start date, relocation. All computable or stored.
+#     C  exactly one written answer.
+#     D  two or more written answers.
+_TIER_BORING = re.compile("^(first |last |full |preferred )?(legal )?name$|^email|^phone|^resume|^cv$|^cover letter$|^linkedin|^website|^portfolio|^location$|^address|^city$|^pronouns$|^other$|profile url$|^how did you (first )?hear|referred|^gender|^race|^veteran|^disability|^ethnicity", re.I)
+_TIER_MECHANICAL = re.compile("legally authoriz|work authoriz|sponsor|visa|18 years|age\\?|residing in|located within|currently authorized|privacy notice|country of residence|non-contractor|citizen|acknowledge|salary|compensation expectation|desired base|start date|notice period|eastern or pacific|are you open to|have you previously", re.I)
+_TIER_GATE = re.compile("relocat|in.person|in office|onsite|on-site|\\b\\w+ hubs?\\b|within \\d+ ?miles|days ?/ ?week|days a week|metropolitan area|willing to travel|travel \\d|hybrid|\\bbased (?:out of|in|near)\\b|commut|select locations?|open to candidates in|where (?:are|do) you (?:currently )?(?:live|located|reside)|\\b(?:NYC|SF|[A-Z][a-z]+, ?(?:AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC))\\b", re.I)
+_TIER_LONG = ("LongText", "textarea", "long_text")
+
+
+def harvest_tier(fields: dict) -> tuple:
+    """(tier, n_written, gates) from a harvested form. `fields` is the harvester's list groups.
+
+    ⚠️ AN INTERVIEW FORMAT IS NOT A JOB CONDITION. Sonatype asks "Our interview process requires
+    an in-person, face to face interview. Are you willing to meet in-person?" on a role whose
+    stated location is US - Remote. Flying somewhere once to interview says nothing about where
+    the job is done, so `interview` is excluded from the gate match.
+    """
+    # 🚨 A WRITTEN ANSWER IS IDENTIFIED BY ITS GROUP, NOT BY A `type` FIELD. The browser read
+    # groups fields by kind and its `textareas` entries carry only label/selector/required, with
+    # NO type key at all. The original rule tested q["type"] because it was written against the
+    # ATS API shape, which does set it. Fed a browser read it found zero written answers and
+    # called every form tier B. Measured 2026-08-28: 47 of 49 real harvests came back B,
+    # including Socure and Yugabyte, which each demand one essay. Both readers agreed, because
+    # both were blind the same way, which is why agreement is not correctness.
+    qs, written = [], []
+    for group, items in fields.items():
+        if not isinstance(items, list):
+            continue
+        for q in items:
+            if not isinstance(q, dict):
+                continue
+            if _TIER_BORING.match((q.get("label") or "").strip()):
+                continue
+            qs.append(q)
+            if (group == "textareas" or q.get("type") in _TIER_LONG) \
+                    and not _TIER_MECHANICAL.search(q.get("label") or ""):
+                written.append(q)
+    lab = lambda q: q.get("label") or ""
+    gates = sorted({lab(q) for q in qs if _TIER_GATE.search(lab(q))
+                    and not re.search(r"interview", lab(q), re.I)})
+    other = [q for q in qs if q not in written and not _TIER_MECHANICAL.search(lab(q))
+             and not _TIER_GATE.search(lab(q))]
+    n = len(written)
+    if n == 0 and not other:
+        tier = "A" if not any(_TIER_MECHANICAL.search(lab(q)) for q in qs) else "B"
+    elif n == 0:
+        tier = "B"
+    elif n == 1:
+        tier = "C"
+    else:
+        tier = "D"
+    return tier, n, gates
+
+
+HARVESTER_URL      = os.environ.get("HARVESTER_URL", "").rstrip("/")
+HARVEST_TOKEN      = os.environ.get("HARVEST_TOKEN", "")
+HARVEST_EVERY_MIN  = int(os.environ.get("HARVEST_EVERY_MIN", "0"))     # 0 = manual only
+HARVEST_BATCH      = int(os.environ.get("HARVEST_BATCH", "20"))
+HARVEST_STALE_DAYS = int(os.environ.get("HARVEST_STALE_DAYS", "30"))
+HARVEST_MIN_SCORE  = int(os.environ.get("HARVEST_MIN_SCORE", "80"))
+
+
+
+def _harvest_call(urls: list) -> dict:
+    """POST to the Cloud Run harvester. Never raises; a transport failure is data."""
+    body = json.dumps({"urls": urls}).encode()
+    req = urllib.request.Request(
+        f"{HARVESTER_URL}/harvest", data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {HARVEST_TOKEN}"})
+    try:
+        with urllib.request.urlopen(req, timeout=max(120, 20 * len(urls))) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:                                        # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _harvest_store(con, candidate_id, res: dict) -> str:
+    """One result -> one row. Returns a short verdict string for the job summary."""
+    url = res.get("url") or ""
+    lists = {k: v for k, v in res.items() if isinstance(v, list)}
+    n_fields = sum(len(v) for v in lists.values())
+    tier, n_written, gates = harvest_tier(lists)
+    con.execute(
+        "INSERT INTO harvest (candidate_id,url,read_url,at,ats,tier,n_fields,n_written,gates,"
+        "                     fields_json,suspect,error) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(url) DO UPDATE SET candidate_id=excluded.candidate_id,"
+        " read_url=excluded.read_url, at=excluded.at, ats=excluded.ats, tier=excluded.tier,"
+        " n_fields=excluded.n_fields, n_written=excluded.n_written, gates=excluded.gates,"
+        " fields_json=excluded.fields_json, suspect=excluded.suspect, error=excluded.error",
+        (candidate_id, url, res.get("read_url"), _now(), res.get("ats"), tier,
+         n_fields, n_written, json.dumps(gates), json.dumps(lists)[:200000],
+         res.get("suspect"), res.get("error")))
+    if res.get("error"):
+        return "error"
+    # 🚨 A ZERO-FIELD READ IS NOT A FORM WITH NO QUESTIONS. The harvester flags it and the
+    # flag is stored, because a batch that recorded hundreds of empty forms as fact would be
+    # worse than not running at all.
+    if res.get("suspect") or n_fields == 0:
+        return "suspect"
+    return f"tier{tier}"
+
+
+def job_harvest() -> str:
+    """Render the application FORM for candidates the ATS API cannot describe completely.
+
+    🚨 WHY THIS IS NOT OPTIONAL FOR TRIAGE. The board API returns JOB-level questions only.
+    Board-level fields, education blocks and compliance questions never appear in it, and the
+    omissions are gate-shaped. Measured across 36 archived pairs: a median 29% and up to 68%
+    of a form's fields are invisible to the API. A candidate could therefore pass every gate
+    this service knows about and still be knocked out by a required Country field, or by
+    "do you live within 45 miles of a talent hub", which is exactly what Socure asks on a
+    posting labelled Remote - USA.
+
+    ⭐ THE BROWSER LIVES ELSEWHERE ON PURPOSE. This image is python:3.12-slim with no node and
+    no chromium, and it should stay that way. The harvester is a Cloud Run service that scales
+    to zero, and this job is its only scheduled caller.
+
+    ⚠️ IT NEVER DECIDES LIVENESS. An error or an empty read is recorded as an error or as
+    `suspect`, never as a dead requisition. A throttled host and a closed req look identical
+    from one failed call, and `verify` is the job that owns that question.
+    """
+    if not HARVESTER_URL or not HARVEST_TOKEN:
+        return "harvest: SKIPPED, HARVESTER_URL or HARVEST_TOKEN is unset"
+    cutoff = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(days=HARVEST_STALE_DAYS)).isoformat()
+    with db() as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT c.id, c.url FROM scan_candidate c "
+            "  LEFT JOIN harvest h ON h.url = c.url "
+            " WHERE c.triaged=1 AND c.verdict='strong' "
+            "   AND CAST(c.score AS INTEGER) >= ? "
+            "   AND c.url LIKE 'http%' "
+            "   AND (c.remote_verdict IS NULL OR c.remote_verdict IN "
+            "        ('fully_remote','remote_in_metro','hybrid_commutable','remote_with_residency')) "
+            "   AND (h.id IS NULL OR (h.at < ? AND h.error IS NULL)) "
+            " ORDER BY CAST(c.score AS INTEGER) DESC LIMIT ?",
+            (HARVEST_MIN_SCORE, cutoff, HARVEST_BATCH))]
+    if not rows:
+        return "harvest: nothing to read"
+    by_url = {r["url"]: r["id"] for r in rows}
+    out = _harvest_call([r["url"] for r in rows])
+    if out.get("error"):
+        return f"harvest: CALL FAILED, {out['error']}"
+    tally = {}
+    with db() as con:
+        for res in out.get("results", []):
+            v = _harvest_store(con, by_url.get(res.get("url")), res)
+            k = v.split("(")[0]
+            tally[k] = tally.get(k, 0) + 1
+    audit("harvest_run", f"{len(rows)} requested, {tally}")
+    return (f"harvest: {len(rows)} read in {out.get('elapsed_ms', 0)}ms, "
+            + ", ".join(f"{k} {v}" for k, v in sorted(tally.items())))
+
+
 def job_table() -> list:
     """
     The one place a scheduled job is declared.
@@ -5661,7 +5843,12 @@ def job_table() -> list:
             ("verify", VERIFY_EVERY_MIN * 60, job_verify),
             # Cheap and database-only. It reads resolved mail and writes timeline rows; it
             # makes no network call and cannot see outbound mail, which arrives by hand.
-            ("interactions", INTERACTIONS_EVERY_MIN * 60, job_interactions)]
+            ("interactions", INTERACTIONS_EVERY_MIN * 60, job_interactions),
+            # ⭐ AFTER triage and remote_check, never beside them. It only reads forms for rows
+            # that already passed the cheap gates, so those must have run first, and it costs a
+            # browser per row. Default interval 0 = MANUAL ONLY until the backfill is done and
+            # the nightly volume is known to be small (measured: 1-14 new strong per night).
+            ("harvest", HARVEST_EVERY_MIN * 60, job_harvest)]
 
 
 async def _scheduler() -> None:
@@ -6726,6 +6913,20 @@ MCP_TOOLS = [
                     "the verbatim status, next action, notes, contact and link.",
      "inputSchema": {"type": "object", "properties": {"company": {"type": "string"}},
                      "required": ["company"]}},
+    # ⚠️ THE ONE TOOL HERE THAT IS NOT PURELY READ-ONLY, AND THE LIMIT IS DELIBERATE. It calls
+    # the harvester and caches the answer in `harvest`. It cannot change an application's
+    # status, clear needs_human, send mail, or touch any pipeline state. Reading a public job
+    # form is what a human does by opening the page; this is that, on demand, from a session
+    # that has no browser.
+    {"name": "harvest_form",
+     "description": "Render a job application FORM in a real browser and return every field, "
+                    "including the gate questions the ATS API hides. Use when a posting's fit "
+                    "or knockouts cannot be judged from the job description alone. Give a "
+                    "posting URL, or a company name to use the newest strong scan candidate.",
+     "inputSchema": {"type": "object", "properties": {
+         "url": {"type": "string", "description": "the posting or apply URL"},
+         "company": {"type": "string", "description": "instead of url: newest strong candidate at this company"},
+         "refresh": {"type": "boolean", "description": "re-read even if a recent harvest exists"}}}},
     {"name": "search_vault",
      "description": "Case-insensitive search across the vault markdown (Career Inventory, "
                     "Answer Bank, Contacts, Project Backlog). Returns matching lines with context.",
@@ -6804,6 +7005,35 @@ def _norm_key(s: str) -> str:
     t = re.sub(r"\b(sr|senior|jr|junior|staff|lead|principal|associate)\b", " ", t)
     return re.sub(r"[^a-z0-9]+", "", t)
 
+
+
+def _harvest_render(row, cached: bool) -> str:
+    """One harvest, as a human reads it: the GATES first, because they are what reject him."""
+    out = [f"{row['url']}",
+           f"  read {row['at'][:16]}{' (cached; pass refresh:true to re-read)' if cached else ''}"
+           f"   TIER {row['tier'] or '?'}   ats={row['ats'] or '?'}"
+           f"   fields={row['n_fields']}   written answers={row['n_written']}"]
+    if row["error"]:
+        out.append(f"  🚨 ERROR: {row['error']}")
+        return "\n".join(out)
+    if row["suspect"]:
+        out.append(f"  🚨 SUSPECT: {row['suspect']}")
+        out.append("  ⚠️ Do NOT read this as a form with no questions. It usually means the URL "
+                   "is a careers page rather than the form, or the requisition is gone.")
+        return "\n".join(out)
+    gates = json.loads(row["gates"] or "[]")
+    if gates:
+        out.append("  🚨 GATE-SHAPED QUESTIONS. Read these before anything else:")
+        out += [f"      {g}" for g in gates]
+    else:
+        out.append("  no gate-shaped question matched. ⚠️ That is not proof there is none; "
+                   "it is what the pattern found.")
+    fields = json.loads(row["fields_json"] or "{}")
+    if fields.get("textareas"):
+        out.append("  written answers required:")
+        out += [f"      {q.get('label')}" for q in fields["textareas"]]
+    out.append("  field groups: " + ", ".join(f"{k} {len(v)}" for k, v in sorted(fields.items()) if v))
+    return "\n".join(out)
 
 def _mcp_call(name: str, args: dict) -> str:
     if name == "pipeline_status":
@@ -7015,6 +7245,36 @@ def _mcp_call(name: str, args: dict) -> str:
                 out.append(f"  ⚠️ {r['note'][:200]}")
             out.append("")
         return "\n".join(out)
+
+    if name == "harvest_form":
+        url, company = (args.get("url") or "").strip(), (args.get("company") or "").strip()
+        if not url and not company:
+            return "Give a url or a company."
+        cand_id = None
+        if not url:
+            r = _rows("SELECT id, url, title, company FROM scan_candidate "
+                      " WHERE lower(company) LIKE ? AND url LIKE 'http%' "
+                      " ORDER BY CAST(score AS INTEGER) DESC LIMIT 1", (f"%{company.lower()}%",))
+            if not r:
+                return f"No scan candidate with a URL matches {company!r}."
+            cand_id, url = r[0]["id"], r[0]["url"]
+        else:
+            r = _rows("SELECT id FROM scan_candidate WHERE url=? LIMIT 1", (url,))
+            cand_id = r[0]["id"] if r else None
+        if not args.get("refresh"):
+            cached = _rows("SELECT * FROM harvest WHERE url=?", (url,))
+            if cached and not cached[0]["error"]:
+                return _harvest_render(cached[0], cached=True)
+        if not HARVESTER_URL or not HARVEST_TOKEN:
+            return "The harvester is not configured (HARVESTER_URL / HARVEST_TOKEN unset)."
+        out = _harvest_call([url])
+        if out.get("error"):
+            return f"Harvester call failed: {out['error']}"
+        res = (out.get("results") or [{}])[0]
+        with db() as con:
+            _harvest_store(con, cand_id, res)
+        row = _rows("SELECT * FROM harvest WHERE url=?", (url,))
+        return _harvest_render(row[0], cached=False) if row else "Harvested but not stored."
 
     if name == "search_vault":
         try:

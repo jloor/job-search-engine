@@ -4174,6 +4174,45 @@ On Wed, Aug 12, 2026 the candidate wrote:
           ("a.status IN ('submitted','interview')" in _msrc,
            "a.status = 'draft'" in _msrc), (True, True))
 
+    # ── the ease tier ────────────────────────────────────────────────────────────────
+    # 🚨 THIS PINS A BUG THAT NEARLY SHIPPED. The rule identified a written answer by
+    # q["type"], which the ATS API sets and the BROWSER READ DOES NOT: the browser groups
+    # fields by kind and its textareas entries carry only label/selector/required. Fed a
+    # browser read it found zero written answers and called 47 of 49 real harvests tier B,
+    # two of which each demand an essay. ease-rank agreed, because ease-rank only ever reads
+    # the API and never hit it. Agreement is not correctness.
+    print("\nharvest_tier, both input shapes:")
+    _browser_c = {"files": [{"label": "Resume"}],
+                  "text": [{"label": "Legal Name", "type": "text"}],
+                  "textareas": [{"label": "Why are you interested in this job at Socure?",
+                                 "required": True}]}
+    _api_c = {"questions": [{"label": "Resume", "type": "input_file"},
+                            {"label": "Legal Name", "type": "input_text"},
+                            {"label": "Why are you interested in this job at Socure?",
+                             "type": "textarea"}]}
+    check("browser read: one essay is tier C", app.harvest_tier(_browser_c)[:2], ("C", 1))
+    check("API read: the same form is also tier C", app.harvest_tier(_api_c)[:2], ("C", 1))
+    check("two essays is tier D",
+          app.harvest_tier({"textareas": [{"label": "Why us?"},
+                                          {"label": "Describe a hard ticket."}]})[0], "D")
+    check("identity only is tier A",
+          app.harvest_tier({"text": [{"label": "First Name", "type": "text"},
+                                     {"label": "Email", "type": "text"}],
+                            "files": [{"label": "Resume"}]})[0], "A")
+    check("mechanical only is tier B",
+          app.harvest_tier({"text": [{"label": "First Name", "type": "text"}],
+                            "dropdowns": [{"label": "Are you legally authorized to work?",
+                                           "type": "select"}]})[0], "B")
+    # ⚠️ An interview FORMAT is not a job condition. Sonatype asks about meeting in person on
+    # a role whose stated location is US - Remote.
+    _g2 = app.harvest_tier({"yesno": [
+        {"label": "Our interview process requires an in-person interview. Are you willing?"},
+        {"label": "Do you live within 45 miles of one of our talent hubs?"}]})[2]
+    check("gate found: the talent-hub question", any("talent hub" in x for x in _g2), True)
+    check("gate NOT raised by an interview format",
+          any("interview" in x for x in _g2), False)
+
+
     print()
     if failures:
         print(f"{len(failures)} FAILED")
