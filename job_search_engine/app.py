@@ -5799,8 +5799,23 @@ def job_harvest() -> str:
             "   AND (h.id IS NULL OR (h.at < ? AND h.error IS NULL)) "
             " ORDER BY CAST(c.score AS INTEGER) DESC LIMIT ?",
             (HARVEST_MIN_SCORE, cutoff, HARVEST_BATCH))]
+    # 🚨 ONE BAD URL MUST NOT BLOCK THE BATCH BEHIND IT. The harvester validates every URL
+    # and rejects the WHOLE request, so a single http:// row returned 400 for all 25 and the
+    # backfill stalled permanently: the same 25 were selected on every run, and the same one
+    # row poisoned them. Measured 2026-08-28, four consecutive batches moved nothing.
+    # ⚠️ The skipped row is RECORDED as an error, not silently dropped, or it would be
+    # reselected forever and the stall would just be quieter.
+    skipped = [r for r in rows if not (r["url"] or "").startswith("https://")]
+    rows = [r for r in rows if (r["url"] or "").startswith("https://")]
+    if skipped:
+        with db() as con:
+            for r in skipped:
+                con.execute(
+                    "INSERT INTO harvest (candidate_id,url,at,error) VALUES (?,?,?,?) "
+                    "ON CONFLICT(url) DO UPDATE SET at=excluded.at, error=excluded.error",
+                    (r["id"], r["url"], now(), "not https; the harvester refuses it"))
     if not rows:
-        return "harvest: nothing to read"
+        return f"harvest: nothing to read ({len(skipped)} skipped as non-https)"
     by_url = {r["url"]: r["id"] for r in rows}
     out = _harvest_call([r["url"] for r in rows])
     if out.get("error"):
@@ -5811,9 +5826,10 @@ def job_harvest() -> str:
             v = _harvest_store(con, by_url.get(res.get("url")), res)
             k = v.split("(")[0]
             tally[k] = tally.get(k, 0) + 1
-    audit("harvest_run", f"{len(rows)} requested, {tally}")
+    audit("harvest_run", f"{len(rows)} requested, {tally}, {len(skipped)} skipped")
     return (f"harvest: {len(rows)} read in {out.get('elapsed_ms', 0)}ms, "
-            + ", ".join(f"{k} {v}" for k, v in sorted(tally.items())))
+            + ", ".join(f"{k} {v}" for k, v in sorted(tally.items()))
+            + (f", {len(skipped)} skipped as non-https" if skipped else ""))
 
 
 def job_table() -> list:
