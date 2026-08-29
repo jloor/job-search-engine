@@ -4292,6 +4292,35 @@ On Wed, Aug 12, 2026 the candidate wrote:
           "unscored" in app._inbox_subject(dict(_s, score=None), None), True)
     check("a form gate is flagged in the subject",
           "+gate" in app._inbox_subject(_s, {"gates": json.dumps(["4 days onsite"])}), True)
+    # 🚨 PRIOR HISTORY EXISTS BECAUSE OF CEDAR. On 2026-08-29 the single best-ranked new remote
+    # posting, $165,750, was the SAME requisition Cedar had rejected eight days earlier, and it
+    # was one command from being packaged again. A verdict saying WORTH APPLYING TO about a job
+    # he was already rejected from is confidently wrong in the direction that wastes a day.
+    _hist_rej = {"_history": {"same_url": [{"id": 145, "status": "rejected",
+                                            "status_raw": "REJECTED 2026-08-21", "role_raw": "SA"}],
+                              "same_company": []}, "gates": "[]"}
+    _cd = dict(_s, company="Cedar", title="Sr. Solutions Architect")
+    check("a rejected requisition is flagged in the SUBJECT",
+          app._inbox_subject(_cd, _hist_rej).startswith("ALREADY REJECTED"), True)
+    check("...and named in the body",
+          "ALREADY APPLIED TO THIS EXACT POSTING" in app._inbox_render(_cd, _hist_rej), True)
+    # ⚠️ URL matching alone is not enough: Quantifind served one role from two requisition ids.
+    _hist_co = {"_history": {"same_url": [], "same_company": [
+        {"id": 236, "status": "submitted", "role_raw": "Solution Engineer"}]}, "gates": "[]"}
+    check("another application at the same company is flagged",
+          app._inbox_subject(_s, _hist_co).startswith("APPLIED HERE BEFORE"), True)
+    check("a genuinely new company gets no prefix",
+          app._inbox_subject(_s, {"_history": {"same_url": [], "same_company": []},
+                                  "gates": "[]"}).startswith("Vesta"), True)
+    # 📌 A forward should be permanent: the board joins the nightly scan.
+    # 📌 A forward should be permanent: the board joins the nightly scan so every FUTURE role
+    # at that company arrives on its own. Vesta was not among the 2,937 enabled boards, so the
+    # only reason that posting was ever seen is that he found it himself.
+    # ⚠️ Tested on the path that touches NO database: a non-ATS url must return None before any
+    # write, so a stray link in a forwarded mail can never insert a junk board.
+    check("a non-ATS url registers nothing",
+          app.inbox_register_board("https://example.com/careers"), None)
+    check("an empty url registers nothing", app.inbox_register_board(""), None)
     check("the reply address is NOT a parameter",
           "to_addr" not in app.job_inbox_url.__code__.co_varnames
           and "INBOX_REPLY_TO" in app.job_inbox_url.__code__.co_names, True)

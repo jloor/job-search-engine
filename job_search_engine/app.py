@@ -6141,6 +6141,101 @@ def inbox_urls(text: str) -> list:
 
 
 
+
+
+def inbox_register_board(url: str) -> str | None:
+    """Add this posting's board to the nightly scan if it is not already there.
+
+    ⭐ WHY A FORWARD SHOULD BE PERMANENT. Vesta was not among the 2,937 enabled boards, so the
+    only reason that posting was ever seen is that he found it himself and mailed it in. Adding
+    the board means every FUTURE role there arrives on its own. One forward, and the company is
+    covered from then on.
+
+    ⚠️ ENABLED, not merely recorded. The table holds 15,924 boards of which 2,937 are enabled;
+    inserting a disabled row would look like success and change nothing.
+    📌 Returns the board key when it added one, None when it was already there or the platform
+    has no per-board sweep.
+    """
+    api = None
+    m = re.search(r"(?:job-boards|boards)(?:\.eu)?\.greenhouse\.io/([^/?#]+)/", url or "")
+    if m:
+        plat, tok = "greenhouse", m.group(1)
+        api = f"https://boards-api.greenhouse.io/v1/boards/{tok}/jobs?content=true"
+    if not api:
+        m = re.search(r"jobs\.ashbyhq\.com/([^/?#]+)/", url or "")
+        if m:
+            plat, tok = "ashby", m.group(1)
+            api = f"https://api.ashbyhq.com/posting-api/job-board/{tok}?includeCompensation=true"
+    if not api:
+        m = re.search(r"jobs\.lever\.co/([^/?#]+)/", url or "")
+        if m:
+            plat, tok = "lever", m.group(1)
+            api = f"https://api.lever.co/v0/postings/{tok}?mode=json"
+    if not api:
+        m = _WD_URL.match(url or "")
+        if m:
+            tn, wd, site, _ = m.groups()
+            plat, tok = "workday", tn
+            api = f"https://{tn}.{wd}.myworkdayjobs.com/wday/cxs/{tn}/{site}/jobs"
+    if not api:
+        return None
+    with db() as con:
+        row = con.execute("SELECT id, enabled FROM scan_board WHERE platform=? AND token=?",
+                          (plat, tok)).fetchone()
+        if row:
+            # ⚠️ A board that exists but is DISABLED is the same blind spot as one that is
+            # missing, so enable it rather than reporting "already there".
+            if not dict(row)["enabled"]:
+                con.execute("UPDATE scan_board SET enabled=1, note=? WHERE id=?",
+                            ("enabled by inbox_url: he mailed in a posting from it",
+                             dict(row)["id"]))
+                return f"{plat}|{tok} (was present but disabled)"
+            return None
+        con.execute("INSERT INTO scan_board (platform,token,api_url,source,added_at,enabled,note) "
+                    "VALUES (?,?,?,?,?,1,?)",
+                    (plat, tok, api, "inbox_url", now(),
+                     "added because he mailed in a posting from this board"))
+    return f"{plat}|{tok}"
+
+def inbox_prior_history(url: str, company: str) -> dict:
+    """What he has already done at this URL and this company. {} when nothing.
+
+    🚨 THIS EXISTS BECAUSE OF CEDAR. On 2026-08-29 a role ranked as the single best new remote
+    posting at $165,750 was the SAME REQUISITION Cedar had rejected eight days earlier, and it
+    was one command from being packaged again. It was caught only because a human opened the
+    URL. A verdict mail that says WORTH APPLYING TO about a job he was already rejected from
+    is worse than useless: it is confidently wrong in the direction that wastes a day.
+
+    ⚠️ MATCHED ON URL **AND** ON COMPANY NAME, because the URL alone is not enough. Quantifind
+    served the same role from two different requisition ids, and the queue stored "Careportalinc"
+    (the Greenhouse BOARD TOKEN) where the company was Cedar. Company matching is containment
+    in both directions, never equality, for the same reason the auto-applier reconciliation
+    needs it: company_raw carries markdown and emoji.
+    """
+    norm = lambda s: re.sub(r"[^a-z0-9]", "", (s or "").lower())
+    cn = norm(company)
+    out = {"same_url": [], "same_company": []}
+    with db() as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT a.id, a.status, a.status_raw, a.submitted_at, a.company_raw, a.role_raw, "
+            "       p.canonical_url "
+            "  FROM application a LEFT JOIN posting p ON p.id = a.posting_id")]
+        autos = [dict(r) for r in con.execute(
+            "SELECT id, company_raw, role_raw, url FROM auto_application")]
+    for r in rows:
+        if (r.get("canonical_url") or "").lower() == (url or "").lower():
+            out["same_url"].append(r)
+        elif cn and (cn in norm(r.get("company_raw")) or norm(r.get("company_raw")) in cn):
+            out["same_company"].append(r)
+    for r in autos:
+        if (r.get("url") or "").lower() == (url or "").lower():
+            out["same_url"].append({**r, "status": "auto-applied", "status_raw":
+                                    "submitted by the auto-applier", "id": f"AUTO {r['id']}"})
+        elif cn and (cn in norm(r.get("company_raw")) or norm(r.get("company_raw")) in cn):
+            out["same_company"].append({**r, "status": "auto-applied", "status_raw":
+                                        "submitted by the auto-applier", "id": f"AUTO {r['id']}"})
+    return out
+
 def _inbox_subject(cand: dict, harvest: dict | None) -> str:
     """The verdict, readable in an inbox list without opening anything.
 
@@ -6175,12 +6270,22 @@ def _inbox_subject(cand: dict, harvest: dict | None) -> str:
     # still be understood. A fixed 38-character budget produced 92-character subjects, and a
     # client that cuts a list view at ~70 would then hide the BAND and the SCORE, which are
     # the two fields the subject exists to show.
+    # 🚨 PRIOR HISTORY GOES FIRST, ahead of everything he asked for, because it is the one
+    # fact that changes what he DOES. A subject reading "Cedar - Sr. Solutions Architect -
+    # Remote - $165-195k - fit 91" is an invitation to apply to a job that already rejected him.
+    prefix = ""
+    hist = (harvest or {}).get("_history") or {}
+    if hist.get("same_url"):
+        st = {r.get("status") for r in hist["same_url"]}
+        prefix = "ALREADY REJECTED - " if "rejected" in st else "ALREADY APPLIED - "
+    elif hist.get("same_company"):
+        prefix = "APPLIED HERE BEFORE - "
     co = (cand.get("company") or "?")[:22]
     tail = f" - {remote} - {band} - {score} [JOB-{cand.get('id')}]"
-    room = max(16, 78 - len(co) - 3 - len(tail))
+    room = max(14, 78 - len(prefix) - len(co) - 3 - len(tail))
     ti = (cand.get("title") or "?")
     ti = ti if len(ti) <= room else ti[:room - 1].rstrip() + "\u2026"
-    return f"{co} - {ti}{tail}"
+    return f"{prefix}{co} - {ti}{tail}"
 
 def _inbox_render(cand: dict, harvest: dict | None, n_in_mail: int = 1) -> str:
     """The reply. Written to be read on a phone, verdict first.
@@ -6212,6 +6317,7 @@ def _inbox_render(cand: dict, harvest: dict | None, n_in_mail: int = 1) -> str:
     if not ok_remote:
         why.append(f"remote verdict is {rv}")
 
+    hist = (harvest or {}).get("_history") or {}
     L.append(f"{cand.get('company') or '?'} — {cand.get('title') or '?'}")
     # ⭐ SAY IT WAS ONE OF SEVERAL. He sends batches, and each posting gets its OWN mail
     # because each needs its own [JOB-nnn] tag for answers and its own company alias. Without
@@ -6219,6 +6325,17 @@ def _inbox_render(cand: dict, harvest: dict | None, n_in_mail: int = 1) -> str:
     # together, and no way to tell whether all six were actually read.
     if n_in_mail > 1:
         L.append(f"  (one of {n_in_mail} links in that email; each gets its own reply)")
+    # ⚠️ BEFORE THE SCORE, NOT AFTER IT. He reads top-down and stops when he has decided.
+    if hist.get("same_url"):
+        L.append("")
+        L.append("  🚨 YOU HAVE ALREADY APPLIED TO THIS EXACT POSTING:")
+        for r in hist["same_url"]:
+            L.append(f"     APP {r['id']} · {r.get('status')} · {str(r.get('status_raw') or '')[:80]}")
+    if hist.get("same_company"):
+        L.append("")
+        L.append(f"  ⚠️ {len(hist['same_company'])} other application(s) at this company:")
+        for r in hist["same_company"][:4]:
+            L.append(f"     APP {r['id']} · {str(r.get('role_raw'))[:38]} · {r.get('status')}")
     L.append("")
     L.append(f"  fit score   {cand.get('score')}  ({cand.get('verdict') or '?'})")
     L.append(f"  band        {band}")
@@ -6294,6 +6411,10 @@ def _inbox_render(cand: dict, harvest: dict | None, n_in_mail: int = 1) -> str:
         L.append("      1. your answer")
         L.append("      2. your answer")
         L.append("  They get stored against this posting. Anything unnumbered is kept as a note.")
+    if (harvest or {}).get("_board_added"):
+        L.append("")
+        L.append(f"  ✅ Added {harvest['_board_added']} to the nightly scan. Future roles at")
+        L.append("     this company will now arrive on their own.")
     L.append("")
     L.append(f"  {cand.get('url')}")
     L.append("")
@@ -6601,6 +6722,15 @@ def job_inbox_url() -> str:
                 # ⚠️ Never fatal. A form we could not read still leaves a scored posting worth
                 # replying about; losing the whole verdict over it would be the wrong trade.
                 audit("inbox_url_harvest_failed", f"{url}: {type(e).__name__}")
+        # ⭐ Carried on the harvest dict so the subject builder and the body see the same facts.
+        harvest = dict(harvest or {})
+        harvest["_history"] = inbox_prior_history(url, cand.get("company"))
+        try:
+            harvest["_board_added"] = inbox_register_board(url)
+        except Exception as e:                                # noqa: BLE001
+            # ⚠️ Never fatal. Failing to widen the scan must not cost him the verdict.
+            harvest["_board_added"] = None
+            audit("inbox_board_failed", f"{url}: {type(e).__name__}")
         body = _inbox_render(cand, harvest, n_in_mail=n_in_mail)
         # 🚨 THE TAG IS HOW A REPLY FINDS ITS WAY HOME, and it is in the SUBJECT on purpose.
         # Matching on In-Reply-To would need the RFC Message-ID of the mail we sent, and the
