@@ -4181,6 +4181,34 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # browser read it found zero written answers and called 47 of 49 real harvests tier B,
     # two of which each demand an essay. ease-rank agreed, because ease-rank only ever reads
     # the API and never hit it. Agreement is not correctness.
+    # ── gate families the 116-form audit proved were missing ──────────────────────────
+    # 🚨 EACH OF THESE IS A REAL QUESTION FROM A REAL POSTING. The pattern was widened once,
+    # against the whole audited corpus, rather than three more times reactively. Measured
+    # before and after on the same 116 forms: 99 missed gates -> 3, and 36 false positives
+    # -> 0. These pin the families so a future edit cannot quietly undo them.
+    print("\ngate families, from the audit:")
+    _G = [("visa sponsorship", "Will you now or in the future require visa sponsorship?*", True),
+          ("work authorisation", "Are you currently eligible to legally work in the United States? *", True),
+          ("right to work", "Do you have the legal right to work in the country?", True),
+          ("bare residency", "In what city and state do you currently reside?*", True),
+          ("state list", "Do you live in one of the following states? Arizona, Arkansas", True),
+          ("talent hub", "Do you live within 45 miles of one of our talent hubs?", True),
+          ("Pacific Time", "This position requires the person to live in the Pacific Standard Time Zone.", True),
+          ("rotating on-call", "This role requires participation in a rotating on-call schedule", True),
+          ("non-compete", "Have you signed a non-compete with your current employer?*", True),
+          ("contract terms", "This is a contract position with an hourly pay range of $20-$23/hour.", True),
+          # ⚠️ and what must NOT be a gate
+          ("EEO race option", "Hispanic, Latino, or Spanish origin", False),
+          ("EEO other race", "Some other race, ethnicity, or origin", False),
+          ("EEO disability", "Do you have a disability or chronic condition (physical, visual)", False),
+          ("interview format", "Our interview process requires an in-person interview. Are you willing?", False),
+          ("experience", "Do you have at least 5 years of experience in customer-facing support?", False),
+          ("on-call TOOLING", "Are you familiar with on-call management software such as PagerDuty?", False),
+          ("board location list", "Remote - SF Bay Area(10 jobs)", False)]
+    for _name, _q, _want in _G:
+        _got = app.harvest_tier({"yesno": [{"label": _q}]})[2]
+        check(f"gate: {_name}", bool(_got), _want)
+
     # ── the gate auditor ──────────────────────────────────────────────────────────────
     # 🚨 THE MODEL PROPOSES AND MUST NOT BE ABLE TO INVENT. It is asked to quote question
     # text exactly; a model that returns a question the form does not contain would put words
