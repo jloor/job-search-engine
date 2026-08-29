@@ -2057,6 +2057,18 @@ def job_ai_read() -> str:
     with db() as con:
         scope_sql = ("" if AI_READ_SCOPE == "all"
                      else " AND (m.classification IS NULL OR m.classification = 'unknown')")
+        # 🚨 NEVER PAY A MODEL TO READ OUR OWN VERDICT MAIL. A verdict sent to
+        # <company>@jobs.jonathanloor.com returns through the catch-all and classifies as
+        # `unknown`, which is exactly what this job selects. Filtering on the SENDER rather
+        # than on the body text matters: a body-text rule would be forgeable by anyone who
+        # copied our footer, and that is a classifier this project has already proved can be
+        # steered by what a sender writes.
+        if INBOX_REPLY_FROM:
+            # ⚠️ Inlined, because this query binds POSITIONALLY and a named parameter would
+            # raise at run time. Safe to inline: the value is our own env var, and it is
+            # stripped to the characters a mail local-part and domain can contain.
+            _self = re.sub(r"[^A-Za-z0-9@._+-]", "", INBOX_REPLY_FROM).lower()
+            scope_sql += f" AND lower(COALESCE(m.from_addr,'')) <> '{_self}'"
         # Read each message once PER VERSION OF ITS TEXT. A re-read of unchanged text
         # costs money and produces a second row that disagrees with the first for no
         # reason a human could act on. A re-read after the text changed is the whole
@@ -6053,6 +6065,27 @@ INBOX_BATCH      = int(os.environ.get("INBOX_BATCH", "5"))
 # and nothing else. If this ever grows a `to` parameter, it has become /send without the
 # approval and must be deleted instead.
 INBOX_REPLY_TO   = os.environ.get("INBOX_REPLY_TO", "").strip()
+# ⭐ SEND THE VERDICT TO THE COMPANY'S OWN ALIAS, so it lands where the application will live.
+# When he later applies to Vesta the employer's confirmation arrives at vesta@ and the verdict
+# thread is already sitting in it. That is the same per-company alias discipline every package
+# already follows, applied one step earlier.
+# 🚨 THE DOMAIN IS STILL FIXED. Only the LOCAL PART is derived, it is slugified to [a-z0-9],
+# and every local part on this domain lands in his own mailbox through the catch-all. So the
+# security property is intact: this path still cannot address anyone but him.
+INBOX_REPLY_PER_COMPANY = os.environ.get(
+    "INBOX_REPLY_PER_COMPANY", "1").strip() not in ("0", "false", "no")
+
+
+def inbox_reply_to(company: str) -> str:
+    """The address a verdict goes to: <company>@<his domain>, or the fixed fallback."""
+    if not INBOX_REPLY_PER_COMPANY or "@" not in INBOX_REPLY_FROM:
+        return INBOX_REPLY_TO
+    slug = re.sub(r"[^a-z0-9]", "", (company or "").lower())[:40]
+    if not slug:
+        return INBOX_REPLY_TO
+    return f"{slug}@{INBOX_REPLY_FROM.split('@', 1)[1]}"
+
+
 INBOX_REPLY_FROM = os.environ.get("INBOX_REPLY_FROM", "").strip()
 
 _URL_RE = re.compile(r"https?://[^\s<>\"'\)\]]+")
@@ -6515,7 +6548,7 @@ def job_inbox_url() -> str:
         # is unambiguous.
         subj = f"[JOB-{cand.get('id')}] {(m['subject'] or 'job link')[:100]}"
         try:
-            _send_via_resend(INBOX_REPLY_FROM, INBOX_REPLY_TO, subj, body, m)
+            _send_via_resend(INBOX_REPLY_FROM, inbox_reply_to(cand.get("company")), subj, body, m)
             state, detail = "replied", None
         except Exception as e:                                # noqa: BLE001
             state, detail = "analysed_no_reply", f"{type(e).__name__}: {e}"[:300]
@@ -6582,9 +6615,14 @@ def job_inbox_answers() -> str:
     where = " OR ".join(["lower(to_alias) LIKE ?"] * len(INBOX_ALIASES))
     with db() as con:
         msgs = [dict(r) for r in con.execute(
+            # 🚨 SKIP OUR OWN MAIL. A verdict sent to <company>@jobs.jonathanloor.com comes
+            # straight back in through the catch-all, carrying the [JOB-nnn] tag, so without
+            # this the service would parse its OWN email as his answers and store the question
+            # list as though he had written it.
             "SELECT id, subject, body_text, body_reply FROM message "
-            f" WHERE ({where}) AND subject LIKE '%[JOB-%' ORDER BY id DESC LIMIT 40",
-            tuple(f"{a}@%" for a in INBOX_ALIASES))]
+            f" WHERE ({where}) AND subject LIKE '%[JOB-%' "
+            "   AND lower(COALESCE(from_addr,'')) <> lower(?) ORDER BY id DESC LIMIT 40",
+            tuple(f"{a}@%" for a in INBOX_ALIASES) + (INBOX_REPLY_FROM,))]
     stored = notes = 0
     for m in msgs:
         tag = _JOB_TAG.search(m["subject"] or "")
