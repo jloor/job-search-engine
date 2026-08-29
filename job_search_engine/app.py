@@ -1438,7 +1438,11 @@ def _read_anthropic(user: str, cache_system: bool,
 
     client = anthropic.Anthropic()          # reads ANTHROPIC_API_KEY
     resp = client.messages.create(
-        model=AI_MODEL, max_tokens=TRIAGE_MAX_TOKENS, system=sys_param,
+        # 🚨 A SHARED 24,000-TOKEN BUDGET BROKE A SMALL CALLER. The SDK REFUSES a
+        # non-streaming request whose max_tokens implies it could exceed 10 minutes, so
+        # gate_audit, which needs a few hundred tokens, failed 15 for 15 with
+        # "Streaming is required". The budget is per-call now; triage's default is unchanged.
+        model=AI_MODEL, max_tokens=max_tokens or TRIAGE_MAX_TOKENS, system=sys_param,
         output_config=out_cfg, messages=[{"role": "user", "content": user}])
     # A refusal is a successful HTTP call with no usable content. Reading content[0]
     # first would raise IndexError and report as a transport bug.
@@ -5850,6 +5854,9 @@ def job_harvest() -> str:
 GATE_AUDIT_ENABLED = os.environ.get("GATE_AUDIT_ENABLED", "1").strip() not in ("0", "false", "no")
 GATE_AUDIT_EVERY_MIN = int(os.environ.get("GATE_AUDIT_EVERY_MIN", "0"))    # 0 = manual only
 GATE_AUDIT_BATCH = int(os.environ.get("GATE_AUDIT_BATCH", "15"))
+# ⚠️ SMALL ON PURPOSE. The reply is a short JSON object quoting question text, so a
+# large budget buys nothing and, above the SDK's threshold, breaks the call outright.
+GATE_AUDIT_MAX_TOKENS = int(os.environ.get("GATE_AUDIT_MAX_TOKENS", "2000"))
 
 _GATE_AUDIT_SYSTEM = """You audit a regular expression, not a job posting.
 
@@ -5936,7 +5943,8 @@ def job_gate_audit() -> str:
                 + "\n</form>")
         try:
             if AI_PROVIDER == "anthropic":
-                text, usage = _read_anthropic(user, _GATE_AUDIT_SYSTEM)
+                text, usage = _read_anthropic(user, _GATE_AUDIT_SYSTEM,
+                                              max_tokens=GATE_AUDIT_MAX_TOKENS)
             else:
                 text, usage = _read_openai_compat(user)
             s = text.strip()
