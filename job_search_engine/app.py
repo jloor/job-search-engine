@@ -6027,7 +6027,14 @@ _GATE_AUDIT_SCHEMA = {
 
 
 # ── 📥 mail a job link, get a verdict back ───────────────────────────────────────────────
-INBOX_ALIAS      = os.environ.get("INBOX_ALIAS", "job").strip().lower()
+# ⚠️ A LIST, AND "jobs" IS IN THE DEFAULT ON PURPOSE. The domain is already
+# jobs.jonathanloor.com, so "jobs@jobs.jonathanloor.com" is what a person actually types, and
+# that is exactly what happened on the first real use: the mail arrived, the URL parsed, and
+# the job ignored it because the filter wanted "job@". An alias that only works when you
+# remember which singular/plural it is, is a trap rather than a feature.
+INBOX_ALIASES = [a.strip().lower() for a in
+                 os.environ.get("INBOX_ALIAS", "job,jobs,jd,link").split(",") if a.strip()]
+INBOX_ALIAS      = INBOX_ALIASES[0]
 INBOX_EVERY_MIN  = int(os.environ.get("INBOX_EVERY_MIN", "0"))     # 0 = manual only
 INBOX_BATCH      = int(os.environ.get("INBOX_BATCH", "5"))
 # 🚨 THE REPLY ADDRESS IS CONFIGURATION, NEVER A PARAMETER. This is the whole reason a
@@ -6407,12 +6414,12 @@ def job_inbox_url() -> str:
     """
     if not INBOX_REPLY_TO or not INBOX_REPLY_FROM:
         return "inbox_url: SKIPPED, INBOX_REPLY_TO or INBOX_REPLY_FROM is unset"
-    alias_at = f"{INBOX_ALIAS}@"
+    where = " OR ".join(["lower(to_alias) LIKE ?"] * len(INBOX_ALIASES))
     with db() as con:
         msgs = [dict(r) for r in con.execute(
             "SELECT id, subject, body_text, body_reply, message_id, references_hdr, to_alias "
-            "  FROM message WHERE lower(to_alias) LIKE ? ORDER BY id DESC LIMIT 40",
-            (alias_at + "%",))]
+            f"  FROM message WHERE {where} ORDER BY id DESC LIMIT 40",
+            tuple(f"{a}@%" for a in INBOX_ALIASES))]
     todo = []
     for m in msgs:
         for u in inbox_urls((m["subject"] or "") + " " + (m["body_reply"] or m["body_text"] or "")):

@@ -4237,6 +4237,10 @@ On Wed, Aug 12, 2026 the candidate wrote:
     print("\ninbox_url:")
     check("unconfigured skips rather than crashing",
           app.job_inbox_url().startswith("inbox_url: SKIPPED"), True)
+    # 🚨 "jobs@jobs.jonathanloor.com" IS WHAT A PERSON TYPES. On the first real use the mail
+    # arrived and the URL parsed, and the job ignored it because the filter wanted "job@".
+    check("the plural alias is accepted", "jobs" in app.INBOX_ALIASES, True)
+    check("the singular alias is accepted", "job" in app.INBOX_ALIASES, True)
     check("the reply address is NOT a parameter",
           "to_addr" not in app.job_inbox_url.__code__.co_varnames
           and "INBOX_REPLY_TO" in app.job_inbox_url.__code__.co_names, True)
