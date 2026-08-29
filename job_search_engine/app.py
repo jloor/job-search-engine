@@ -6115,8 +6115,7 @@ def _inbox_render(cand: dict, harvest: dict | None) -> str:
         # ⚠️ An unknown floor is not a passed gate. Say so rather than scoring it green.
         if floor:
             gates_ok.append(cand["comp_min"] >= floor)
-        else:
-            why.append("pay floor UNKNOWN (candidate.toml not synced), so the band was not judged")
+        # (an unknown floor is reported by the `unknown` block below, once)
         if floor and cand["comp_min"] < floor:
             why.append(f"band starts below the ${floor:,} floor")
     else:
@@ -6151,7 +6150,23 @@ def _inbox_render(cand: dict, harvest: dict | None) -> str:
     # not showing the gates, because it teaches you to trust the one-line verdict.
     # ⚠️ It does NOT auto-reject on a gate. His standing principle is that an attendance
     # condition is an OFFER-stage decision, so the verdict qualifies rather than refuses.
-    if not all(gates_ok):
+    # 🚨 "NOT JUDGED" IS NOT "REJECTED", AND CONFLATING THEM IS THE EXPENSIVE DIRECTION.
+    # First real use: a $120,000-$140,000 remote Technical Integration Specialist came back
+    # "DOES NOT CLEAR THE GATES" because triage had skipped it and the remote verdict was
+    # still NULL. Nothing had judged it at all. A reply that reads as a rejection on a job
+    # nobody scored is worse than no reply, because he would skip it.
+    unknown = []
+    if cand.get("score") is None:
+        unknown.append("not scored yet (triage has not run on it)")
+    if not (cand.get("remote_verdict")):
+        unknown.append("remote status not determined")
+    if not comp_floor():
+        unknown.append("pay floor unknown (candidate.toml not synced)")
+    if unknown:
+        L.append("  >>> COULD NOT JUDGE THIS ONE YET")
+        L += [f"      {u}" for u in unknown]
+        L.append("      Ask again in a few minutes, or check it by hand.")
+    elif not all(gates_ok):
         L.append("  >>> DOES NOT CLEAR THE GATES")
     elif g:
         L.append(f"  >>> WORTH APPLYING TO, BUT READ THE {len(g)} GATE QUESTION(S) ABOVE FIRST")

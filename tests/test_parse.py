@@ -4268,17 +4268,28 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("a form gate QUALIFIES the verdict",
           "READ THE 1 GATE" in _verdict(_cand, {"tier": "B", "n_written": 0,
               "gates": json.dumps(["4 days a week onsite. Are you comfortable?"])}), True)
+    # 🚨 NOT JUDGED IS NOT REJECTED. First real use returned "DOES NOT CLEAR THE GATES" for a
+    # $120-140k REMOTE role that triage had simply not scored yet. A reply that reads as a
+    # rejection on a job nobody judged is worse than no reply, because he would skip it.
+    check("an unscored posting says COULD NOT JUDGE, never rejected",
+          _verdict(dict(_cand, score=None, remote_verdict=None), None),
+          ">>> COULD NOT JUDGE THIS ONE YET")
+    check("a missing remote verdict alone also blocks a verdict",
+          _verdict(dict(_cand, remote_verdict=None), None),
+          ">>> COULD NOT JUDGE THIS ONE YET")
     check("a band under the floor fails",
           _verdict(dict(_cand, comp_min=80000), {"tier": "B", "n_written": 0, "gates": "[]"}),
           ">>> DOES NOT CLEAR THE GATES")
     check("an onsite role fails",
           _verdict(dict(_cand, remote_verdict="onsite"), {"tier": "B", "n_written": 0, "gates": "[]"}),
           ">>> DOES NOT CLEAR THE GATES")
-    # ⚠️ An unknown floor must SAY so, on a passing verdict too. It used to be dropped.
+    # ⚠️ AN UNKNOWN FLOOR NOW BLOCKS THE VERDICT RATHER THAN FOOTNOTING A PASS. It first only
+    # printed a caveat under a clean WORTH APPLYING TO, which hides that the pay was never
+    # checked. If the floor is unknown, the posting has not been judged.
     app.comp_floor = lambda: 0
-    check("an unknown floor is still reported on a pass",
-          "pay floor UNKNOWN" in app._inbox_render(_cand, {"tier": "B", "n_written": 0, "gates": "[]"}),
-          True)
+    _u = app._inbox_render(_cand, {"tier": "B", "n_written": 0, "gates": "[]"})
+    check("an unknown floor blocks the verdict", ">>> COULD NOT JUDGE" in _u, True)
+    check("...and says which fact is missing", "pay floor unknown" in _u, True)
     app.comp_floor = _prev_floor
 
     # ── the gate auditor ──────────────────────────────────────────────────────────────
