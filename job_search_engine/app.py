@@ -5892,6 +5892,25 @@ Quote question text EXACTLY as given. Do not invent questions. If the regex was 
 return agrees true with two empty lists."""
 
 
+
+# 🚨 THE CALLER MUST SUPPLY ITS OWN SCHEMA OR IT GETS THE EMAIL ONE. _read_anthropic defaults
+# to schema_for("anthropic"), the email-reading shape, and FORCES it. gate_audit ran 15 forms
+# without one and got back {"classification": "noise", "reasoning": "placeholder"} every time:
+# the model was structurally unable to answer the question it was asked. The parser then found
+# no "missed" key, defaulted to empty lists, and recorded 15 of 15 AGREEMENT. A perfect score
+# from a model that never saw the question is the worst possible failure mode for an auditor.
+_GATE_AUDIT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "agrees": {"type": "boolean"},
+        "missed": {"type": "array", "items": {"type": "string"}},
+        "false_positive": {"type": "array", "items": {"type": "string"}},
+        "reasoning": {"type": "string"},
+    },
+    "required": ["agrees", "missed", "false_positive", "reasoning"],
+    "additionalProperties": False,
+}
+
 def job_gate_audit() -> str:
     """A model checks what the gate regex missed. It PROPOSES; it never edits a gate.
 
@@ -5951,17 +5970,25 @@ def job_gate_audit() -> str:
                 # at all. It never got that far only because a TypeError fired first.
                 text, usage = _read_anthropic(user, cache_system=True,
                                               system=_GATE_AUDIT_SYSTEM,
+                                              schema=_GATE_AUDIT_SCHEMA,
                                               max_tokens=GATE_AUDIT_MAX_TOKENS)
             else:
                 # ⚠️ The system prompt is not optional here either. The first version
                 # called this with the user text alone, so under AI_PROVIDER=openai_compat
                 # the model would have been asked to audit with NO instructions.
-                text, usage = _read_openai_compat(user, system=_GATE_AUDIT_SYSTEM)
+                text, usage = _read_openai_compat(user, system=_GATE_AUDIT_SYSTEM,
+                                                  schema=_GATE_AUDIT_SCHEMA,
+                                                  schema_name="gate_audit")
             s = text.strip()
             if s.startswith("```"):
                 s = s.split("\n", 1)[-1].rsplit("```", 1)[0]
             i, j = s.find("{"), s.rfind("}")
             d = json.loads(s[i:j + 1])
+            # 🚨 A REPLY THAT LACKS THESE KEYS IS NOT AN AUDIT. Without this the email schema
+            # came back, every key was missing, and the empty defaults below scored as
+            # AGREEMENT. An auditor must never be able to pass by returning nothing.
+            if not all(k in d for k in ("agrees", "missed", "false_positive")):
+                raise RuntimeError(f"reply is not a gate audit: keys {sorted(d)[:6]}")
         except Exception as e:                                    # noqa: BLE001
             fail += 1
             audit("gate_audit_error", f"harvest {r['id']}: {type(e).__name__}: {e}")

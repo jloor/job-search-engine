@@ -4191,6 +4191,16 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("the auditor is told an interview format is not a gate",
           "interview" in _gsys.lower() and "not a gate" in _gsys.lower(), True)
     check("the auditor is told EEO is not a gate", "EEO" in _gsys, True)
+    # 🚨 A REPLY THAT DOES NOT ANSWER MUST NOT SCORE AS AGREEMENT. Without its own schema
+    # the auditor got the EMAIL schema back ({"classification": "noise", ...}) on 15 forms,
+    # every expected key was missing, the empty defaults applied, and it reported 15 of 15
+    # AGREEMENT. A perfect score from a model that never saw the question is the worst
+    # possible failure for an auditor, so the required keys are pinned here.
+    check("the auditor has its own schema, not the email one",
+          sorted(app._GATE_AUDIT_SCHEMA["required"]),
+          ["agrees", "false_positive", "missed", "reasoning"])
+    check("the schema forbids extra keys",
+          app._GATE_AUDIT_SCHEMA.get("additionalProperties"), False)
     _prev = app.GATE_AUDIT_ENABLED
     app.GATE_AUDIT_ENABLED = False
     check("GATE_AUDIT_ENABLED=0 stops it entirely",
