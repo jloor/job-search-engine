@@ -4292,6 +4292,27 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("...and says which fact is missing", "pay floor unknown" in _u, True)
     app.comp_floor = _prev_floor
 
+    # ── 📝 answers mailed back ────────────────────────────────────────────────────────
+    print("\ninbox_answers:")
+    _b = ("1. Integrations are where two companies' assumptions meet.\n\n"
+          "That is also where they break.\n\n2) A weekend go-live.\n\nThanks,\nJonathan\n"
+          "Sent from my iPhone")
+    _a, _left = app.parse_numbered_answers(_b)
+    check("a multi-paragraph answer stays whole",
+          "assumptions meet" in _a.get(1, "") and "they break" in _a.get(1, ""), True)
+    check("'2)' is accepted as well as '2.'", 2 in _a, True)
+    # 🚨 Continuation across a blank line is deliberate for essays, and would otherwise glue a
+    # sign-off onto the last answer and put it in a job application.
+    check("a signature is NOT appended to the last answer",
+          "iPhone" not in " ".join(_a.values()) and "Jonathan" not in " ".join(_a.values()), True)
+    check("quoted original text is ignored",
+          app.parse_numbered_answers("> 1. their words\n1. mine")[0], {1: "mine"})
+    # ⚠️ Nothing he wrote is discarded. Unnumbered text becomes a note.
+    check("unnumbered text is kept as leftover, not dropped",
+          app.parse_numbered_answers("just a thought")[1], "just a thought")
+    check("the subject tag is what matches a reply",
+          bool(app._JOB_TAG.search("Re: [JOB-13580] check job")), True)
+
     # ── the gate auditor ──────────────────────────────────────────────────────────────
     # 🚨 THE MODEL PROPOSES AND MUST NOT BE ABLE TO INVENT. It is asked to quote question
     # text exactly; a model that returns a question the form does not contain would put words

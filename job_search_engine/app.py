@@ -613,6 +613,14 @@ MIGRATIONS = [
      "replied_at TEXT, detail TEXT)"),
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_request_once ON inbox_request(message_id, url)",
     "CREATE INDEX IF NOT EXISTS idx_inbox_request_state ON inbox_request(state, at)",
+    # 📝 His answers to a posting's written questions, captured by REPLYING to the verdict mail.
+    # ⚠️ Keyed on (candidate_id, question) so answering the same question twice UPDATES rather
+    # than accumulating two versions with no way to tell which he meant.
+    ("CREATE TABLE IF NOT EXISTS candidate_answer ("
+     "id INTEGER PRIMARY KEY, candidate_id INTEGER NOT NULL, url TEXT NOT NULL, "
+     "question TEXT NOT NULL, answer TEXT NOT NULL, at TEXT NOT NULL, message_id INTEGER)"),
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_answer_once "
+    "  ON candidate_answer(candidate_id, question)",
     ("CREATE TABLE IF NOT EXISTS backlog_item ("
      "id INTEGER PRIMARY KEY, closes_claim TEXT NOT NULL, build TEXT NOT NULL, "
      "earns_claim TEXT NOT NULL, does_not_earn TEXT NOT NULL, tier INTEGER, "
@@ -6136,6 +6144,17 @@ def _inbox_render(cand: dict, harvest: dict | None) -> str:
         L.append(f"              {str(cand['remote_evidence'])[:150]}")
     if harvest and harvest.get("tier"):
         L.append(f"  form        tier {harvest['tier']}, {harvest.get('n_written') or 0} written answer(s)")
+    # 📝 THE WRITTEN QUESTIONS, NUMBERED, so he can see the work before deciding and can
+    # answer them by replying. Numbering is what makes the reply parseable without asking him
+    # to repeat the question text back.
+    written = []
+    if harvest and harvest.get("fields_json"):
+        try:
+            written = [(q.get("label") or "").strip()
+                       for q in json.loads(harvest["fields_json"]).get("textareas") or []
+                       if (q.get("label") or "").strip()]
+        except Exception:                                     # noqa: BLE001
+            written = []
     g = json.loads((harvest or {}).get("gates") or "[]")
     if g:
         L.append("")
@@ -6182,6 +6201,16 @@ def _inbox_render(cand: dict, harvest: dict | None) -> str:
         L.append("")
         L.append("  why that score:")
         L.append(f"    {str(cand['reasoning'])[:600]}")
+    if written:
+        L.append("")
+        L.append(f"  WRITTEN ANSWERS THIS FORM WANTS ({len(written)}):")
+        for i, q in enumerate(written, 1):
+            L.append(f"    {i}. {q}")
+        L.append("")
+        L.append("  To draft them, REPLY to this email with numbered answers:")
+        L.append("      1. your answer")
+        L.append("      2. your answer")
+        L.append("  They get stored against this posting. Anything unnumbered is kept as a note.")
     L.append("")
     L.append(f"  {cand.get('url')}")
     L.append("")
@@ -6479,7 +6508,12 @@ def job_inbox_url() -> str:
                 # replying about; losing the whole verdict over it would be the wrong trade.
                 audit("inbox_url_harvest_failed", f"{url}: {type(e).__name__}")
         body = _inbox_render(cand, harvest)
-        subj = f"Re: {(m['subject'] or 'job link')[:120]}"
+        # 🚨 THE TAG IS HOW A REPLY FINDS ITS WAY HOME, and it is in the SUBJECT on purpose.
+        # Matching on In-Reply-To would need the RFC Message-ID of the mail we sent, and the
+        # Resend API returns its own id, not that header. Matching on subject text alone breaks
+        # the moment he edits it. A [JOB-nnn] tag survives every mail client's Re: prefixing and
+        # is unambiguous.
+        subj = f"[JOB-{cand.get('id')}] {(m['subject'] or 'job link')[:100]}"
         try:
             _send_via_resend(INBOX_REPLY_FROM, INBOX_REPLY_TO, subj, body, m)
             state, detail = "replied", None
@@ -6493,6 +6527,109 @@ def job_inbox_url() -> str:
         done += 1
     audit("inbox_url_run", f"{done} processed, {failed} failed")
     return f"inbox_url: {done} processed, {failed} failed"
+
+
+
+_JOB_TAG = re.compile(r"\[JOB-(\d+)\]")
+# ⚠️ Numbered answers only. "1." / "1)" / "Q1." at the start of a line, which is what a person
+# types without being taught a syntax.
+_ANS_NUM = re.compile(r"^\s*(?:Q\s*)?(\d{1,2})\s*[\.\)\:]\s*(.+)$")
+
+
+def parse_numbered_answers(body: str) -> tuple:
+    """(numbered_answers, leftover_text) from a reply.
+
+    ⚠️ NOTHING HE WROTE IS EVER DISCARDED. Text that is not under a number becomes the
+    leftover and is stored as a note. A parser that silently drops half a considered answer
+    because it did not start with "2." is worse than no parser.
+    """
+    # 🚨 A SIGNATURE MUST NOT BECOME THE TAIL OF HIS LAST ANSWER. Continuation across a blank
+    # line is deliberate, because an essay answer runs to several paragraphs. That same rule
+    # would otherwise glue "Thanks, Jonathan / Sent from my iPhone" onto answer 2 and put it in
+    # a job application.
+    sig = re.compile(r"^\s*(--\s*$|thanks[,!.]?\s*$|thank you[,!.]?\s*$|best[,!.]?\s*$|"
+                     r"regards[,!.]?\s*$|cheers[,!.]?\s*$|sent from my |sent via |"
+                     r"jonathan\s*$|jon\s*$)", re.I)
+    out, cur, leftover = {}, None, []
+    for line in (body or "").splitlines():
+        if line.lstrip().startswith(">"):          # quoted original, not his words
+            continue
+        if sig.match(line):
+            break                                   # everything after a sign-off is not an answer
+        m = _ANS_NUM.match(line)
+        if m:
+            cur = int(m.group(1))
+            out[cur] = [m.group(2).strip()]
+        elif cur is not None and line.strip():
+            out[cur].append(line.strip())
+        elif line.strip():
+            leftover.append(line.strip())
+    return ({k: " ".join(v).strip() for k, v in out.items() if " ".join(v).strip()},
+            " ".join(leftover).strip())
+
+
+def job_inbox_answers() -> str:
+    """Store the answers he mails back, against the posting they belong to.
+
+    ⭐ HOW A REPLY FINDS ITS POSTING. Every verdict mail carries [JOB-<candidate_id>] in the
+    subject, and every mail client keeps the subject on a reply. That is more reliable than
+    In-Reply-To here, because the Resend API returns its own id rather than the RFC Message-ID
+    it generated, so we never learn the header a reply would quote.
+
+    ⚠️ IT STORES; IT DOES NOT APPLY. These land in candidate_answer and are picked up when a
+    package is built. Nothing here can submit anything.
+    """
+    where = " OR ".join(["lower(to_alias) LIKE ?"] * len(INBOX_ALIASES))
+    with db() as con:
+        msgs = [dict(r) for r in con.execute(
+            "SELECT id, subject, body_text, body_reply FROM message "
+            f" WHERE ({where}) AND subject LIKE '%[JOB-%' ORDER BY id DESC LIMIT 40",
+            tuple(f"{a}@%" for a in INBOX_ALIASES))]
+    stored = notes = 0
+    for m in msgs:
+        tag = _JOB_TAG.search(m["subject"] or "")
+        if not tag:
+            continue
+        cid = int(tag.group(1))
+        with db() as con:
+            row = con.execute("SELECT id,url FROM scan_candidate WHERE id=?", (cid,)).fetchone()
+            h = con.execute("SELECT fields_json FROM harvest WHERE url=("
+                            " SELECT url FROM scan_candidate WHERE id=?)", (cid,)).fetchone()
+        if not row:
+            continue
+        row = dict(row)
+        questions = []
+        if h and dict(h).get("fields_json"):
+            try:
+                questions = [(q.get("label") or "").strip()
+                             for q in json.loads(dict(h)["fields_json"]).get("textareas") or []
+                             if (q.get("label") or "").strip()]
+            except Exception:                                 # noqa: BLE001
+                questions = []
+        answers, leftover = parse_numbered_answers(m["body_reply"] or m["body_text"] or "")
+        for n, txt in answers.items():
+            # ⚠️ A number with no question behind it is still HIS WORDS. Keep it under a
+            # placeholder rather than dropping it because the form changed since.
+            q = questions[n - 1] if 1 <= n <= len(questions) else f"(answer {n}, question not on file)"
+            with db() as con:
+                con.execute(
+                    "INSERT INTO candidate_answer (candidate_id,url,question,answer,at,message_id) "
+                    "VALUES (?,?,?,?,?,?) ON CONFLICT(candidate_id,question) DO UPDATE SET "
+                    " answer=excluded.answer, at=excluded.at, message_id=excluded.message_id",
+                    (cid, row["url"], q, txt, now(), m["id"]))
+            stored += 1
+        if leftover:
+            with db() as con:
+                con.execute(
+                    "INSERT INTO candidate_answer (candidate_id,url,question,answer,at,message_id) "
+                    "VALUES (?,?,?,?,?,?) ON CONFLICT(candidate_id,question) DO UPDATE SET "
+                    " answer=excluded.answer, at=excluded.at, message_id=excluded.message_id",
+                    (cid, row["url"], "(unnumbered note)", leftover, now(), m["id"]))
+            notes += 1
+    if not stored and not notes:
+        return "inbox_answers: nothing new"
+    audit("inbox_answers", f"{stored} answer(s), {notes} note(s)")
+    return f"inbox_answers: stored {stored} answer(s) and {notes} note(s)"
 
 
 def job_table() -> list:
@@ -6539,7 +6676,10 @@ def job_table() -> list:
             # timer nobody reads.
             ("gate_audit", GATE_AUDIT_EVERY_MIN * 60, job_gate_audit),
             # 📥 Mail a link, get a verdict. Manual-only by default until the alias is in use.
-            ("inbox_url", INBOX_EVERY_MIN * 60, job_inbox_url)]
+            ("inbox_url", INBOX_EVERY_MIN * 60, job_inbox_url),
+            # 📝 Reads his REPLIES to those verdicts and stores the answers. Same cadence:
+            # a reply is worth capturing while he is still thinking about the posting.
+            ("inbox_answers", INBOX_EVERY_MIN * 60, job_inbox_answers)]
 
 
 async def _scheduler() -> None:
@@ -7618,6 +7758,13 @@ MCP_TOOLS = [
          "url": {"type": "string", "description": "the posting or apply URL"},
          "company": {"type": "string", "description": "instead of url: newest strong candidate at this company"},
          "refresh": {"type": "boolean", "description": "re-read even if a recent harvest exists"}}}},
+    {"name": "job_answers",
+     "description": "The answers he has mailed back for a posting's written questions, and any "
+                    "unnumbered notes. Use when building a package so his own words are reused "
+                    "rather than rewritten.",
+     "inputSchema": {"type": "object", "properties": {
+         "company": {"type": "string", "description": "company substring"},
+         "url": {"type": "string"}}}},
     {"name": "search_vault",
      "description": "Case-insensitive search across the vault markdown (Career Inventory, "
                     "Answer Bank, Contacts, Project Backlog). Returns matching lines with context.",
@@ -7966,6 +8113,27 @@ def _mcp_call(name: str, args: dict) -> str:
             _harvest_store(con, cand_id, res)
         row = _rows("SELECT * FROM harvest WHERE url=?", (url,))
         return _harvest_render(row[0], cached=False) if row else "Harvested but not stored."
+
+    if name == "job_answers":
+        co, u = (args.get("company") or "").strip(), (args.get("url") or "").strip()
+        if u:
+            rows = _rows("SELECT a.*, c.company, c.title FROM candidate_answer a "
+                         " JOIN scan_candidate c ON c.id=a.candidate_id WHERE a.url=? "
+                         " ORDER BY a.id", (u,))
+        elif co:
+            rows = _rows("SELECT a.*, c.company, c.title FROM candidate_answer a "
+                         " JOIN scan_candidate c ON c.id=a.candidate_id "
+                         " WHERE lower(c.company) LIKE ? ORDER BY a.id", (f"%{co.lower()}%",))
+        else:
+            rows = _rows("SELECT a.*, c.company, c.title FROM candidate_answer a "
+                         " JOIN scan_candidate c ON c.id=a.candidate_id ORDER BY a.id DESC LIMIT 30")
+        if not rows:
+            return "No mailed-in answers recorded. Reply to a verdict email with numbered answers."
+        out = []
+        for r in rows:
+            out += [f"{r['company']} — {r['title']}", f"  Q: {r['question']}",
+                    f"  A: {r['answer']}", f"  ({r['at'][:16]})", ""]
+        return "\n".join(out)
 
     if name == "search_vault":
         try:
