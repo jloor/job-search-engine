@@ -6140,6 +6140,48 @@ def inbox_urls(text: str) -> list:
     return ats + other
 
 
+
+def _inbox_subject(cand: dict, harvest: dict | None) -> str:
+    """The verdict, readable in an inbox list without opening anything.
+
+    ⭐ WHY THE SUBJECT CARRIES THE ANSWER. A batch of six arrives as six mails. Scanning
+    "Vesta - Technical Integration Specialist - Remote - $120-140k - 80" beats opening six.
+
+    🚨 THE [JOB-nnn] TAG STAYS, and it is what a reply is matched on. It sits at the END so
+    the human-readable part is what a narrow mail client shows first, and the matcher searches
+    anywhere in the subject so position is free.
+    ⚠️ Every field is TRUNCATED, not wrapped. A subject a client cuts at 78 characters must
+    still show the company and the title, so those are budgeted first.
+    """
+    remote = {"fully_remote": "Remote", "remote_with_residency": "Remote*",
+              "remote_in_metro": "Remote-metro", "hybrid_commutable": "Hybrid",
+              "onsite": "ONSITE", "unclear": "loc?"}.get(cand.get("remote_verdict") or "", "loc?")
+    # A form gate is usually an attendance condition, and that belongs in the subject rather
+    # than three paragraphs down.
+    try:
+        if json.loads((harvest or {}).get("gates") or "[]"):
+            remote += "+gate"
+    except Exception:                                         # noqa: BLE001
+        pass
+    if cand.get("comp_min"):
+        band = f"${cand['comp_min'] // 1000}-{cand['comp_max'] // 1000}k"
+        if (cand.get("comp_basis") or "") == "hourly":
+            band = f"${cand['comp_min']}-{cand['comp_max']}/hr"
+    else:
+        band = "no band"
+    score = cand.get("score")
+    score = f"fit {score}" if score not in (None, "") else "unscored"
+    # ⚠️ THE TITLE ABSORBS THE TRUNCATION, because it is the field that can lose words and
+    # still be understood. A fixed 38-character budget produced 92-character subjects, and a
+    # client that cuts a list view at ~70 would then hide the BAND and the SCORE, which are
+    # the two fields the subject exists to show.
+    co = (cand.get("company") or "?")[:22]
+    tail = f" - {remote} - {band} - {score} [JOB-{cand.get('id')}]"
+    room = max(16, 78 - len(co) - 3 - len(tail))
+    ti = (cand.get("title") or "?")
+    ti = ti if len(ti) <= room else ti[:room - 1].rstrip() + "\u2026"
+    return f"{co} - {ti}{tail}"
+
 def _inbox_render(cand: dict, harvest: dict | None, n_in_mail: int = 1) -> str:
     """The reply. Written to be read on a phone, verdict first.
 
@@ -6565,7 +6607,7 @@ def job_inbox_url() -> str:
         # Resend API returns its own id, not that header. Matching on subject text alone breaks
         # the moment he edits it. A [JOB-nnn] tag survives every mail client's Re: prefixing and
         # is unambiguous.
-        subj = f"[JOB-{cand.get('id')}] {(m['subject'] or 'job link')[:100]}"
+        subj = _inbox_subject(cand, harvest)
         try:
             _send_via_resend(INBOX_REPLY_FROM, inbox_reply_to(cand.get("company")), subj, body, m)
             state, detail = "replied", None

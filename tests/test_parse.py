@@ -4271,6 +4271,27 @@ On Wed, Aug 12, 2026 the candidate wrote:
           "one of 5 links" in app._inbox_render(_c, None, n_in_mail=5), True)
     check("a single link says nothing about a batch",
           "one of" not in app._inbox_render(_c, None, n_in_mail=1), True)
+    # 📧 THE SUBJECT CARRIES THE VERDICT. A batch arrives as several mails, and scanning
+    # "Vesta - Technical Integration Spec... - Remote - $120-140k - fit 80" beats opening each.
+    _s = {"id": 42, "company": "Vesta", "title": "Technical Integration Specialist",
+          "score": "80", "comp_min": 120000, "comp_max": 140000,
+          "remote_verdict": "fully_remote"}
+    _subj = app._inbox_subject(_s, None)
+    for _bit in ("Vesta", "Remote", "$120-140k", "fit 80", "[JOB-42]"):
+        check(f"subject carries {_bit}", _bit in _subj, True)
+    # 🚨 The tag is what a reply is matched on, so it must survive every subject shape.
+    check("the tag is matchable", bool(app._JOB_TAG.search(_subj)), True)
+    # ⚠️ A fixed title budget produced 92-character subjects, and a client cutting a list view
+    # at ~70 would then hide the BAND and the SCORE, the two fields the subject exists for.
+    _long = app._inbox_subject(
+        dict(_s, company="Fireblocks",
+             title="Solutions Architect, AMER Professional Services Team"), None)
+    check("a long title is truncated, not the band", len(_long) <= 78, True)
+    check("...and the band survives the truncation", "$120-140k" in _long, True)
+    check("an unscored posting says so in the subject",
+          "unscored" in app._inbox_subject(dict(_s, score=None), None), True)
+    check("a form gate is flagged in the subject",
+          "+gate" in app._inbox_subject(_s, {"gates": json.dumps(["4 days onsite"])}), True)
     check("the reply address is NOT a parameter",
           "to_addr" not in app.job_inbox_url.__code__.co_varnames
           and "INBOX_REPLY_TO" in app.job_inbox_url.__code__.co_names, True)
