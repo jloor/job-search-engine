@@ -589,6 +589,20 @@ MIGRATIONS = [
      "gates TEXT, fields_json TEXT, suspect TEXT, error TEXT)"),
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_harvest_url ON harvest(url)",
     "CREATE INDEX IF NOT EXISTS idx_harvest_candidate ON harvest(candidate_id)",
+    # 🚨 WHAT THE REGEX MISSED, AS A PROPOSAL AND NEVER AS AN ANSWER. _TIER_GATE has been
+    # widened three times, always AFTER a real posting slipped through: Obsidian's bare list
+    # of cities, Sonatype's interview format (a false positive), and Socure's "within 45 miles
+    # of one of our talent hubs", which was found only because a test was hand-written for it.
+    # A pattern that is edited every time it is wrong is a pattern nobody can trust to be
+    # right. This table is the model's second opinion on the same stored form.
+    # ⚠️ IT PROPOSES. Nothing here changes a tier, a gate, or a candidate's verdict.
+    ("CREATE TABLE IF NOT EXISTS gate_audit ("
+     "id INTEGER PRIMARY KEY, harvest_id INTEGER NOT NULL REFERENCES harvest(id), "
+     "at TEXT NOT NULL, model TEXT NOT NULL, fields_sha256 TEXT NOT NULL, "
+     "agrees INTEGER, missed TEXT, false_positive TEXT, reasoning TEXT, "
+     "input_tokens INTEGER, output_tokens INTEGER, raw_json TEXT)"),
+    "CREATE INDEX IF NOT EXISTS idx_gate_audit_harvest ON gate_audit(harvest_id, at DESC)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_gate_audit_once ON gate_audit(harvest_id, fields_sha256, model)",
     ("CREATE TABLE IF NOT EXISTS backlog_item ("
      "id INTEGER PRIMARY KEY, closes_claim TEXT NOT NULL, build TEXT NOT NULL, "
      "earns_claim TEXT NOT NULL, does_not_earn TEXT NOT NULL, tier INTEGER, "
@@ -5832,6 +5846,132 @@ def job_harvest() -> str:
             + (f", {len(skipped)} skipped as non-https" if skipped else ""))
 
 
+
+GATE_AUDIT_ENABLED = os.environ.get("GATE_AUDIT_ENABLED", "1").strip() not in ("0", "false", "no")
+GATE_AUDIT_EVERY_MIN = int(os.environ.get("GATE_AUDIT_EVERY_MIN", "0"))    # 0 = manual only
+GATE_AUDIT_BATCH = int(os.environ.get("GATE_AUDIT_BATCH", "15"))
+
+_GATE_AUDIT_SYSTEM = """You audit a regular expression, not a job posting.
+
+A job application form has been read in a browser. A regex was then used to pick out the
+questions that are GATES: questions whose answer can disqualify this candidate from the job
+regardless of how well they fit it. Your only task is to say what that regex got wrong.
+
+A GATE is a question about a condition of employment the candidate either meets or does not:
+  - where they must live, or be based, or commute to, or relocate to
+  - required days per week in a named office, or a distance from one
+  - work authorisation, visa sponsorship, security clearance
+  - a required licence, certification, or degree stated as a requirement
+  - required travel
+  - a named language other than English required to do the job
+  - any question whose "wrong" answer ends the application
+
+NOT a gate:
+  - the format of the INTERVIEW rather than the job. "Our interview process requires an
+    in-person interview, are you willing?" says nothing about where the work is done.
+  - voluntary EEO or self-identification questions of any kind
+  - salary expectations, start date, notice period, or how they heard about the role
+  - anything asking them to write about themselves
+  - identity fields: name, email, phone, resume, LinkedIn
+
+Reply with JSON only:
+{"agrees": true|false,
+ "missed": ["exact question text the regex should have flagged and did not"],
+ "false_positive": ["exact question text the regex flagged that is not a gate"],
+ "reasoning": "one sentence"}
+
+Quote question text EXACTLY as given. Do not invent questions. If the regex was right,
+return agrees true with two empty lists."""
+
+
+def job_gate_audit() -> str:
+    """A model checks what the gate regex missed. It PROPOSES; it never edits a gate.
+
+    🚨 WHY. _TIER_GATE has been widened three times, each time after a live posting slipped
+    through, and the last one (Socure's "within 45 miles of one of our talent hubs") was
+    caught only because a test happened to be hand-written for it. The regex decides; this
+    tells us where it is wrong, on real stored forms, so widening it is evidence-driven
+    rather than reactive.
+
+    ⚠️ IT CANNOT CHANGE ANYTHING. It writes to gate_audit and nothing else. A model failure
+    costs a review, never a wrong verdict on a job.
+
+    📌 It re-reads nothing. The unique index is (harvest_id, fields_sha256, model), so the
+    same form is audited once per model unless the FORM ITSELF changed. Re-running is free.
+    """
+    if not GATE_AUDIT_ENABLED:
+        return "gate_audit: disabled (GATE_AUDIT_ENABLED=0)"
+    with db() as con:
+        rows = [dict(r) for r in con.execute(
+            # 📌 SQLite cannot hash the JSON, so the already-audited check cannot live in this
+            # query. It selects a generous window and the sha comparison below does the real
+            # skipping. The window is the batch size times four so a page of already-audited
+            # rows cannot starve the batch.
+            "SELECT h.id, h.url, h.gates, h.fields_json FROM harvest h "
+            " WHERE h.suspect IS NULL AND h.error IS NULL AND h.fields_json IS NOT NULL "
+            " ORDER BY h.id LIMIT ?", (GATE_AUDIT_BATCH * 4,))]
+    todo = []
+    for r in rows:
+        sha = hashlib.sha256((r["fields_json"] or "").encode()).hexdigest()
+        with db() as con:
+            seen = con.execute("SELECT 1 FROM gate_audit WHERE harvest_id=? AND fields_sha256=? "
+                               "AND model=?", (r["id"], sha, AI_MODEL)).fetchone()
+        if not seen:
+            r["sha"] = sha
+            todo.append(r)
+            if len(todo) >= GATE_AUDIT_BATCH:
+                break
+    if not todo:
+        return "gate_audit: nothing new to audit"
+    agree = miss = fp = fail = 0
+    for r in todo:
+        fields = json.loads(r["fields_json"] or "{}")
+        qs = [q.get("label") for v in fields.values() if isinstance(v, list)
+              for q in v if isinstance(q, dict) and q.get("label")]
+        flagged = json.loads(r["gates"] or "[]")
+        user = ("<form untrusted=\"true\">\nEvery question on the form:\n"
+                + "\n".join(f"- {q}" for q in qs)
+                + "\n\nThe regex flagged these as gates:\n"
+                + ("\n".join(f"- {g}" for g in flagged) or "(none)")
+                + "\n</form>")
+        try:
+            if AI_PROVIDER == "anthropic":
+                text, usage = _read_anthropic(user, _GATE_AUDIT_SYSTEM)
+            else:
+                text, usage = _read_openai_compat(user)
+            s = text.strip()
+            if s.startswith("```"):
+                s = s.split("\n", 1)[-1].rsplit("```", 1)[0]
+            i, j = s.find("{"), s.rfind("}")
+            d = json.loads(s[i:j + 1])
+        except Exception as e:                                    # noqa: BLE001
+            fail += 1
+            audit("gate_audit_error", f"harvest {r['id']}: {type(e).__name__}: {e}")
+            continue
+        # ⚠️ ONLY QUESTIONS THAT ARE ACTUALLY ON THE FORM. A model that invents a question
+        # would otherwise put words in the posting's mouth, and this table is read later as
+        # evidence about a real employer.
+        got = [m for m in (d.get("missed") or []) if m in qs]
+        bad = [m for m in (d.get("false_positive") or []) if m in flagged]
+        miss += len(got)
+        fp += len(bad)
+        if not got and not bad:
+            agree += 1
+        with db() as con:
+            con.execute(
+                "INSERT OR IGNORE INTO gate_audit (harvest_id,at,model,fields_sha256,agrees,"
+                " missed,false_positive,reasoning,input_tokens,output_tokens,raw_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (r["id"], now(), AI_MODEL, r["sha"], int(not got and not bad),
+                 json.dumps(got), json.dumps(bad), (d.get("reasoning") or "")[:500],
+                 (usage or {}).get("input_tokens"), (usage or {}).get("output_tokens"),
+                 json.dumps(d)[:20000]))
+    audit("gate_audit_run", f"{len(todo)} audited, agree {agree}, missed {miss}, fp {fp}")
+    return (f"gate_audit: {len(todo)} audited, the regex agreed on {agree}, "
+            f"{miss} missed gate(s), {fp} false positive(s)"
+            + (f", {fail} model call(s) failed" if fail else ""))
+
+
 def job_table() -> list:
     """
     The one place a scheduled job is declared.
@@ -5870,7 +6010,11 @@ def job_table() -> list:
             # that already passed the cheap gates, so those must have run first, and it costs a
             # browser per row. Default interval 0 = MANUAL ONLY until the backfill is done and
             # the nightly volume is known to be small (measured: 1-14 new strong per night).
-            ("harvest", HARVEST_EVERY_MIN * 60, job_harvest)]
+            ("harvest", HARVEST_EVERY_MIN * 60, job_harvest),
+            # ⚠️ AFTER harvest, and manual-only by default. It costs a model call per form and
+            # it decides nothing, so it should run when someone wants the evidence, not on a
+            # timer nobody reads.
+            ("gate_audit", GATE_AUDIT_EVERY_MIN * 60, job_gate_audit)]
 
 
 async def _scheduler() -> None:

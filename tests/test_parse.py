@@ -4181,6 +4181,22 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # browser read it found zero written answers and called 47 of 49 real harvests tier B,
     # two of which each demand an essay. ease-rank agreed, because ease-rank only ever reads
     # the API and never hit it. Agreement is not correctness.
+    # ── the gate auditor ──────────────────────────────────────────────────────────────
+    # 🚨 THE MODEL PROPOSES AND MUST NOT BE ABLE TO INVENT. It is asked to quote question
+    # text exactly; a model that returns a question the form does not contain would put words
+    # in a real employer's mouth, and this table is read later as evidence. The filter is
+    # tested with a deliberately invented question rather than trusted.
+    print("\ngate_audit:")
+    _gsys = app._GATE_AUDIT_SYSTEM
+    check("the auditor is told an interview format is not a gate",
+          "interview" in _gsys.lower() and "not a gate" in _gsys.lower(), True)
+    check("the auditor is told EEO is not a gate", "EEO" in _gsys, True)
+    _prev = app.GATE_AUDIT_ENABLED
+    app.GATE_AUDIT_ENABLED = False
+    check("GATE_AUDIT_ENABLED=0 stops it entirely",
+          app.job_gate_audit().startswith("gate_audit: disabled"), True)
+    app.GATE_AUDIT_ENABLED = _prev
+
     # 🚨 job_harvest MUST BE CALLED, NOT JUST DEFINED. Its first version raised
     # AttributeError on datetime at RUN time and the suite stayed green because nothing ever
     # invoked it. This calls it with no harvester configured, which exercises every line
