@@ -5835,6 +5835,36 @@ def job_harvest() -> str:
                     (r["id"], r["url"], now(), "not https; the harvester refuses it"))
     if not rows:
         return f"harvest: nothing to read ({len(skipped)} skipped as non-https)"
+    # ⭐ WORKDAY NEVER GOES TO THE BROWSER. Its form is behind account creation, so a browser
+    # read returns zero fields and files it as suspect forever: 62 of the 206 suspect rows
+    # were Workday. Its gates live in the description, which its own JSON serves for free.
+    # ⚠️ tier stays NULL for these. A tier means "how much writing does the FORM demand", and
+    # we have not seen the form. Recording a letter we did not measure would be worse than
+    # recording none, so `suspect` says exactly what is and is not known.
+    wd = [r for r in rows if _WD_URL.match(r["url"] or "")]
+    rows = [r for r in rows if not _WD_URL.match(r["url"] or "")]
+    wd_ok = wd_none = 0
+    for r in wd:
+        gates, chars = workday_gates(r["url"])
+        with db() as con:
+            con.execute(
+                "INSERT INTO harvest (candidate_id,url,at,ats,gates,n_fields,suspect) "
+                "VALUES (?,?,?,?,?,?,?) ON CONFLICT(url) DO UPDATE SET at=excluded.at,"
+                " ats=excluded.ats, gates=excluded.gates, n_fields=excluded.n_fields,"
+                " suspect=excluded.suspect, error=NULL",
+                (r["id"], r["url"], now(), "Workday", json.dumps(gates), 0,
+                 "FORM NOT READ: Workday puts it behind account creation. The gates above come "
+                 "from the job description, not the form, and there is no tier."
+                 if chars else
+                 "DESCRIPTION NOT READ: the Workday JSON endpoint did not answer. This is not "
+                 "a posting without gates; it is a posting nobody read."))
+        if chars:
+            wd_ok += 1
+        else:
+            wd_none += 1
+    if not rows:
+        return (f"harvest: {wd_ok} Workday description(s) read, {wd_none} unreadable"
+                + (f", {len(skipped)} skipped as non-https" if skipped else ""))
     by_url = {r["url"]: r["id"] for r in rows}
     out = _harvest_call([r["url"] for r in rows])
     if out.get("error"):
@@ -5848,6 +5878,8 @@ def job_harvest() -> str:
     audit("harvest_run", f"{len(rows)} requested, {tally}, {len(skipped)} skipped")
     return (f"harvest: {len(rows)} read in {out.get('elapsed_ms', 0)}ms, "
             + ", ".join(f"{k} {v}" for k, v in sorted(tally.items()))
+            + (f", {wd_ok} Workday description(s)" if wd_ok else "")
+            + (f", {wd_none} Workday unreadable" if wd_none else "")
             + (f", {len(skipped)} skipped as non-https" if skipped else ""))
 
 
@@ -5899,6 +5931,78 @@ return agrees true with two empty lists."""
 # the model was structurally unable to answer the question it was asked. The parser then found
 # no "missed" key, defaulted to empty lists, and recorded 15 of 15 AGREEMENT. A perfect score
 # from a model that never saw the question is the worst possible failure mode for an auditor.
+
+# ── Workday: the gates are in the PROSE, because the form is unreachable ──────────────────
+# 🚨 WORKDAY'S APPLICATION FORM CANNOT BE HARVESTED, AND SHOULD NOT BE. Measured 2026-08-28:
+# the apply page renders zero fields even with a 15-second settle, because Workday puts the
+# form behind ACCOUNT CREATION. Automating that is out of bounds, so the browser path is a
+# dead end here for a good reason rather than a technical one.
+#
+# ⭐ BUT THE FORM WAS NEVER THE GOAL. The gates were, and Workday states them in the job
+# description, which its own CXS JSON endpoint returns in full and for free:
+#     /wday/cxs/<tenant>/<site>/job/<path>
+# Measured on real postings: "We cannot offer employment sponsorship at this time",
+# "Candidates must be eligible to work in the US", "requiring employees to work from our
+# Belfast office two days per week", "Participate in on-call rotations". Every one of those
+# is a knockout that was previously invisible.
+#
+# ⚠️ PROSE IS NOT A QUESTION LIST, AND _TIER_GATE WAS TUNED ON QUESTIONS. Run unchanged over a
+# description it fires on "we sponsor events throughout the year" and on benefits copy. So a
+# sentence must ALSO carry an obligation word, and marketing sentences are dropped outright.
+_WD_URL = re.compile(r"https://([^.]+)\.(wd\d+)\.myworkdayjobs\.com/(?:[a-z-]+/)?([^/]+)/job/(.+)$")
+_WD_OBLIGATION = re.compile(
+    r"\bmust\b|\brequire|\bcannot\b|\bunable to\b|\bnot able to\b|\bwill not\b|"
+    r"\beligible\b|\bauthoriz|\bexpected to\b|\bneed to\b|\bshould be\b|"
+    r"\bthis (?:is|role|position)\b|\bcandidates?\b|\bapplicants?\b", re.I)
+_WD_MARKETING = re.compile(
+    r"benefits?|perks?|we (?:offer|sponsor|host|celebrate)|events? throughout|"
+    r"equal opportunity|diversity|our mission|culture|401|insurance|vacation|"
+    r"we are proud|join us|why work", re.I)
+
+
+def workday_gates(url: str) -> tuple:
+    """(gate_sentences, description_chars) read from Workday's own JSON. No browser.
+
+    ⚠️ Returns ([], 0) on ANY failure. A tenant that refuses is not a posting without gates,
+    and the caller records the difference: 0 chars means "not read", never "nothing found".
+    """
+    # 📌 Both imported inside the function, matching this module's convention. Neither
+    # `urllib` nor `html` exists at module scope: line 20 imports json, os, re and others by
+    # name. A module-level reference to either raises NameError at RUN time, which is exactly
+    # how job_harvest failed twice before anything called it.
+    import html as _h
+    import urllib.error, urllib.request
+    m = _WD_URL.match(url or "")
+    if not m:
+        return [], 0
+    tenant, wd, site, path = m.groups()
+    api = f"https://{tenant}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/job/{path}"
+    try:
+        req = urllib.request.Request(api, headers={"User-Agent": "Mozilla/5.0",
+                                                   "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            info = json.loads(r.read().decode()).get("jobPostingInfo") or {}
+    except Exception:                                             # noqa: BLE001
+        return [], 0
+    body = _h.unescape(re.sub(r"<[^>]+>", " ", info.get("jobDescription") or ""))
+    body = re.sub(r"\s+", " ", body)
+    out = []
+    for s in re.split(r"(?<=[.!?])\s+|\u2022|\u25cf|\n", body):
+        s = s.strip(" -\u2022\u25cf")
+        if not (12 < len(s) < 300):
+            continue
+        if _WD_MARKETING.search(s) or not _WD_OBLIGATION.search(s):
+            continue
+        if _TIER_GATE.search(s):
+            out.append(s)
+    # ⚠️ Deduplicate but keep order: Workday boilerplate repeats the same clause per section.
+    seen, uniq = set(), []
+    for s in out:
+        if s.lower() not in seen:
+            seen.add(s.lower())
+            uniq.append(s)
+    return uniq, len(body)
+
 _GATE_AUDIT_SCHEMA = {
     "type": "object",
     "properties": {

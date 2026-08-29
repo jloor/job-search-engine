@@ -4209,6 +4209,30 @@ On Wed, Aug 12, 2026 the candidate wrote:
         _got = app.harvest_tier({"yesno": [{"label": _q}]})[2]
         check(f"gate: {_name}", bool(_got), _want)
 
+    # ── Workday: gates from prose, not from a form ────────────────────────────────────
+    # 🚨 Workday's form sits behind ACCOUNT CREATION, so a browser read returns zero fields:
+    # 62 of 206 suspect harvest rows were Workday. Its gates are in the description instead.
+    # ⚠️ _TIER_GATE was tuned on QUESTIONS. Run unchanged over prose it fires on "we sponsor
+    # events throughout the year", so a sentence must also carry an obligation word and
+    # marketing copy is dropped. These pin both halves.
+    print("\nWorkday prose gates:")
+    check("url parses", bool(app._WD_URL.match(
+        "https://alkami.wd12.myworkdayjobs.com/Alkami/job/US-Remote/Engineer_JR-1")), True)
+    check("a non-Workday url does not", bool(app._WD_URL.match(
+        "https://job-boards.greenhouse.io/x/jobs/1")), False)
+    _keep = "Work Authorization : We cannot offer employment sponsorship at this time."
+    check("real gate: obligation + gate word",
+          bool(app._WD_OBLIGATION.search(_keep) and app._TIER_GATE.search(_keep)
+               and not app._WD_MARKETING.search(_keep)), True)
+    _drop = "In addition to our benefits, we sponsor events throughout the year."
+    check("marketing 'we sponsor events' is dropped",
+          bool(app._WD_MARKETING.search(_drop)), True)
+    _noob = "Sponsorship is interesting to think about."
+    check("a gate word with no obligation is not a gate",
+          bool(app._WD_OBLIGATION.search(_noob)), False)
+    check("an unreadable tenant returns 0 chars, not 'no gates'",
+          app.workday_gates("https://nope.wd1.myworkdayjobs.com/X/job/a/b"), ([], 0))
+
     # ── the gate auditor ──────────────────────────────────────────────────────────────
     # 🚨 THE MODEL PROPOSES AND MUST NOT BE ABLE TO INVENT. It is asked to quote question
     # text exactly; a model that returns a question the form does not contain would put words
