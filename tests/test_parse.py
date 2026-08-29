@@ -4241,6 +4241,36 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # arrived and the URL parsed, and the job ignored it because the filter wanted "job@".
     check("the plural alias is accepted", "jobs" in app.INBOX_ALIASES, True)
     check("the singular alias is accepted", "job" in app.INBOX_ALIASES, True)
+    # 📬 HE SENDS BATCHES: several roles at one company, one role at several companies, or
+    # both mixed with the tracking and social links a forwarded mail carries. Taking only the
+    # first link dropped the rest SILENTLY, which is the problem: he would not know which of
+    # the six he sent had been judged.
+    check("several roles at ONE company all survive",
+          len(app.inbox_urls("https://job-boards.greenhouse.io/vesta/jobs/1 "
+                             "https://job-boards.greenhouse.io/vesta/jobs/2")), 2)
+    check("one role at SEVERAL companies all survive",
+          len(app.inbox_urls("https://job-boards.greenhouse.io/toast/jobs/1 "
+                             "https://jobs.ashbyhq.com/harvey/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee "
+                             "https://jobs.lever.co/redox/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")), 3)
+    check("a mixed batch keeps the postings and drops the noise",
+          len(app.inbox_urls("https://job-boards.greenhouse.io/vesta/jobs/1 "
+                             "https://jobs.ashbyhq.com/harvey/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee "
+                             "https://click.mailer.com/track/xyz "
+                             "https://www.linkedin.com/company/vesta "
+                             "https://unsubscribe.example.com/u?x=1")), 2)
+    check("a per-message cap exists so one mail cannot eat a run",
+          app.INBOX_MAX_URLS_PER_MSG >= 1, True)
+    # ⭐ Each posting gets its OWN mail, because each needs its own [JOB-nnn] tag for answer
+    # routing and its own company alias. The batch line is what stops six unrelated-looking
+    # emails arriving with no sign they belong together.
+    _c = {"company": "V", "title": "T", "score": 80, "verdict": "strong", "comp_min": 140000,
+          "comp_max": 200000, "comp_source": "board", "location": "Remote",
+          "remote_verdict": "fully_remote", "remote_evidence": "", "reasoning": "",
+          "url": "https://v", "id": 1}
+    check("a batched reply says which of how many",
+          "one of 5 links" in app._inbox_render(_c, None, n_in_mail=5), True)
+    check("a single link says nothing about a batch",
+          "one of" not in app._inbox_render(_c, None, n_in_mail=1), True)
     check("the reply address is NOT a parameter",
           "to_addr" not in app.job_inbox_url.__code__.co_varnames
           and "INBOX_REPLY_TO" in app.job_inbox_url.__code__.co_names, True)

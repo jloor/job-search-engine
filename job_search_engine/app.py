@@ -6056,7 +6056,9 @@ INBOX_ALIASES = [a.strip().lower() for a in
                  os.environ.get("INBOX_ALIAS", "job,jobs,jd,link").split(",") if a.strip()]
 INBOX_ALIAS      = INBOX_ALIASES[0]
 INBOX_EVERY_MIN  = int(os.environ.get("INBOX_EVERY_MIN", "0"))     # 0 = manual only
-INBOX_BATCH      = int(os.environ.get("INBOX_BATCH", "5"))
+INBOX_BATCH      = int(os.environ.get("INBOX_BATCH", "8"))
+# ⚠️ Per MESSAGE, so one mail carrying a long list cannot consume a whole run.
+INBOX_MAX_URLS_PER_MSG = int(os.environ.get("INBOX_MAX_URLS_PER_MSG", "10"))
 # 🚨 THE REPLY ADDRESS IS CONFIGURATION, NEVER A PARAMETER. This is the whole reason a
 # self-reply path is acceptable beside a /send that refuses without a human's Ed25519
 # signature. /send exists so an agent cannot decide on its own to answer a RECRUITER; that
@@ -6138,7 +6140,7 @@ def inbox_urls(text: str) -> list:
     return ats + other
 
 
-def _inbox_render(cand: dict, harvest: dict | None) -> str:
+def _inbox_render(cand: dict, harvest: dict | None, n_in_mail: int = 1) -> str:
     """The reply. Written to be read on a phone, verdict first.
 
     ⚠️ EVERY NUMBER SAYS WHERE IT CAME FROM. A band read off the employer's page and a band a
@@ -6169,6 +6171,12 @@ def _inbox_render(cand: dict, harvest: dict | None) -> str:
         why.append(f"remote verdict is {rv}")
 
     L.append(f"{cand.get('company') or '?'} — {cand.get('title') or '?'}")
+    # ⭐ SAY IT WAS ONE OF SEVERAL. He sends batches, and each posting gets its OWN mail
+    # because each needs its own [JOB-nnn] tag for answers and its own company alias. Without
+    # this line a batch of six arrives as six unrelated emails with no sign they belong
+    # together, and no way to tell whether all six were actually read.
+    if n_in_mail > 1:
+        L.append(f"  (one of {n_in_mail} links in that email; each gets its own reply)")
     L.append("")
     L.append(f"  fit score   {cand.get('score')}  ({cand.get('verdict') or '?'})")
     L.append(f"  band        {band}")
@@ -6499,20 +6507,31 @@ def job_inbox_url() -> str:
             tuple(f"{a}@%" for a in INBOX_ALIASES))]
     todo = []
     for m in msgs:
-        for u in inbox_urls((m["subject"] or "") + " " + (m["body_reply"] or m["body_text"] or "")):
+        # 🚨 EVERY LINK IN THE MAIL, NOT JUST THE FIRST. He sends batches: several roles at one
+        # company, one role at several companies, or both mixed. Taking only the first link
+        # silently dropped the rest, and silently is the problem: he would have no way to know
+        # which of the six he sent had been judged.
+        per_msg = 0
+        found = inbox_urls((m["subject"] or "") + " " + (m["body_reply"] or m["body_text"] or ""))
+        for u in found:
             with db() as con:
                 seen = con.execute("SELECT 1 FROM inbox_request WHERE message_id=? AND url=?",
                                    (m["id"], u)).fetchone()
             if not seen:
-                todo.append((m, u))
-                break                      # one posting per message; the first ATS link wins
+                todo.append((m, u, len(found)))
+                per_msg += 1
+                # ⚠️ A CAP PER MESSAGE, NOT A LIMIT OF ONE. Every URL costs a fetch, a model
+                # call and a browser harvest, so a mail with forty links must not become forty
+                # of each. The cap is announced in the reply rather than silently applied.
+                if per_msg >= INBOX_MAX_URLS_PER_MSG or len(todo) >= INBOX_BATCH:
+                    break
         if len(todo) >= INBOX_BATCH:
             break
     if not todo:
         return "inbox_url: nothing new"
 
     done = failed = 0
-    for m, url in todo:
+    for m, url, n_in_mail in todo:
         with db() as con:
             con.execute("INSERT OR IGNORE INTO inbox_request (message_id,url,at,state) "
                         "VALUES (?,?,?,'working')", (m["id"], url, now()))
@@ -6540,7 +6559,7 @@ def job_inbox_url() -> str:
                 # ⚠️ Never fatal. A form we could not read still leaves a scored posting worth
                 # replying about; losing the whole verdict over it would be the wrong trade.
                 audit("inbox_url_harvest_failed", f"{url}: {type(e).__name__}")
-        body = _inbox_render(cand, harvest)
+        body = _inbox_render(cand, harvest, n_in_mail=n_in_mail)
         # 🚨 THE TAG IS HOW A REPLY FINDS ITS WAY HOME, and it is in the SUBJECT on purpose.
         # Matching on In-Reply-To would need the RFC Message-ID of the mail we sent, and the
         # Resend API returns its own id, not that header. Matching on subject text alone breaks
