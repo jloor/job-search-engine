@@ -1398,7 +1398,8 @@ Rules that matter more than being helpful:
 
 
 def _read_anthropic(user: str, cache_system: bool,
-                    system: "str | list" = "", schema: dict | None = None) -> tuple[str, dict]:
+                    system: "str | list" = "", schema: dict | None = None,
+                    max_tokens: int | None = None) -> tuple[str, dict]:
     """The Anthropic path. Explicit cache breakpoint, effort parameter, typed refusals.
 
     ⭐ `system` may be a LIST of content blocks the caller has already marked with its own
@@ -5943,10 +5944,19 @@ def job_gate_audit() -> str:
                 + "\n</form>")
         try:
             if AI_PROVIDER == "anthropic":
-                text, usage = _read_anthropic(user, _GATE_AUDIT_SYSTEM,
+                # 🚨 KEYWORDS, NOT POSITION. The second positional parameter here is
+                # `cache_system`, a BOOLEAN, not the system prompt. Passing the prompt
+                # positionally made a non-empty string the cache flag and left `system`
+                # EMPTY, so the model would have been asked to audit with no instructions
+                # at all. It never got that far only because a TypeError fired first.
+                text, usage = _read_anthropic(user, cache_system=True,
+                                              system=_GATE_AUDIT_SYSTEM,
                                               max_tokens=GATE_AUDIT_MAX_TOKENS)
             else:
-                text, usage = _read_openai_compat(user)
+                # ⚠️ The system prompt is not optional here either. The first version
+                # called this with the user text alone, so under AI_PROVIDER=openai_compat
+                # the model would have been asked to audit with NO instructions.
+                text, usage = _read_openai_compat(user, system=_GATE_AUDIT_SYSTEM)
             s = text.strip()
             if s.startswith("```"):
                 s = s.split("\n", 1)[-1].rsplit("```", 1)[0]
