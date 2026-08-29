@@ -5930,13 +5930,16 @@ def job_gate_audit() -> str:
         return "gate_audit: disabled (GATE_AUDIT_ENABLED=0)"
     with db() as con:
         rows = [dict(r) for r in con.execute(
-            # 📌 SQLite cannot hash the JSON, so the already-audited check cannot live in this
-            # query. It selects a generous window and the sha comparison below does the real
-            # skipping. The window is the batch size times four so a page of already-audited
-            # rows cannot starve the batch.
+            # 🚨 NO LIMIT ON THE WINDOW. It was BATCH*4, which only ever looked at the first
+            # 60 rows: once those were audited the job reported "nothing new to audit" with
+            # 56 forms still unread. A window that scrolls off the work it is meant to do
+            # reports completion instead of progress, which is the worst way to stop.
+            # ⚠️ SQLite cannot hash the JSON, so the already-audited check cannot live in
+            # this query; the sha comparison below does the real skipping and breaks at
+            # GATE_AUDIT_BATCH. The full scan is cheap: this table is hundreds of rows.
             "SELECT h.id, h.url, h.gates, h.fields_json FROM harvest h "
             " WHERE h.suspect IS NULL AND h.error IS NULL AND h.fields_json IS NOT NULL "
-            " ORDER BY h.id LIMIT ?", (GATE_AUDIT_BATCH * 4,))]
+            " ORDER BY h.id")]
     todo = []
     for r in rows:
         sha = hashlib.sha256((r["fields_json"] or "").encode()).hexdigest()
