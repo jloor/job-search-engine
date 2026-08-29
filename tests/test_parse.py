@@ -4233,6 +4233,50 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("an unreadable tenant returns 0 chars, not 'no gates'",
           app.workday_gates("https://nope.wd1.myworkdayjobs.com/X/job/a/b"), ([], 0))
 
+    # ── 📥 mail a job link, get a verdict ─────────────────────────────────────────────
+    print("\ninbox_url:")
+    check("unconfigured skips rather than crashing",
+          app.job_inbox_url().startswith("inbox_url: SKIPPED"), True)
+    check("the reply address is NOT a parameter",
+          "to_addr" not in app.job_inbox_url.__code__.co_varnames
+          and "INBOX_REPLY_TO" in app.job_inbox_url.__code__.co_names, True)
+    # ⭐ An ATS link outranks everything else in a forwarded recruiter mail.
+    _u = app.inbox_urls("hi see https://x.com/share and "
+                        "https://job-boards.greenhouse.io/acme/jobs/1 thanks")
+    check("an ATS url is picked over a social one", _u[:1], ["https://job-boards.greenhouse.io/acme/jobs/1"])
+    check("tracking links are dropped", app.inbox_urls("https://click.foo/track/1"), [])
+    check("unsubscribe links are dropped", app.inbox_urls("https://a.co/unsubscribe?x=1"), [])
+    _prev_floor = app.comp_floor
+    _cand = {"company": "X", "title": "Y", "score": 85, "verdict": "strong",
+             "comp_min": 140000, "comp_max": 200000, "comp_source": "employer_page",
+             "location": "Remote", "remote_verdict": "fully_remote", "remote_evidence": "",
+             "reasoning": "", "url": "https://x"}
+
+    def _verdict(cand, harv):
+        return [l.strip() for l in app._inbox_render(cand, harv).splitlines() if ">>>" in l][0]
+
+    app.comp_floor = lambda: 100000
+    check("a clean role reads WORTH APPLYING TO",
+          _verdict(_cand, {"tier": "B", "n_written": 0, "gates": "[]"}), ">>> WORTH APPLYING TO")
+    # 🚨 The first version printed the gates and then said WORTH APPLYING TO anyway, which is
+    # the summary contradicting its own evidence. It qualifies now, and does NOT auto-reject,
+    # because an attendance condition is an offer-stage decision.
+    check("a form gate QUALIFIES the verdict",
+          "READ THE 1 GATE" in _verdict(_cand, {"tier": "B", "n_written": 0,
+              "gates": json.dumps(["4 days a week onsite. Are you comfortable?"])}), True)
+    check("a band under the floor fails",
+          _verdict(dict(_cand, comp_min=80000), {"tier": "B", "n_written": 0, "gates": "[]"}),
+          ">>> DOES NOT CLEAR THE GATES")
+    check("an onsite role fails",
+          _verdict(dict(_cand, remote_verdict="onsite"), {"tier": "B", "n_written": 0, "gates": "[]"}),
+          ">>> DOES NOT CLEAR THE GATES")
+    # ⚠️ An unknown floor must SAY so, on a passing verdict too. It used to be dropped.
+    app.comp_floor = lambda: 0
+    check("an unknown floor is still reported on a pass",
+          "pay floor UNKNOWN" in app._inbox_render(_cand, {"tier": "B", "n_written": 0, "gates": "[]"}),
+          True)
+    app.comp_floor = _prev_floor
+
     # ── the gate auditor ──────────────────────────────────────────────────────────────
     # 🚨 THE MODEL PROPOSES AND MUST NOT BE ABLE TO INVENT. It is asked to quote question
     # text exactly; a model that returns a question the form does not contain would put words

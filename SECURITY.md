@@ -288,3 +288,25 @@ message gets. This is not new and this job did not cause it, but the probe is th
 time it was demonstrated, so: **a classification is a hint about mail, never an
 authorisation.** Nothing downstream may act on a label without a human reading the
 message.
+
+## 📥 The inbox reply path (`job_inbox_url`), added 2026-08-29
+
+Mail a job link to `<INBOX_ALIAS>@jobs.jonathanloor.com` and the service replies with a fit
+verdict. That reply is the ONLY outbound mail this service sends without a human's Ed25519
+approval, and the exception is deliberately shaped so it cannot become a general one.
+
+**Why it is not a hole in `/send`:**
+
+- 🚨 **The recipient is not a parameter.** It is `INBOX_REPLY_TO`, read from the environment.
+  There is no code path that lets a caller choose who receives the mail. An attacker who fully
+  controls the trigger gains the ability to send **Jonathan** an email about a job posting.
+- 🚨 **`/send` is untouched.** It still requires `X-Approval`, a signature only the operator can
+  mint, and it is still the only way to answer a recruiter. This path cannot reply to a message,
+  cannot address an employer, and cannot be reached through `/send`.
+- ⚠️ **It only reads mail sent to the inbox alias.** A recruiter's mail to a company alias is
+  full of URLs and is never treated as a request to evaluate a job.
+- ⚠️ **The body is generated from stored data, not from the sender's text.** The inbound mail
+  contributes exactly one thing: a URL, which must match a known ATS pattern or is refused.
+
+**The line that must not be crossed:** if this ever grows a `to` parameter, it has become
+`/send` without the approval, and it must be deleted rather than guarded.

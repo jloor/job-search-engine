@@ -603,6 +603,16 @@ MIGRATIONS = [
      "input_tokens INTEGER, output_tokens INTEGER, raw_json TEXT)"),
     "CREATE INDEX IF NOT EXISTS idx_gate_audit_harvest ON gate_audit(harvest_id, at DESC)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_gate_audit_once ON gate_audit(harvest_id, fields_sha256, model)",
+    # 📥 "Mail me a job link and tell me if it is worth applying to."
+    # ⚠️ ONE ROW PER MESSAGE PER URL, so a re-run cannot double-process and a forwarded thread
+    # containing the same link twice is handled once. `state` is the audit trail: a request that
+    # failed says WHY rather than silently vanishing, which is how a queue starves.
+    ("CREATE TABLE IF NOT EXISTS inbox_request ("
+     "id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL, url TEXT NOT NULL, "
+     "at TEXT NOT NULL, state TEXT NOT NULL, candidate_id INTEGER, "
+     "replied_at TEXT, detail TEXT)"),
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_request_once ON inbox_request(message_id, url)",
+    "CREATE INDEX IF NOT EXISTS idx_inbox_request_state ON inbox_request(state, at)",
     ("CREATE TABLE IF NOT EXISTS backlog_item ("
      "id INTEGER PRIMARY KEY, closes_claim TEXT NOT NULL, build TEXT NOT NULL, "
      "earns_claim TEXT NOT NULL, does_not_earn TEXT NOT NULL, tier INTEGER, "
@@ -6015,6 +6025,148 @@ _GATE_AUDIT_SCHEMA = {
     "additionalProperties": False,
 }
 
+
+# ── 📥 mail a job link, get a verdict back ───────────────────────────────────────────────
+INBOX_ALIAS      = os.environ.get("INBOX_ALIAS", "job").strip().lower()
+INBOX_EVERY_MIN  = int(os.environ.get("INBOX_EVERY_MIN", "0"))     # 0 = manual only
+INBOX_BATCH      = int(os.environ.get("INBOX_BATCH", "5"))
+# 🚨 THE REPLY ADDRESS IS CONFIGURATION, NEVER A PARAMETER. This is the whole reason a
+# self-reply path is acceptable beside a /send that refuses without a human's Ed25519
+# signature. /send exists so an agent cannot decide on its own to answer a RECRUITER; that
+# gate is untouched. This path can only ever mail ONE address, read from the environment, so
+# a caller who compromises it gains the ability to send Jonathan an email about a job posting
+# and nothing else. If this ever grows a `to` parameter, it has become /send without the
+# approval and must be deleted instead.
+INBOX_REPLY_TO   = os.environ.get("INBOX_REPLY_TO", "").strip()
+INBOX_REPLY_FROM = os.environ.get("INBOX_REPLY_FROM", "").strip()
+
+_URL_RE = re.compile(r"https?://[^\s<>\"'\)\]]+")
+# ⚠️ Links that are never a job posting. A forwarded recruiter mail is full of tracking
+# pixels, unsubscribe links and social icons, and processing one of those wastes a model call
+# and files a nonsense candidate.
+_URL_SKIP = re.compile(
+    r"unsubscribe|/track|/click|list-manage|mailchimp|sendgrid|hubspot|utm_|\.(png|jpg|gif|css|js)$|"
+    r"twitter\.com|x\.com|linkedin\.com/company|facebook\.com|instagram\.com|youtube\.com|"
+    r"google\.com/maps|calendly\.com|zoom\.us|teams\.microsoft", re.I)
+
+
+def comp_floor() -> int:
+    """His pay floor, from config/candidate.toml in the synced repo.
+
+    🚨 NOT A CONSTANT IN THIS FILE. The floor is one of the four facts CLAUDE.md says must
+    never live upstream, alongside job titles, the commute origin and document paths. Same
+    lazy-import shape as target_title() so the service and tools/ cannot disagree about it,
+    and a missing config yields a conservative 0 rather than a stale number that would
+    silently pass a role under his real floor.
+    """
+    try:
+        import candidate as _C
+        return int(_C.load()["compensation"]["floor"])
+    except Exception:                                         # noqa: BLE001
+        # 🚨 0 MEANS "UNKNOWN", AND THE CALLER MUST TREAT IT THAT WAY. The engine ships its own
+        # candidate.py stub which returns {} until the private repo is synced, so this is the
+        # normal answer on a laptop and an abnormal one in production. Returning 0 and letting a
+        # caller compare `band >= 0` would silently PASS every posting on the pay gate, which is
+        # the failure mode this whole config split exists to prevent.
+        return 0
+
+
+def inbox_urls(text: str) -> list:
+    """Job-posting URLs from a message body, best first, de-duplicated.
+
+    ⭐ A KNOWN ATS URL WINS OVER ANYTHING ELSE IN THE MAIL. He forwards a recruiter's message
+    as often as a bare link, and those carry the employer's own careers page, the recruiter's
+    signature links and a tracking pixel. Ranking a greenhouse/ashby/lever/workday URL first
+    means the right one is processed even when it is the fifth link in the body.
+    """
+    seen, ats, other = set(), [], []
+    for u in _URL_RE.findall(text or ""):
+        u = u.rstrip(".,;:'\">)")
+        if u in seen or _URL_SKIP.search(u):
+            continue
+        seen.add(u)
+        (ats if re.search(r"greenhouse\.io|ashbyhq\.com|lever\.co|myworkdayjobs\.com|"
+                          r"gh_jid=|jobs\.|careers", u, re.I) else other).append(u)
+    return ats + other
+
+
+def _inbox_render(cand: dict, harvest: dict | None) -> str:
+    """The reply. Written to be read on a phone, verdict first.
+
+    ⚠️ EVERY NUMBER SAYS WHERE IT CAME FROM. A band read off the employer's page and a band a
+    model inferred are not the same fact, and this reply is the thing he will act on.
+    """
+    L = []
+    gates_ok, why = [], []
+    band = ""
+    if cand.get("comp_min"):
+        src = {"board": "employer's own pay field", "employer_page": "employer page",
+               "posting_verified": "the live posting", "body_regex": "the posting text",
+               "model_unverified": "A MODEL, UNVERIFIED"}.get(cand.get("comp_source"), cand.get("comp_source") or "?")
+        band = f"${cand['comp_min']:,}-${cand['comp_max']:,} ({src})"
+        floor = comp_floor()
+        # ⚠️ An unknown floor is not a passed gate. Say so rather than scoring it green.
+        if floor:
+            gates_ok.append(cand["comp_min"] >= floor)
+        else:
+            why.append("pay floor UNKNOWN (candidate.toml not synced), so the band was not judged")
+        if floor and cand["comp_min"] < floor:
+            why.append(f"band starts below the ${floor:,} floor")
+    else:
+        band = "NONE STATED"
+        why.append("no band published")
+    rv = cand.get("remote_verdict") or "unknown"
+    ok_remote = rv in ("fully_remote", "remote_in_metro", "hybrid_commutable", "remote_with_residency")
+    gates_ok.append(ok_remote)
+    if not ok_remote:
+        why.append(f"remote verdict is {rv}")
+
+    L.append(f"{cand.get('company') or '?'} — {cand.get('title') or '?'}")
+    L.append("")
+    L.append(f"  fit score   {cand.get('score')}  ({cand.get('verdict') or '?'})")
+    L.append(f"  band        {band}")
+    L.append(f"  location    {cand.get('location') or '?'}   [{rv}]")
+    if cand.get("remote_evidence"):
+        L.append(f"              {str(cand['remote_evidence'])[:150]}")
+    if harvest and harvest.get("tier"):
+        L.append(f"  form        tier {harvest['tier']}, {harvest.get('n_written') or 0} written answer(s)")
+    g = json.loads((harvest or {}).get("gates") or "[]")
+    if g:
+        L.append("")
+        L.append("  GATE QUESTIONS ON THE FORM, read these first:")
+        L += [f"    - {x[:150]}" for x in g[:6]]
+    elif harvest:
+        L.append("  no gate-shaped question matched (not proof there is none)")
+    L.append("")
+    # 🚨 A GATE ON THE FORM CHANGES THE VERDICT, IT DOES NOT JUST GET PRINTED. The first
+    # version listed "4 days a week onsite (Monday-Thursday)" and still said WORTH APPLYING TO
+    # in the next line, which is the summary contradicting its own evidence. That is worse than
+    # not showing the gates, because it teaches you to trust the one-line verdict.
+    # ⚠️ It does NOT auto-reject on a gate. His standing principle is that an attendance
+    # condition is an OFFER-stage decision, so the verdict qualifies rather than refuses.
+    if not all(gates_ok):
+        L.append("  >>> DOES NOT CLEAR THE GATES")
+    elif g:
+        L.append(f"  >>> WORTH APPLYING TO, BUT READ THE {len(g)} GATE QUESTION(S) ABOVE FIRST")
+    else:
+        L.append("  >>> WORTH APPLYING TO")
+    # ⚠️ CAVEATS PRINT WHETHER OR NOT THE VERDICT FAILED. They used to print only on a
+    # failure, so "pay floor UNKNOWN, the band was not judged" was silently dropped under a
+    # clean WORTH APPLYING TO. A verdict that hides why it might be wrong is the worst line
+    # in the whole reply.
+    if why:
+        L += [f"      {w}" for w in why]
+    if cand.get("reasoning"):
+        L.append("")
+        L.append("  why that score:")
+        L.append(f"    {str(cand['reasoning'])[:600]}")
+    L.append("")
+    L.append(f"  {cand.get('url')}")
+    L.append("")
+    L.append("  Reply is automatic and unsigned. It cannot apply for anything.")
+    return "\n".join(L)
+
+
 def job_gate_audit() -> str:
     """A model checks what the gate regex missed. It PROPOSES; it never edits a gate.
 
@@ -6124,6 +6276,203 @@ def job_gate_audit() -> str:
             + (f", {fail} model call(s) failed" if fail else ""))
 
 
+
+
+def _inbox_fetch(url: str) -> dict:
+    """One posting, from its own platform's API. Returns a dict shaped like the scanner's.
+
+    ⭐ THE PLATFORM API, NOT A SCRAPE, FOR THE SAME REASON THE SCANNER USES ONE: it returns the
+    posting and only the posting. A Greenhouse BOARD page can carry several jobs, and reading
+    the highest band off one of those once recorded a Level 1 service desk role at
+    $150,000-$175,000 that belonged to a Cybersecurity req further down the page.
+    """
+    import html as _h
+    # ⚠️ urllib.parse TOO. The gh_jid branch calls urlparse, and importing only
+    # urllib.request leaves it a NameError at RUN time on the one path that uses it.
+    import urllib.error, urllib.parse, urllib.request
+    ua = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Accept": "application/json"}
+    def _get(u):
+        with urllib.request.urlopen(urllib.request.Request(u, headers=ua), timeout=30) as r:
+            return json.loads(r.read().decode())
+    strip = lambda s: " ".join(_h.unescape(re.sub(r"<[^>]+>", " ", s or "")).split())
+
+    m = re.search(r"(?:job-boards|boards)(?:\.eu)?\.greenhouse\.io/([^/?#]+)/jobs/(\d+)", url)
+    gh_embed = re.search(r"gh_jid=(\d+)", url)
+    if m or gh_embed:
+        if m:
+            tok, jid = m.groups()
+        else:
+            # An employer-hosted page carries the job id but not the board token; the token is
+            # the host's own name often enough to try, and a 404 here is a clean failure.
+            jid = gh_embed.group(1)
+            tok = re.sub(r"^www\.|\.(com|io|ai|co)$", "", urllib.parse.urlparse(url).netloc).split(".")[0]
+        d = _get(f"https://api.greenhouse.io/v1/boards/{tok}/jobs/{jid}")
+        return {"title": d.get("title"), "location": (d.get("location") or {}).get("name"),
+                "description": strip(d.get("content")), "url": url,
+                "req_id": f"greenhouse|{tok}:{jid}", "board": f"greenhouse|{tok}",
+                "company": d.get("company_name") or tok, "is_remote": None,
+                "comp": None}
+
+    m = re.search(r"jobs\.ashbyhq\.com/([^/?#]+)/([0-9a-f-]{36})", url)
+    if m:
+        org, uid = m.groups()
+        d = _get(f"https://api.ashbyhq.com/posting-api/job-board/{org}?includeCompensation=true")
+        for j in d.get("jobs", []):
+            if j.get("id") == uid:
+                comp = (j.get("compensation") or {}).get("scrapeableCompensationSalarySummary")
+                return {"title": j.get("title"), "location": j.get("location"),
+                        "description": j.get("descriptionPlain") or "", "url": url,
+                        "req_id": f"ashby|{org}:{uid}", "board": f"ashby|{org}",
+                        "company": org, "is_remote": j.get("isRemote"), "comp": comp}
+        raise RuntimeError("posting is not on the Ashby board (gone, or wrong org)")
+
+    m = re.search(r"jobs\.lever\.co/([^/?#]+)/([0-9a-f-]{36})", url)
+    if m:
+        site, uid = m.groups()
+        for j in _get(f"https://api.lever.co/v0/postings/{site}?mode=json&limit=200"):
+            if j.get("id") == uid:
+                sr = j.get("salaryRange") or {}
+                return {"title": j.get("text"),
+                        "location": (j.get("categories") or {}).get("location"),
+                        "description": strip(j.get("descriptionPlain") or j.get("description")),
+                        "url": url, "req_id": f"lever|{site}:{uid}", "board": f"lever|{site}",
+                        "company": site, "is_remote": None,
+                        "comp": (f"${sr['min']:,} - ${sr['max']:,}" if sr.get("min") else None)}
+        raise RuntimeError("posting is not on the Lever board (gone, or wrong site)")
+
+    m = _WD_URL.match(url)
+    if m:
+        tn, wd, site, path = m.groups()
+        d = _get(f"https://{tn}.{wd}.myworkdayjobs.com/wday/cxs/{tn}/{site}/job/{path}")
+        info = d.get("jobPostingInfo") or {}
+        return {"title": info.get("title"), "location": info.get("location"),
+                "description": strip(info.get("jobDescription")), "url": url,
+                "req_id": f"workday|{tn}:{info.get('jobReqId') or path[:60]}",
+                "board": f"workday|{tn}", "company": tn, "is_remote": None, "comp": None}
+
+    raise RuntimeError("unrecognised ATS. Send a Greenhouse, Ashby, Lever or Workday link.")
+
+
+def _inbox_evaluate(url: str) -> dict:
+    """Fetch, store and SCORE one posting. Returns the scan_candidate row.
+
+    ⭐ IT DOES NOT SCORE ANYTHING ITSELF. It inserts with triaged=0 and calls the existing
+    job_triage, which owns the profile, the prompt, the pack batching and the vocabulary. A
+    second scorer would drift from the first, and the whole queue would then hold two kinds of
+    score that look identical.
+    """
+    with db() as con:
+        row = con.execute("SELECT * FROM scan_candidate WHERE url=?", (url,)).fetchone()
+    if row and dict(row).get("triaged"):
+        return dict(row)                                      # already known and scored
+
+    if not row:
+        pst = _inbox_fetch(url)
+        band = _comp_at_insert(pst)
+        with db() as con:
+            con.execute(
+                "INSERT INTO scan_candidate (at,req_id,board,title,location,comp,is_remote,"
+                "url,description,triaged,comp_min,comp_max,comp_basis,comp_evidence,"
+                "comp_source,company,company_source) VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?)",
+                (now(), pst["req_id"], pst["board"], pst["title"], pst.get("location"),
+                 pst.get("comp"),
+                 (None if pst.get("is_remote") is None else (1 if pst["is_remote"] else 0)),
+                 url, (pst.get("description") or "")[:AI_MAX_BODY_CHARS],
+                 *(band or (None, None, None, None, None)),
+                 pst.get("company"), "inbox_url"))
+    job_triage()
+    job_remote_check()
+    with db() as con:
+        row = con.execute("SELECT * FROM scan_candidate WHERE url=?", (url,)).fetchone()
+    if not row:
+        raise RuntimeError("stored the posting but could not read it back")
+    return dict(row)
+
+
+def job_inbox_url() -> str:
+    """Mail a job link to the inbox alias, get a verdict back.
+
+    ⭐ WHY THIS IS SMALL. Every piece already existed and none of it is duplicated here: the
+    catch-all already delivers mail to this service, fetch/comp/gates/place already turn a URL
+    into a scored candidate, the Cloud Run harvester already reads the form, and harvest_tier
+    already computes the letter. This job is the wiring plus one reply.
+
+    🚨 THE REPLY GOES TO ONE HARDCODED ADDRESS AND CANNOT BE REDIRECTED. See INBOX_REPLY_TO.
+    /send still refuses without a human's Ed25519 signature and this does NOT touch it.
+
+    ⚠️ IT PROCESSES ONLY MAIL SENT TO THE INBOX ALIAS. A recruiter's mail to a company alias
+    is full of URLs and must never be treated as a request to evaluate a job.
+    """
+    if not INBOX_REPLY_TO or not INBOX_REPLY_FROM:
+        return "inbox_url: SKIPPED, INBOX_REPLY_TO or INBOX_REPLY_FROM is unset"
+    alias_at = f"{INBOX_ALIAS}@"
+    with db() as con:
+        msgs = [dict(r) for r in con.execute(
+            "SELECT id, subject, body_text, body_reply, message_id, references_hdr, to_alias "
+            "  FROM message WHERE lower(to_alias) LIKE ? ORDER BY id DESC LIMIT 40",
+            (alias_at + "%",))]
+    todo = []
+    for m in msgs:
+        for u in inbox_urls((m["subject"] or "") + " " + (m["body_reply"] or m["body_text"] or "")):
+            with db() as con:
+                seen = con.execute("SELECT 1 FROM inbox_request WHERE message_id=? AND url=?",
+                                   (m["id"], u)).fetchone()
+            if not seen:
+                todo.append((m, u))
+                break                      # one posting per message; the first ATS link wins
+        if len(todo) >= INBOX_BATCH:
+            break
+    if not todo:
+        return "inbox_url: nothing new"
+
+    done = failed = 0
+    for m, url in todo:
+        with db() as con:
+            con.execute("INSERT OR IGNORE INTO inbox_request (message_id,url,at,state) "
+                        "VALUES (?,?,?,'working')", (m["id"], url, now()))
+        try:
+            cand = _inbox_evaluate(url)
+        except Exception as e:                                # noqa: BLE001
+            failed += 1
+            with db() as con:
+                con.execute("UPDATE inbox_request SET state='error', detail=? "
+                            " WHERE message_id=? AND url=?",
+                            (f"{type(e).__name__}: {e}"[:400], m["id"], url))
+            audit("inbox_url_error", f"msg {m['id']}: {type(e).__name__}: {e}")
+            continue
+        harvest = None
+        if HARVESTER_URL and HARVEST_TOKEN:
+            try:
+                out = _harvest_call([url])
+                res = (out.get("results") or [{}])[0]
+                if res and not res.get("error"):
+                    with db() as con:
+                        _harvest_store(con, cand.get("id"), res)
+                        row = con.execute("SELECT * FROM harvest WHERE url=?", (url,)).fetchone()
+                    harvest = dict(row) if row else None
+            except Exception as e:                            # noqa: BLE001
+                # ⚠️ Never fatal. A form we could not read still leaves a scored posting worth
+                # replying about; losing the whole verdict over it would be the wrong trade.
+                audit("inbox_url_harvest_failed", f"{url}: {type(e).__name__}")
+        body = _inbox_render(cand, harvest)
+        subj = f"Re: {(m['subject'] or 'job link')[:120]}"
+        try:
+            _send_via_resend(INBOX_REPLY_FROM, INBOX_REPLY_TO, subj, body, m)
+            state, detail = "replied", None
+        except Exception as e:                                # noqa: BLE001
+            state, detail = "analysed_no_reply", f"{type(e).__name__}: {e}"[:300]
+        with db() as con:
+            con.execute("UPDATE inbox_request SET state=?, candidate_id=?, replied_at=?, detail=? "
+                        " WHERE message_id=? AND url=?",
+                        (state, cand.get("id"), now() if state == "replied" else None,
+                         detail, m["id"], url))
+        done += 1
+    audit("inbox_url_run", f"{done} processed, {failed} failed")
+    return f"inbox_url: {done} processed, {failed} failed"
+
+
 def job_table() -> list:
     """
     The one place a scheduled job is declared.
@@ -6166,7 +6515,9 @@ def job_table() -> list:
             # ⚠️ AFTER harvest, and manual-only by default. It costs a model call per form and
             # it decides nothing, so it should run when someone wants the evidence, not on a
             # timer nobody reads.
-            ("gate_audit", GATE_AUDIT_EVERY_MIN * 60, job_gate_audit)]
+            ("gate_audit", GATE_AUDIT_EVERY_MIN * 60, job_gate_audit),
+            # 📥 Mail a link, get a verdict. Manual-only by default until the alias is in use.
+            ("inbox_url", INBOX_EVERY_MIN * 60, job_inbox_url)]
 
 
 async def _scheduler() -> None:
