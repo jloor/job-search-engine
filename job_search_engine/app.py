@@ -173,6 +173,13 @@ def db():
 # JSON body stays a reasonable size.
 _HRANA_BATCH = int(os.environ.get("HRANA_BATCH", "200"))
 
+# 🚨 A WRITE LOCK ABORTED A WHOLE BOARD SWEEP FOUR TIMES IN ONE DAY. Measured 2026-08-29 at
+# 04:12, 05:42, 21:12 and 2026-08-30 at 01:42: `job_scan_error: bunny db error: SQLite error:
+# database is locked`, each one ending a sweep of 2,941 boards. The lock is momentary and
+# belongs to whichever writer got there first, so the answer is to wait and continue.
+_DB_LOCKED = re.compile(r"database is locked|database table is locked|SQLITE_BUSY", re.I)
+_HRANA_RETRIES = int(os.environ.get("HRANA_RETRIES", "5"))
+
 
 class _Hrana:
     """
@@ -230,8 +237,8 @@ class _Hrana:
             return base64.b64decode(c.get("base64", ""))
         return c.get("value")
 
-    def _pipeline(self, stmts: list) -> list:
-        import urllib.request, urllib.error
+    def _post(self, stmts: list) -> dict:
+        import urllib.error, urllib.request
         body = json.dumps({"requests": [{"type": "execute", "stmt": s} for s in stmts]
                                        + [{"type": "close"}]}).encode()
         req = urllib.request.Request(
@@ -240,20 +247,52 @@ class _Hrana:
                      "Authorization": f"Bearer {self._token}"})
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
-                payload = json.loads(r.read())
+                return json.loads(r.read())
         except urllib.error.HTTPError as e:
             # P3: fail loudly. A silent storage failure is how mail gets lost.
             raise RuntimeError(f"bunny db HTTP {e.code}: {e.read().decode(errors='replace')[:300]}") from None
 
-        out = []
-        for res in payload.get("results", []):
-            if res.get("type") == "error":
-                err = res.get("error", {})
-                raise RuntimeError(f"bunny db error: {err.get('message', err)}")
-            resp = res.get("response") or {}
-            if resp.get("type") == "execute":
-                out.append(resp.get("result") or {})
-        return out
+    def _pipeline(self, stmts: list) -> list:
+        """Send statements, retrying only the ones a write lock actually stopped.
+
+        🚨 IT RESUMES AT THE FAILED STATEMENT, IT DOES NOT RESEND THE BATCH. There is no
+        transaction around a pipeline: each statement autocommits as the server reaches it.
+        So when statement 50 of 200 hits the lock, statements 1 to 49 HAVE ALREADY APPLIED.
+        Retrying the whole batch would apply them a second time, and while most writes here
+        are INSERT OR IGNORE or an UPDATE with a WHERE, some are not. Silent double
+        insertion is a worse failure than the abort this replaces.
+
+        ⭐ WHY RETRY AND NOT A WRITE QUEUE. The lock is held for milliseconds by whoever is
+        writing at that instant, and it is not always us: the nightly backup reads, the MCP
+        server reads, a manual job writes. A queue can only serialise THIS process, so it
+        would add a bottleneck and a memory risk while still losing the sweep to any writer
+        outside it. Backoff answers the actual question, which is "wait, then continue".
+
+        ⚠️ ONLY A LOCK IS RETRIED. A constraint violation or a syntax error is a bug, and
+        repeating it changes nothing except how long it takes to find out.
+        """
+        import random
+        out, pending, attempt = [], list(stmts), 0
+        while True:
+            payload = self._post(pending)
+            failed_at = None
+            for idx, res in enumerate(payload.get("results", [])):
+                if res.get("type") == "error":
+                    failed_at = (idx, res.get("error", {}) or {})
+                    break
+                resp = res.get("response") or {}
+                if resp.get("type") == "execute":
+                    out.append(resp.get("result") or {})
+            if failed_at is None:
+                return out
+            idx, err = failed_at
+            msg = str(err.get("message", err))
+            if not _DB_LOCKED.search(msg) or attempt >= _HRANA_RETRIES:
+                raise RuntimeError(f"bunny db error: {msg}")
+            attempt += 1
+            # Exponential, with jitter so two writers that collide do not retry in step.
+            time.sleep(min(8.0, 0.25 * 2 ** attempt) * (0.5 + random.random()))
+            pending = pending[idx:]
 
     def execute(self, sql, params=()):
         stmt = {"sql": sql, "args": [self._arg(p) for p in params]}

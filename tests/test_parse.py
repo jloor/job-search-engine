@@ -4340,6 +4340,46 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("no board from a linkedin link",
           app.inbox_register_board("https://www.linkedin.com/jobs/view/4285561079"), None)
     # An ATS link in the same mail outranks the LinkedIn one: it is the archivable record.
+    # 🚨 A WRITE LOCK MUST NOT COST A WHOLE SWEEP, AND THE RETRY MUST NOT DOUBLE-WRITE.
+    # Four sweeps of 2,941 boards died on "database is locked" in one day. There is no
+    # transaction around a pipeline, so the statements before the failure HAVE applied;
+    # resending the batch would apply them twice. The retry must resume at the failure.
+    h = app._Hrana.__new__(app._Hrana)
+    sent = []
+    ok = lambda: {"type": "ok", "response": {"type": "execute", "result": {"rows": []}}}
+    lock = {"type": "error", "error": {"message": "SQLite error: database is locked"}}
+
+    def fake_post(stmts, _state={"n": 0}):
+        sent.append([x["sql"] for x in stmts])
+        _state["n"] += 1
+        if _state["n"] == 1:                       # first try: 3 apply, the 4th is locked
+            return {"results": [ok(), ok(), ok(), lock]}
+        return {"results": [ok() for _ in stmts]}  # retry: the rest apply
+
+    h._post = fake_post
+    import time as _t
+    _sleep, _t.sleep = _t.sleep, lambda s: None
+    try:
+        out = h._pipeline([{"sql": f"S{i}", "args": []} for i in range(6)])
+    finally:
+        _t.sleep = _sleep
+    check("every statement's result is returned once", len(out), 6)
+    check("the retry resumes at the failed statement, not the start",
+          sent[1], ["S3", "S4", "S5"])
+    check("the three that applied are never resent",
+          any(x in sent[1] for x in ("S0", "S1", "S2")), False)
+
+    # ⚠️ A bug must not be retried: repeating it only delays the report.
+    def constraint_post(stmts):
+        return {"results": [{"type": "error",
+                             "error": {"message": "SQLite error: UNIQUE constraint failed"}}]}
+    h._post = constraint_post
+    try:
+        h._pipeline([{"sql": "S", "args": []}])
+        check("a constraint error is raised, not retried", "no raise", "RuntimeError")
+    except RuntimeError as e:
+        check("a constraint error is raised, not retried", "UNIQUE" in str(e), True)
+
     # 🚨 A LONG JOB MUST NOT BLOCK THE SHORT ONES BEHIND IT. Measured 2026-08-29 in
     # production: `scan` had run 772 of the 804 seconds since boot and every job listed
     # after it, including inbox_url on a 180-second interval, had not run once. The
