@@ -6318,7 +6318,7 @@ def _inbox_render(cand: dict, harvest: dict | None, n_in_mail: int = 1) -> str:
         why.append(f"remote verdict is {rv}")
 
     hist = (harvest or {}).get("_history") or {}
-    L.append(f"{cand.get('company') or '?'} — {cand.get('title') or '?'}")
+    L.append(f"{cand.get('company') or '?'}: {cand.get('title') or '?'}")
     # ⭐ SAY IT WAS ONE OF SEVERAL. He sends batches, and each posting gets its OWN mail
     # because each needs its own [JOB-nnn] tag for answers and its own company alias. Without
     # this line a batch of six arrives as six unrelated emails with no sign they belong
@@ -6374,6 +6374,23 @@ def _inbox_render(cand: dict, harvest: dict | None, n_in_mail: int = 1) -> str:
     # "DOES NOT CLEAR THE GATES" because triage had skipped it and the remote verdict was
     # still NULL. Nothing had judged it at all. A reply that reads as a rejection on a job
     # nobody scored is worse than no reply, because he would skip it.
+    # ⚠️ SAY WHAT A LINKEDIN LINK CANNOT ANSWER. The guest payload has no apply link, so
+    # neither the form nor the board token exists. Printing the same verdict shape as an ATS
+    # link would let "no gate-shaped question matched" read as "the form is clean" on a form
+    # that was never opened.
+    note = (harvest or {}).get("_linkedin_note")
+    if note and not linkedin_job_id(cand.get("url") or ""):
+        L.append(f"  FROM LINKEDIN: {note}")
+        L.append("")
+    if linkedin_job_id(cand.get("url") or ""):
+        if note:
+            L.append(f"  WHY IT STAYED A LEAD: {note}")
+        L.append("  READ FROM LINKEDIN, SO TWO THINGS ARE MISSING:")
+        L.append("    - the form was not read: no tier, and no gate questions either way")
+        L.append("    - no board token, so this company was NOT added to the nightly scan")
+        L.append("    For both, tap Apply and forward the employer's own link instead.")
+        L.append("")
+
     unknown = []
     if cand.get("score") is None:
         unknown.append("not scored yet (triage has not run on it)")
@@ -6533,6 +6550,204 @@ def job_gate_audit() -> str:
 
 
 
+_LI_JOB = re.compile(r"linkedin\.com/(?:[a-z]{2}/)?(?:comm/)?jobs/view/(\d{6,})"
+                     r"|linkedin\.com/jobs[^\s]*[?&]currentJobId=(\d{6,})", re.I)
+
+
+_ATS_SUFFIX = re.compile(r"(inc|llc|ltd|corp|corporation|company|technologies|technology|"
+                         r"labs|software|systems|group|holdings|global|usa|io|ai|hq)$")
+
+
+def _ats_board_titles(platform: str, token: str) -> list:
+    """(title, url) for one board, or [] if that board does not exist.
+
+    🚨 THE LIVE BOARD DECIDES, NOT scan_board. Measured 2026-08-29: `retool` is present in
+    scan_board on BOTH greenhouse and lever, and both 404. A row in that table proves a board
+    was seen once, never that it answers today, and trusting it made the resolver report a
+    company as reachable when nothing was there.
+    """
+    import urllib.request
+    ua = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    api = {"greenhouse": f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs",
+           "ashby": f"https://api.ashbyhq.com/posting-api/job-board/{token}",
+           "lever": f"https://api.lever.co/v0/postings/{token}?mode=json"}.get(platform)
+    if not api:
+        return []
+    try:
+        with urllib.request.urlopen(urllib.request.Request(api, headers=ua), timeout=25) as r:
+            d = json.loads(r.read().decode())
+    except Exception:                                         # noqa: BLE001
+        return []
+    if platform == "greenhouse":
+        return [(j.get("title"), j.get("absolute_url"), (j.get("location") or {}).get("name"))
+                for j in (d.get("jobs") or [])]
+    if platform == "ashby":
+        return [(j.get("title"), j.get("jobUrl"), j.get("location")) for j in (d.get("jobs") or [])]
+    return [(j.get("text"), j.get("hostedUrl"), (j.get("categories") or {}).get("location"))
+            for j in (d or [])]
+
+
+def linkedin_resolve_ats(company: str, title: str, slug: str = "",
+                         location: str = "") -> dict | None:
+    """The employer's own posting URL for a job seen on LinkedIn.
+
+    Returns {"url": ...} on exactly one match, {"ambiguous": n} when the title alone cannot
+    pick one, or None when the employer is not reachable on a supported board.
+
+    🚨 THIS EXISTS BECAUSE LINKEDIN WILL NOT GIVE UP THE APPLY LINK. Measured 2026-08-29
+    against live postings: the guest payload carries no externalApply parameter and no ATS
+    URL (0 of 13), the full public page carries none either (0 of 6, and the single match was
+    LinkedIn's own marketing link), /jobs/view/externalApply/<id> answers 400 and
+    /job-apply/<id> answers 404. The link is behind the login. So it is looked UP instead of
+    followed: LinkedIn supplies the employer and the title, the employer's board supplies the
+    URL.
+
+    🚨 AMBIGUITY IS REFUSED, NOT GUESSED, AND THIS IS THE WHOLE RISK. A wrong match archives
+    one requisition under another's URL and reads the wrong form. The first version returned
+    the first title match and resolved a Datadog posting to a DIFFERENT req with the same
+    title, because employers list one role in several locations. So: every match is collected,
+    the LinkedIn location is used to break a tie, and anything still ambiguous returns a count
+    for the reply to report instead of a URL.
+
+    ⚠️ The title must match after normalisation, or contain the other and be at least 60% of
+    its length. "Support Engineer" must not silently become "Support Engineering Manager".
+    """
+    n = re.sub(r"[^a-z0-9]", "", (company or "").lower())
+    if not n or not title:
+        return None
+    tokens = [t for t in dict.fromkeys([n, _ATS_SUFFIX.sub("", n),
+                                        re.sub(r"[^a-z0-9]", "", (slug or "").lower())]) if len(t) > 2]
+    flat = lambda x: " ".join(re.sub(r"[^a-z0-9 ]", " ", (x or "").lower()).split())
+    want = flat(title)
+    # ⚠️ THE CITY IS TAKEN BEFORE FLATTENING. flat() strips the commas, so splitting the
+    # flattened string on one returns the whole location and the tie-break can never fire.
+    city = flat((location or "").split(",")[0])
+    for tok in tokens:
+        for platform in ("greenhouse", "ashby", "lever"):
+            hits = []
+            for t, u, loc in _ats_board_titles(platform, tok):
+                got = flat(t)
+                if not got or not u:
+                    continue
+                if got == want or ((got in want or want in got) and
+                                   min(len(got), len(want)) >= 0.6 * max(len(got), len(want))):
+                    hits.append((u, flat(loc)))
+            if len(hits) > 1 and city:
+                # The city is usually what separates two reqs that share one title.
+                narrowed = [h for h in hits if city in h[1]]
+                if len(narrowed) == 1:
+                    return {"url": narrowed[0][0]}
+            if len(hits) == 1:
+                return {"url": hits[0][0]}
+            if hits:
+                return {"ambiguous": len(hits)}
+    return None
+
+
+def linkedin_job_id(url: str) -> str | None:
+    """The numeric job id out of any of the shapes LinkedIn hands out on mobile.
+
+    ⚠️ THE SHARE SHEET DOES NOT GIVE ONE CANONICAL URL. Tapping share on a posting yields
+    /jobs/view/<id>, browsing a saved list yields /jobs/collections/...?currentJobId=<id>,
+    and mail from LinkedIn itself yields /comm/jobs/view/<id>. All three are the same job,
+    and matching only the first would silently drop the other two as unrecognised.
+    """
+    m = _LI_JOB.search(url or "")
+    return (m.group(1) or m.group(2)) if m else None
+
+
+def _linkedin_posting(jid: str, url: str) -> dict:
+    """One LinkedIn posting, from the endpoint that serves logged-out visitors.
+
+    🚨 THIS IS A LEAD, NOT AN ARCHIVE, AND THE DIFFERENCE IS THE APPLY LINK. The guest
+    payload carries the title, the employer, the location and the full description, which is
+    everything the score needs. It does NOT carry the employer's own ATS URL: verified
+    2026-08-29 against a live posting, there is no externalApply parameter and no
+    greenhouse/ashby/lever link anywhere in the HTML. So the form cannot be read, the tier
+    cannot be computed, and no board token exists to add to the nightly scan. The reply says
+    so rather than reporting a silent zero.
+    ⚠️ A dead posting answers 404 here, which is a clean failure and NOT an empty result.
+    """
+    import html as _h
+    import time
+    import urllib.error, urllib.request
+    ua = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
+    req = urllib.request.Request(
+        f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{jid}", headers=ua)
+    # ⚠️ LINKEDIN THROTTLES A BATCH, AND THE FAILURE LOOKS LIKE A DEAD POSTING. Reading 44
+    # ids back to back on 2026-08-29 returned only 14; the same ids read one at a time, two
+    # seconds apart, ALL returned 200. Without this a batch of ten forwarded links would come
+    # back mostly "could not read", and he would think the postings had expired.
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                b = r.read().decode("utf-8", "replace")
+            break
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 410):                          # genuinely gone, do not retry
+                raise
+            if attempt == 2:
+                raise
+            time.sleep(3 * (attempt + 1))
+        except Exception:                                     # noqa: BLE001
+            if attempt == 2:
+                raise
+            time.sleep(3 * (attempt + 1))
+
+    def one(pat):
+        m = re.search(pat, b, re.S)
+        return " ".join(_h.unescape(re.sub(r"<[^>]+>", " ", m.group(1))).split()) if m else None
+
+    desc = one(r'description__text.*?<div[^>]*>(.*?)</div>\s*</div>') or ""
+    if not desc:
+        raise RuntimeError(f"LinkedIn served job {jid} with no description body")
+    return {
+        "title": one(r'topcard__title[^>]*>(.*?)</h2>'),
+        "company": one(r'topcard__org-name-link[^>]*>(.*?)</a>'),
+        "location": one(r'topcard__flavor--bullet[^>]*>(.*?)</span>'),
+        # The band is left to _comp_at_insert on the description, with one exception: when
+        # LinkedIn prints its own pay block, that is the employer's published number.
+        # ⚠️ `or None`: an empty match is NOT a band. Stored as "" it reads downstream as a
+        # value that was found, which is the opposite of what an absent pay block means.
+        "comp": one(r'class="[^"]*compensation__salary[^"]*"[^>]*>([^<]*)') or None,
+        # The company's LinkedIn slug is a third candidate board token, and often the best
+        # one: "Datadog" the display name and "datadog" the greenhouse token agree here, but
+        # a display name with punctuation or a suffix frequently does not.
+        "company_slug": (re.search(r'linkedin\.com/company/([^"/?]+)', b) or [None, ""])[1],
+        "description": desc, "url": url, "board": None,
+        "req_id": f"linkedin|{jid}", "is_remote": None, "source": "linkedin",
+    }
+
+
+def inbox_resolve_linkedin(url: str) -> tuple:
+    """(url to process, note for the reply). A LinkedIn link becomes the employer's own URL.
+
+    ⭐ THIS IS THE WHOLE POINT OF THE SECONDARY PASS. Resolved, the LinkedIn link stops being
+    a lead and becomes a normal posting: the archive is the employer's, the form is read, the
+    tier is computed, and the board joins the nightly scan. Unresolved, it stays a lead and
+    the reply says which of the two reasons applied.
+    """
+    jid = linkedin_job_id(url)
+    if not jid:
+        return url, None
+    try:
+        pst = _linkedin_posting(jid, url)
+    except Exception:                                         # noqa: BLE001
+        return url, None
+    r = linkedin_resolve_ats(pst.get("company"), pst.get("title"),
+                             pst.get("company_slug") or "", pst.get("location") or "")
+    if r and r.get("url"):
+        return r["url"], ("found the employer's own posting for this LinkedIn link, "
+                          "so the form and the board were read too")
+    if r and r.get("ambiguous"):
+        return url, (f"{r['ambiguous']} postings on their board share this title, so the "
+                     "employer's URL was NOT guessed. Read as a LinkedIn lead only.")
+    return url, ("this employer is not on Greenhouse, Ashby or Lever, so there is no "
+                 "employer URL to find. Read as a LinkedIn lead only.")
+
+
 def _inbox_fetch(url: str) -> dict:
     """One posting, from its own platform's API. Returns a dict shaped like the scanner's.
 
@@ -6552,6 +6767,10 @@ def _inbox_fetch(url: str) -> dict:
         with urllib.request.urlopen(urllib.request.Request(u, headers=ua), timeout=30) as r:
             return json.loads(r.read().decode())
     strip = lambda s: " ".join(_h.unescape(re.sub(r"<[^>]+>", " ", s or "")).split())
+
+    jid = linkedin_job_id(url)
+    if jid:
+        return _linkedin_posting(jid, url)
 
     m = re.search(r"(?:job-boards|boards)(?:\.eu)?\.greenhouse\.io/([^/?#]+)/jobs/(\d+)", url)
     gh_embed = re.search(r"gh_jid=(\d+)", url)
@@ -6677,11 +6896,15 @@ def job_inbox_url() -> str:
         per_msg = 0
         found = inbox_urls((m["subject"] or "") + " " + (m["body_reply"] or m["body_text"] or ""))
         for u in found:
+            try:
+                u, li_note = inbox_resolve_linkedin(u)
+            except Exception:                                 # noqa: BLE001
+                li_note = None
             with db() as con:
                 seen = con.execute("SELECT 1 FROM inbox_request WHERE message_id=? AND url=?",
                                    (m["id"], u)).fetchone()
             if not seen:
-                todo.append((m, u, len(found)))
+                todo.append((m, u, len(found), li_note))
                 per_msg += 1
                 # ⚠️ A CAP PER MESSAGE, NOT A LIMIT OF ONE. Every URL costs a fetch, a model
                 # call and a browser harvest, so a mail with forty links must not become forty
@@ -6694,7 +6917,7 @@ def job_inbox_url() -> str:
         return "inbox_url: nothing new"
 
     done = failed = 0
-    for m, url, n_in_mail in todo:
+    for m, url, n_in_mail, li_note in todo:
         with db() as con:
             con.execute("INSERT OR IGNORE INTO inbox_request (message_id,url,at,state) "
                         "VALUES (?,?,?,'working')", (m["id"], url, now()))
@@ -6731,6 +6954,7 @@ def job_inbox_url() -> str:
             # ⚠️ Never fatal. Failing to widen the scan must not cost him the verdict.
             harvest["_board_added"] = None
             audit("inbox_board_failed", f"{url}: {type(e).__name__}")
+        harvest["_linkedin_note"] = li_note
         body = _inbox_render(cand, harvest, n_in_mail=n_in_mail)
         # 🚨 THE TAG IS HOW A REPLY FINDS ITS WAY HOME, and it is in the SUBJECT on purpose.
         # Matching on In-Reply-To would need the RFC Message-ID of the mail we sent, and the

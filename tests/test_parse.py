@@ -4321,6 +4321,59 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("a non-ATS url registers nothing",
           app.inbox_register_board("https://example.com/careers"), None)
     check("an empty url registers nothing", app.inbox_register_board(""), None)
+
+    # He browses on his phone, and the LinkedIn share sheet hands out three different URL
+    # shapes for the same posting. Matching only /jobs/view would drop the other two as
+    # unrecognised, which is the failure that looks like "the batch worked" minus some rows.
+    for label, u in [
+        ("share sheet", "https://www.linkedin.com/jobs/view/4285561079"),
+        ("saved list", "https://www.linkedin.com/jobs/collections/recommended/?currentJobId=4285561079"),
+        ("linkedin's own mail", "https://www.linkedin.com/comm/jobs/view/4285561079/?trk=eml"),
+        ("locale prefix", "https://www.linkedin.com/de/jobs/view/4285561079"),
+    ]:
+        check(f"linkedin id, {label}", app.linkedin_job_id(u), "4285561079")
+    check("a profile is not a job", app.linkedin_job_id("https://www.linkedin.com/in/x"), None)
+    check("an ats url is not linkedin",
+          app.linkedin_job_id("https://job-boards.greenhouse.io/a/jobs/1"), None)
+    # 🚨 A LinkedIn link yields no board token, so nothing may be registered off it. Silently
+    # registering something guessed from the URL would poison the nightly scan.
+    check("no board from a linkedin link",
+          app.inbox_register_board("https://www.linkedin.com/jobs/view/4285561079"), None)
+    # An ATS link in the same mail outranks the LinkedIn one: it is the archivable record.
+    # 🚨 THE RESOLVER MUST REFUSE A COIN FLIP. LinkedIn gives a company and a title, never the
+    # apply link, so the employer's URL is looked up. Two reqs sharing one title is common
+    # (measured on Datadog's own board), and picking one would archive the wrong requisition
+    # and read the wrong form. Offline: the board reader is stubbed, so no network here.
+    _real = app._ats_board_titles
+    try:
+        BOARD = [("Support Engineer", "https://x/1", "New York, NY"),
+                 ("Support Engineer", "https://x/2", "Tokyo, Japan"),
+                 ("Support Engineering Manager", "https://x/3", "Remote"),
+                 ("Data Scientist", "https://x/4", "Remote")]
+        app._ats_board_titles = lambda pl, tok: BOARD if (pl == "greenhouse" and tok == "acme") else []
+        check("two reqs share the title, so refuse",
+              app.linkedin_resolve_ats("Acme", "Support Engineer"), {"ambiguous": 2})
+        check("the city breaks the tie",
+              app.linkedin_resolve_ats("Acme", "Support Engineer", location="New York, NY"),
+              {"url": "https://x/1"})
+        check("a unique title resolves",
+              app.linkedin_resolve_ats("Acme", "Data Scientist"), {"url": "https://x/4"})
+        # "Support Engineer" inside "Support Engineering Manager" is a DIFFERENT job.
+        check("a manager title is not the same role",
+              app.linkedin_resolve_ats("Acme", "Support Engineering Manager"),
+              {"url": "https://x/3"})
+        check("an unknown employer resolves to nothing",
+              app.linkedin_resolve_ats("Nobody Ltd", "Support Engineer"), None)
+        check("the slug is tried as a token",
+              app.linkedin_resolve_ats("Acme Technologies, Inc.", "Data Scientist", slug="acme"),
+              {"url": "https://x/4"})
+    finally:
+        app._ats_board_titles = _real
+
+    check("the ats link is preferred",
+          app.inbox_urls("a https://www.linkedin.com/jobs/view/4285561079 "
+                         "b https://job-boards.greenhouse.io/x/jobs/9")[0],
+          "https://job-boards.greenhouse.io/x/jobs/9")
     check("the reply address is NOT a parameter",
           "to_addr" not in app.job_inbox_url.__code__.co_varnames
           and "INBOX_REPLY_TO" in app.job_inbox_url.__code__.co_names, True)
