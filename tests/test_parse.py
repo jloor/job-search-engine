@@ -4340,6 +4340,22 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("no board from a linkedin link",
           app.inbox_register_board("https://www.linkedin.com/jobs/view/4285561079"), None)
     # An ATS link in the same mail outranks the LinkedIn one: it is the archivable record.
+    # 🚨 A LONG JOB MUST NOT BLOCK THE SHORT ONES BEHIND IT. Measured 2026-08-29 in
+    # production: `scan` had run 772 of the 804 seconds since boot and every job listed
+    # after it, including inbox_url on a 180-second interval, had not run once. The
+    # scheduler awaits jobs in table order, so the fix is to launch the long ones in a
+    # thread. This asserts the shape rather than the timing, because a timing test here
+    # would need a real event loop and a real sweep.
+    import inspect as _i
+    _sched = _i.getsource(app._scheduler)
+    check("the scheduler backgrounds the long jobs", "if name in ASYNC_JOBS:" in _sched, True)
+    check("...and still audits a failure in that thread",
+          "_error" in _sched.split("if name in ASYNC_JOBS:")[1].split("try:")[0]
+          or "job_{n}_error" in _sched, True)
+    # Every job that outlives an HTTP request must be in the set the scheduler backgrounds,
+    # or it silently becomes a blocker again the next time one is added.
+    check("scan is one of them", "scan" in app.ASYNC_JOBS, True)
+
     # 🚨 THE RESOLVER MUST REFUSE A COIN FLIP. LinkedIn gives a company and a title, never the
     # apply link, so the employer's URL is looked up. Two reqs sharing one title is common
     # (measured on Datadog's own board), and picking one would archive the wrong requisition

@@ -7158,6 +7158,30 @@ async def _scheduler() -> None:
             if time.time() - last[name] < interval:
                 continue
             last[name] = time.time()
+            # 🚨 A LONG JOB MUST NOT BLOCK THE SHORT ONES BEHIND IT. This loop is sequential
+            # and awaits each job in table order, so a sweep that runs for an hour also
+            # stops every job listed after it for that hour. Measured 2026-08-29: `scan` had
+            # been running 772 of the 804 seconds since boot, and NOTHING below it in the
+            # table had run once, including inbox_url on its 180-second interval. Mail a job
+            # link during the nightly sweep and the reply simply never comes, with no error
+            # anywhere, because the job did not fail: it was never called.
+            # ⚠️ Safe against a second copy: run_once takes a PER-JOB lock and declines
+            # rather than queues, so the next pass finds it running and skips it.
+            if name in ASYNC_JOBS:
+                def _bg(n=name, f=fn):
+                    # ⚠️ It catches, for the same reason the awaited branch does: a thread
+                    # that dies on an exception writes nothing at all, and absence of news
+                    # reads as success.
+                    try:
+                        d = run_once(n, f)
+                        audit(f"job_{n}", d)
+                        print(f"[scheduler] {n}: {d}", flush=True)
+                    except Exception as e:                    # noqa: BLE001
+                        audit(f"job_{n}_error", f"{type(e).__name__}: {e}")
+                        print(f"[scheduler] {n} FAILED: {type(e).__name__}: {e}", flush=True)
+                threading.Thread(target=_bg, name=f"sched-{name}", daemon=True).start()
+                print(f"[scheduler] {name}: started in the background", flush=True)
+                continue
             try:
                 detail = await asyncio.to_thread(run_once, name, fn)
                 audit(f"job_{name}", detail)
