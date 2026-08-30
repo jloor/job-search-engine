@@ -180,6 +180,18 @@ _HRANA_BATCH = int(os.environ.get("HRANA_BATCH", "200"))
 _DB_LOCKED = re.compile(r"database is locked|database table is locked|SQLITE_BUSY", re.I)
 _HRANA_RETRIES = int(os.environ.get("HRANA_RETRIES", "5"))
 
+# 📊 WHAT ACTUALLY HAPPENS, because the retry above was built on an INFERENCE. The lock was
+# assumed to be held for milliseconds, reasoning from a stateless autocommit transport. That
+# is reasonable and it is not a measurement. These counters make the next collision answer
+# the question: if `exhausted` climbs while `max_wait_s` sits at the ceiling, the lock is
+# long and backoff is the wrong tool. Read them at /diag/config.
+_DB_RETRY = {"locked": 0, "http_429_503": 0, "exhausted": 0,
+             "waited_s": 0.0, "max_wait_s": 0.0, "worst_attempts": 0}
+
+
+class _Retryable(Exception):
+    """The server rejected the request before running it, so nothing was applied."""
+
 
 class _Hrana:
     """
@@ -249,6 +261,16 @@ class _Hrana:
             with urllib.request.urlopen(req, timeout=30) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
+            # 🚨 ONLY 429 AND 503 RETRY, AND THE REASON IS AMBIGUITY, NOT POLITENESS. Those two
+            # are refusals issued BEFORE the statements run, so nothing was applied and the
+            # same batch can be sent again safely. A 502 or a 504 means the request may have
+            # executed and the answer was lost on the way back; resending it could apply every
+            # statement twice. A socket timeout is ambiguous in exactly the same way and is
+            # deliberately NOT caught here. When we cannot prove nothing happened, failing is
+            # the safe answer.
+            if e.code in (429, 503):
+                _DB_RETRY["http_429_503"] += 1
+                raise _Retryable(f"bunny db HTTP {e.code}") from None
             # P3: fail loudly. A silent storage failure is how mail gets lost.
             raise RuntimeError(f"bunny db HTTP {e.code}: {e.read().decode(errors='replace')[:300]}") from None
 
@@ -272,9 +294,31 @@ class _Hrana:
         repeating it changes nothing except how long it takes to find out.
         """
         import random
-        out, pending, attempt = [], list(stmts), 0
+        out, pending, attempt, waited = [], list(stmts), 0, 0.0
+
+        def _hold(reason: str) -> None:
+            """Back off once, or give up and say so."""
+            nonlocal attempt, waited
+            if attempt >= _HRANA_RETRIES:
+                _DB_RETRY["exhausted"] += 1
+                raise RuntimeError(f"bunny db error: {reason} "
+                                   f"(gave up after {attempt} retries, {waited:.1f}s)")
+            attempt += 1
+            # Exponential, with jitter so two writers that collide do not retry in step.
+            pause = min(8.0, 0.25 * 2 ** attempt) * (0.5 + random.random())
+            waited += pause
+            _DB_RETRY["waited_s"] = round(_DB_RETRY["waited_s"] + pause, 2)
+            _DB_RETRY["max_wait_s"] = max(_DB_RETRY["max_wait_s"], round(waited, 2))
+            _DB_RETRY["worst_attempts"] = max(_DB_RETRY["worst_attempts"], attempt)
+            time.sleep(pause)
+
         while True:
-            payload = self._post(pending)
+            try:
+                payload = self._post(pending)
+            except _Retryable as e:
+                # Nothing applied, so the SAME pending list is safe to resend.
+                _hold(str(e))
+                continue
             failed_at = None
             for idx, res in enumerate(payload.get("results", [])):
                 if res.get("type") == "error":
@@ -287,11 +331,10 @@ class _Hrana:
                 return out
             idx, err = failed_at
             msg = str(err.get("message", err))
-            if not _DB_LOCKED.search(msg) or attempt >= _HRANA_RETRIES:
+            if not _DB_LOCKED.search(msg):
                 raise RuntimeError(f"bunny db error: {msg}")
-            attempt += 1
-            # Exponential, with jitter so two writers that collide do not retry in step.
-            time.sleep(min(8.0, 0.25 * 2 ** attempt) * (0.5 + random.random()))
+            _DB_RETRY["locked"] += 1
+            _hold(msg)
             pending = pending[idx:]
 
     def execute(self, sql, params=()):
@@ -3298,6 +3341,70 @@ def gate_posting(p: dict) -> tuple[bool, str]:
     return True, ""
 
 
+class _board_write:
+    """A per-board write that fails like a per-board fetch: counted, then skipped.
+
+    🚨 THIS IS WHY A LOCKED DATABASE USED TO COST 2,941 BOARDS. The loop already tolerates a
+    board that will not answer: it appends to `failed` and moves on, which is why a sweep
+    reports "FAILED 13" and still finishes. The WRITE had no such guard, so a single database
+    error propagated out of the loop and ended the whole pass, discarding every board not yet
+    reached. A board that cannot be read and a board that cannot be written are the same kind
+    of problem and now cost the same amount.
+
+    ⚠️ A failed write can be PARTIAL, because the statements are not one transaction. The
+    board is left half-updated and the next sweep reconciles it, because it reads the current
+    state before writing. Worth saying out loud: this trades a clean abort for a recoverable
+    inconsistency on ONE board, and the alternative was losing the other 2,940.
+
+    🚨 A CLASS, NOT @contextmanager, AND A TEST IS WHY. The generator version caught a failure
+    in db() ITSELF, then never reached its yield, and Python turned that into
+    "RuntimeError: generator didn't yield" AT THE with-statement. So a database that could not
+    be opened at all still killed the sweep: the exact failure the guard exists to prevent,
+    reintroduced by the guard. Two entry points can fail here, opening and writing, and only
+    __enter__/__exit__ can swallow both.
+
+    ⭐ A context manager rather than a try block around 126 lines of body: re-indenting that
+    much working code to add error handling is its own risk.
+    """
+
+    class _Dead:
+        """Stands in for a connection that was never opened. Any use raises, and __exit__
+        suppresses it, so the body fails at its first statement instead of on a None."""
+
+        def __getattr__(self, name):
+            raise RuntimeError("the database could not be opened for this board")
+
+    def __init__(self, key: str, failed: list):
+        self._key, self._failed, self._cm, self._open = key, failed, None, False
+
+    def _record(self, e: BaseException) -> None:
+        self._failed.append(f"{self._key}: write {type(e).__name__}")
+        print(f"[scan] {self._key}: write failed, board skipped: "
+              f"{type(e).__name__}: {e}", flush=True)
+
+    def __enter__(self):
+        try:
+            self._cm = db()
+            con = self._cm.__enter__()
+            self._open = True
+            return con
+        except Exception as e:                                # noqa: BLE001
+            self._record(e)
+            return self._Dead()
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._open:
+            try:
+                self._cm.__exit__(exc_type, exc, tb)
+            except Exception as e:                            # noqa: BLE001
+                exc_type, exc = type(e), e
+        if exc_type is not None:
+            if self._open:                                    # not already recorded
+                self._record(exc)
+            return True                                       # swallowed: skip this board
+        return False
+
+
 def job_scan() -> str:
     """Sweep every known board once and record what was and was not there."""
     if not SCAN_ENABLED:
@@ -3391,7 +3498,7 @@ def _job_scan_locked() -> str:
             # ⭐ Three statements per board, not one per requisition. The old code wrote a full
             # snapshot every sweep; this reads the previous state, writes only the difference,
             # and leaves an unchanged board completely untouched.
-            with db() as con:
+            with _board_write(key, failed) as con:
                 # ⚠️ Only rows NOT already marked gone count as "was present". Without this
                 # a soft-deleted row would be re-reported as vanishing on every later sweep.
                 was = {r["req_id"]: r["title"] for r in con.execute(
@@ -7480,6 +7587,10 @@ def diag_config(request: Request, authorization: str | None = Header(None)):
         "at": now(), "version": ENGINE_VERSION, "uptime_s": int(time.time() - BOOTED_AT),
         "secrets": {k: fp(os.environ.get(k)) for k in secret},
         "settings": {k: os.environ.get(k, "(unset)") for k in plain},
+        # 📊 Process-local and reset by a restart, which is the point: it answers "is the
+        # write lock still biting THIS pod, and for how long", without a database write of
+        # its own during the contention it is measuring.
+        "db_retry": dict(_DB_RETRY),
         # The database HOST, never the token. This is what proves a repoint actually landed.
         # ⚠️ The sqlite backend is a PATH, not a URL. Splitting "/data/relay.db" on "//" and
         # taking the first segment yields "", so a local deployment reported no database at

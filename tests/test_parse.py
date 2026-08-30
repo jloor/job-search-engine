@@ -4369,6 +4369,68 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("the three that applied are never resent",
           any(x in sent[1] for x in ("S0", "S1", "S2")), False)
 
+    # 🚨 A BOARD THAT CANNOT BE WRITTEN MUST COST ONE BOARD, NOT THE SWEEP. The fetch was
+    # already guarded, which is why a sweep reports "FAILED 13" and still finishes; the
+    # write was not, so one locked database ended a pass over 2,941 boards.
+    import contextlib as _cl
+    _real_db = app.db
+    try:
+        app.db = lambda: _cl.nullcontext(object())            # opens fine, body decides
+        _failed = []
+        try:
+            with app._board_write("greenhouse|acme", _failed):
+                raise RuntimeError("bunny db error: SQLite error: database is locked")
+            escaped = "suppressed"
+        except Exception as _e:                               # noqa: BLE001
+            escaped = f"escaped: {type(_e).__name__}"
+        check("a write failure does NOT escape the board", escaped, "suppressed")
+        check("the board is counted as failed", _failed, ["greenhouse|acme: write RuntimeError"])
+
+        # 🚨 The generator version turned THIS into "generator didn't yield" at the
+        # with-statement, so a database that would not open still killed the sweep.
+        def _boom():
+            raise OSError("cannot reach the database")
+        app.db = _boom
+        _failed2 = []
+        try:
+            with app._board_write("lever|acme", _failed2) as _con:
+                _con.execute("SELECT 1")
+            escaped2 = "suppressed"
+        except Exception as _e:                               # noqa: BLE001
+            escaped2 = f"escaped: {type(_e).__name__}"
+        check("a database that will not OPEN also costs one board", escaped2, "suppressed")
+        check("...and is counted once, not twice", len(_failed2), 1)
+    finally:
+        app.db = _real_db
+
+    # 🚨 A 429 OR A 503 IS SAFE TO RESEND; A 502 IS NOT. The first two are refusals issued
+    # before the statements run, so nothing was applied. A 502 may mean the batch executed
+    # and the answer was lost, and resending would apply every statement twice.
+    calls = {"n": 0}
+
+    def flaky_post(stmts):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise app._Retryable("bunny db HTTP 503")
+        return {"results": [ok() for _ in stmts]}
+
+    h._post = flaky_post
+    _sleep2, _t.sleep = _t.sleep, lambda s: None
+    try:
+        out = h._pipeline([{"sql": "A", "args": []}, {"sql": "B", "args": []}])
+    finally:
+        _t.sleep = _sleep2
+    check("a 503 is resent whole, because nothing applied", (len(out), calls["n"]), (2, 2))
+
+    def gateway_post(stmts):
+        raise RuntimeError("bunny db HTTP 502: bad gateway")
+    h._post = gateway_post
+    try:
+        h._pipeline([{"sql": "A", "args": []}])
+        check("a 502 is NOT retried, because it is ambiguous", "no raise", "RuntimeError")
+    except RuntimeError as e:
+        check("a 502 is NOT retried, because it is ambiguous", "502" in str(e), True)
+
     # ⚠️ A bug must not be retried: repeating it only delays the report.
     def constraint_post(stmts):
         return {"results": [{"type": "error",
