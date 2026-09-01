@@ -562,6 +562,30 @@ MIGRATIONS = [
     "ALTER TABLE scan_candidate ADD COLUMN decide_passed TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN decide_excluded TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN decided_at TEXT",
+    # ⭐ 2026-09-01. HOW OLD THE POSTING IS, WHICH NOTHING COULD ANSWER BEFORE. The table
+    # had `at` (when WE first saw it) and nothing else, so a requisition rotting for six
+    # weeks ranked identically to one published this morning. One posting went out five weeks stale
+    # and that only surfaced because a human opened the archived copy by hand.
+    #
+    # 🚨 THREE COLUMNS, NOT ONE, BECAUSE THE BOARDS ANSWER THREE DIFFERENT QUESTIONS.
+    # Measured on a live Greenhouse board 2026-09-01:
+    #     updated_at       2026-09-01T17:11:29-04:00   (today)
+    #     first_published  2026-02-10T17:53:20-05:00   (February)
+    # Nearly seven months apart on ONE posting. `posted_at` is age and is what ranks;
+    # `updated_at` is a liveness signal and is what says somebody still tends this req.
+    # Collapsing them makes a stale posting look fresh every time an employer fixes a typo.
+    "ALTER TABLE scan_candidate ADD COLUMN posted_at TEXT",
+    "ALTER TABLE scan_candidate ADD COLUMN updated_at TEXT",
+    # ⚠️ WHICH FIELD IT CAME FROM, because "posted" is not one thing across eight platforms.
+    # greenhouse=first_published · ashby=publishedAt · lever=createdAt (epoch ms) ·
+    # breezy=published_date · workable=published_on · teamtailor=date_published ·
+    # workday=RELATIVE TEXT ONLY. Without this column a Workday guess and a Greenhouse fact
+    # are indistinguishable, which is the same mistake comp_source exists to prevent.
+    "ALTER TABLE scan_candidate ADD COLUMN posted_source TEXT",
+    # 📌 The application window close date. CLAUDE.md's posting-hygiene header has asked for
+    # this since 2026-08-11 and nothing ever captured it. Greenhouse publishes it free on
+    # every job as application_deadline; it is usually null, and null means "not stated".
+    "ALTER TABLE scan_candidate ADD COLUMN deadline TEXT",
     "ALTER TABLE board_state ADD COLUMN vanished_at TEXT",
     # ⚠️ TWO COLUMNS, NOT ONE. vanished_at is "first noticed missing" and is only a
     # suspicion; vanish_confirmed_at is "a second sweep agreed, and it was reported". With
@@ -3121,7 +3145,17 @@ def _board_reqs(platform: str, api_url: str) -> list[dict]:
             "Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=SCAN_TIMEOUT) as r:
             data = json.loads(r.read())
+    return _normalise_board(platform, data, api_url)
 
+
+def _normalise_board(platform: str, data, api_url: str) -> list[dict]:
+    """The PARSING half of _board_reqs, split out so it can be tested without a network.
+
+    ⭐ It was one function, so every per-platform field-mapping rule was reachable only by
+    making a live board call. That is why nothing noticed for months that seven platforms
+    publish a posting date and none of it was being read. A seam here costs one indirection
+    and makes the mapping assertable against a fixture.
+    """
     out: list[dict] = []
     _seen_ids: set = set()
 
@@ -3144,6 +3178,29 @@ def _board_reqs(platform: str, api_url: str) -> list[dict]:
         _seen_ids.add(rid)
         out.append(rec)
 
+    def _day(v):
+        """An ISO date, or None. Never a guess.
+
+        🚨 IT REFUSES RELATIVE TEXT. Workday's list says "Posted 30+ Days Ago", which is not
+        a date and must not be turned into one: converting it would write a precise-looking
+        value that is wrong by up to weeks and that nothing downstream could tell apart from
+        a published timestamp. Those rows keep posted_at NULL and say so in posted_source.
+        """
+        if v is None or v == "":
+            return None
+        # Lever ships epoch milliseconds. 1e11 separates ms from seconds for any modern date.
+        if isinstance(v, (int, float)):
+            try:
+                return datetime.fromtimestamp(
+                    (v / 1000 if v > 1e11 else v), timezone.utc).date().isoformat()
+            except (ValueError, OSError, OverflowError):
+                return None
+        s = str(v).strip()
+        # ⚠️ Anchored, and the year must be 20xx. A bare r"\d{4}-\d{2}-\d{2}" search would
+        # happily lift a date out of the middle of a job title.
+        m = re.match(r"^(20\d{2}-\d{2}-\d{2})", s)
+        return m.group(1) if m else None
+
     if platform.startswith("greenhouse"):
         for j in data.get("jobs", []):
             loc = (j.get("location") or {}).get("name") or ""
@@ -3158,6 +3215,13 @@ def _board_reqs(platform: str, api_url: str) -> list[dict]:
                         # only platform of the six that does.
                         "company": j.get("company_name") or None,
                         "company_source": "ats" if j.get("company_name") else None,
+                        # ⭐ first_published is the AGE. updated_at is the LIVENESS signal and
+                        # moves whenever anyone edits the req: measured seven months apart on
+                        # one live posting, 2026-09-01.
+                        "posted_at": _day(j.get("first_published")),
+                        "updated_at": _day(j.get("updated_at")),
+                        "posted_source": "first_published" if j.get("first_published") else None,
+                        "deadline": _day(j.get("application_deadline")),
                         "description": _plain(j.get("content") or "")})
     elif platform == "ashby":
         for j in data.get("jobs", []):
@@ -3167,6 +3231,8 @@ def _board_reqs(platform: str, api_url: str) -> list[dict]:
                         "is_remote": bool(j.get("isRemote")),
                         "comp": (j.get("compensation") or {}).get("compensationTierSummary"),
                         "location": j.get("location") or "", "url": u,
+                        "posted_at": _day(j.get("publishedAt")),
+                        "posted_source": "publishedAt" if j.get("publishedAt") else None,
                         "description": _plain(j.get("descriptionPlain") or "")})
     elif platform == "lever":
         for j in data:
@@ -3175,6 +3241,9 @@ def _board_reqs(platform: str, api_url: str) -> list[dict]:
                         "is_remote": "remote" in str(cat.get("location", "")).lower() or None,
                         "comp": None, "location": cat.get("location") or "",
                         "url": j.get("hostedUrl") or "",
+                        # ⚠️ Lever ships epoch MILLISECONDS, not a string. _day sorts it out.
+                        "posted_at": _day(j.get("createdAt")),
+                        "posted_source": "createdAt" if j.get("createdAt") else None,
                         "description": _plain(j.get("descriptionPlain")
                                               or j.get("description") or "")})
     elif platform == "smartrecruiters":
@@ -3202,6 +3271,12 @@ def _board_reqs(platform: str, api_url: str) -> list[dict]:
                   "is_remote": "remote" in loc.lower() or None,
                   "comp": None, "location": loc,
                   "url": f"{_base}{path}" if _base and path else "",
+                  # 🚨 Workday's LIST gives relative text only ("Posted 30+ Days Ago"), which
+                  # _day refuses. posted_at stays NULL and posted_source says why, so nothing
+                  # downstream mistakes an absent date for a fresh posting. The real date is
+                  # startDate on the per-job detail endpoint; job_workday_enrich can fill it.
+                  "posted_at": _day(j.get("postedOn")),
+                  "posted_source": ("relative_only" if j.get("postedOn") else None),
                   "description": ""})
     elif platform == "teamtailor":
         # ⭐ THE ONLY NEW PLATFORM THAT CARRIES THE FULL DESCRIPTION. Workday and Breezy
@@ -3245,6 +3320,9 @@ def _board_reqs(platform: str, api_url: str) -> list[dict]:
                   "url": j.get("url") or "",
                   "company": org or None,
                   "company_source": "ats" if org else None,
+                  "posted_at": _day(j.get("date_published") or jp.get("datePosted")),
+                  "posted_source": "date_published" if j.get("date_published") else None,
+                  "deadline": _day(jp.get("validThrough")),
                   "description": _plain(j.get("content_html") or jp.get("description") or "")})
     elif platform == "breezy":
         # Breezy returns a bare list, and is the second platform after Greenhouse to state
@@ -3266,6 +3344,8 @@ def _board_reqs(platform: str, api_url: str) -> list[dict]:
                   "location": loc, "url": j.get("url") or "",
                   "company": ((j.get("company") or {}) or {}).get("name") or None,
                   "company_source": "ats" if ((j.get("company") or {}) or {}).get("name") else None,
+                  "posted_at": _day(j.get("published_date")),
+                  "posted_source": "published_date" if j.get("published_date") else None,
                   # Breezy's list carries no description, same gap as Workday.
                   "description": ""})
     elif platform == "workable":
@@ -3273,6 +3353,12 @@ def _board_reqs(platform: str, api_url: str) -> list[dict]:
             _add({"req_id": str(j.get("shortcode")), "title": j.get("title") or "",
                         "is_remote": bool(j.get("telecommuting")), "comp": None,
                         "location": j.get("location") or "", "url": j.get("url") or "",
+                        # ⚠️ published_on, NOT created_at. Measured 2026-08-13 vs 2026-05-05 on
+                        # one posting: created is when the req was opened internally, published
+                        # is when candidates could first see it. Age means the latter.
+                        "posted_at": _day(j.get("published_on")),
+                        "updated_at": None,
+                        "posted_source": "published_on" if j.get("published_on") else None,
                         "description": _plain(j.get("description") or "")})
     return out
 
@@ -3817,7 +3903,8 @@ def _scan_candidates(at: str, new_ids: list, detail: dict) -> str:
             con.execute(
                 "INSERT INTO scan_candidate (at,req_id,board,title,location,comp,is_remote,"
                 "url,description,triaged,comp_min,comp_max,comp_basis,comp_evidence,"
-                "comp_source,company,company_source) VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?)",
+                "comp_source,company,company_source,posted_at,updated_at,posted_source,"
+                "deadline) VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,?)",
                 (at, rid, rid.rpartition(":")[0], pst["title"], pst.get("location"),
                  # NULL means the board did not say. Writing 0 for unknown would read as
                  # "confirmed not remote", which is the same absence-is-not-a-verdict
@@ -3834,7 +3921,11 @@ def _scan_candidates(at: str, new_ids: list, detail: dict) -> str:
                  # opened out. company_source records which, so nothing downstream has to
                  # guess whether it is looking at a verified name or a slug.
                  pst.get("company") or _company_from_board(rid.rpartition(":")[0]),
-                 pst.get("company_source") or "token"))
+                 pst.get("company_source") or "token",
+                 # ⭐ NULL means the board did not publish a date, never "fresh". Workday
+                 # lands here with posted_source='relative_only' and posted_at NULL.
+                 pst.get("posted_at"), pst.get("updated_at"),
+                 pst.get("posted_source"), pst.get("deadline")))
             kept += 1
             if band:
                 priced += 1
@@ -7066,13 +7157,16 @@ def _inbox_evaluate(url: str) -> dict:
             con.execute(
                 "INSERT INTO scan_candidate (at,req_id,board,title,location,comp,is_remote,"
                 "url,description,triaged,comp_min,comp_max,comp_basis,comp_evidence,"
-                "comp_source,company,company_source) VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?)",
+                "comp_source,company,company_source,posted_at,updated_at,posted_source,"
+                "deadline) VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,?)",
                 (now(), pst["req_id"], pst["board"], pst["title"], pst.get("location"),
                  pst.get("comp"),
                  (None if pst.get("is_remote") is None else (1 if pst["is_remote"] else 0)),
                  url, (pst.get("description") or "")[:AI_MAX_BODY_CHARS],
                  *(band or (None, None, None, None, None)),
-                 pst.get("company"), "inbox_url"))
+                 pst.get("company"), "inbox_url",
+                 pst.get("posted_at"), pst.get("updated_at"),
+                 pst.get("posted_source"), pst.get("deadline")))
     job_triage()
     job_remote_check()
     with db() as con:

@@ -3811,8 +3811,13 @@ On Wed, Aug 12, 2026 the candidate wrote:
 
     # ⚠️ The sweep must still build urls, and through the same helper. A second copy of
     # this logic is what produced two answers in the first place.
-    _wsrc = _src_of(_appw._board_reqs)
+    # 📌 2026-09-01: _board_reqs was split into a fetch half and _normalise_board, so the
+    # posting-date mapping could be tested without a network. The guard reads BOTH halves
+    # rather than naming one, so it keeps biting wherever the logic ends up living.
+    _wsrc = _src_of(_appw._board_reqs) + _src_of(_appw._normalise_board)
     check("the sweep uses the shared helper", "workday_bases(api_url)" in _wsrc, True)
+    check("url building is not duplicated across the split",
+          _wsrc.count("workday_bases(api_url)"), 1)
     check("...and no longer carries its own hostname regexes",
           "myworkdayjobs.com/wday/cxs" in _wsrc, False)
 
