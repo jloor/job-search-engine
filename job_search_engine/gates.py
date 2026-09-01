@@ -257,6 +257,11 @@ def question_class(q: str | None, cfg: dict | None = None) -> str:
 # posting that simply states no location, which contradicts this module's own rule that
 # absence is never a rejection. Caught by test_gates_decisions on its first run.
 _PLACEHOLDER = re.compile(r"update location|^-+$|^n/?a$|^tbd$", re.I)
+# a country or a continent, and nothing more specific: it names no place to disagree with
+_BARE_REGION = re.compile(r"^\s*(remote\s*[-,–]?\s*)?(us|usa|u\.s\.a?\.?|"
+                          r"united states( of america)?|north america|nationwide|anywhere|"
+                          r"remote)\s*$", re.I)
+_TZ_ONLY = re.compile(r"^\s*[a-z ]*time( ?zone)?\s*$", re.I)
 
 
 def location_conflict(location: str | None, remote_verdict: str | None,
@@ -280,6 +285,19 @@ def location_conflict(location: str | None, remote_verdict: str | None,
         return None                      # absence is not a rejection
     if _PLACEHOLDER.search(loc):
         return f"location is a placeholder ({loc!r}): read the posting before sending"
+    # ⚠️ A BARE COUNTRY OR REGION IS NOT A CONFLICT. Measured in production 2026-09-01: 29 of
+    # 157 "location names ..." flags were the strings "US", "USA", "United States" and "North
+    # America" on roles already judged remote. Naming no city cannot contradict a remote
+    # verdict, and a flag that fires on the common case is a flag nobody reads.
+    if _BARE_REGION.match(loc):
+        return None
+    # ⚠️ A TIMEZONE HE ACCEPTS IS NOT A CONFLICT EITHER. "Eastern Time zone" was flagged as
+    # somewhere he cannot reach. The timezones he refuses are the configured list, and they
+    # are handled by question_class; anything else here is noise.
+    if _TZ_ONLY.match(loc):
+        tz = _tz_re(cfg)
+        return (f"location names the timezone {loc!r}, which is on his reject list"
+                if tz and tz.search(loc) else None)
     if eligibility(loc) == "eligible" and REMOTE_TXT.search(loc):
         return None
     if C.metro_match(loc, cfg) or REMOTE_TXT.search(loc):

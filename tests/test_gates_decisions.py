@@ -95,6 +95,17 @@ check("his own metro is quiet",
       gates.location_conflict("New York, NY", "hybrid_commutable", CFG), None)
 check("a blank field is quiet, because absence is not a rejection",
       gates.location_conflict("", "fully_remote", CFG), None)
+# 🚨 Production, 2026-09-01: 29 of 157 flags were a bare country on an already-remote role.
+# A flag that fires on the common case is a flag nobody reads.
+for bare in ("US", "USA", "United States", "North America", "Remote - US", "Anywhere"):
+    check(f"bare region {bare!r} is quiet", gates.location_conflict(bare, "fully_remote", CFG), None)
+check("his own timezone is quiet",
+      gates.location_conflict("Eastern Time zone", "fully_remote", CFG), None)
+check("a rejected timezone as a location IS flagged",
+      "reject list" in (gates.location_conflict("Pacific Time zone", "fully_remote", CFG) or ""),
+      True)
+check("a specific city outside the metro is still flagged",
+      "disagree" in (gates.location_conflict("Austin, TX", "fully_remote", CFG) or ""), True)
 
 print()
 if fails:
