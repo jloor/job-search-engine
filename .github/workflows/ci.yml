@@ -16,6 +16,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python3 tests/test_parse.py
+      - run: python3 tests/test_gates_decisions.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #

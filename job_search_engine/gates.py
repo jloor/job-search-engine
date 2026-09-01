@@ -158,3 +158,131 @@ def cascade_hybrid(remote_verdict: str, location: str | None, residency: str | N
     if C.metro_match(f"{resid} {location or ''}", cfg) and eligibility(location) != "ineligible":
         return "hybrid_commutable"
     return remote_verdict
+
+# ── the requisition, the question and the location field ─────────────────────────────────
+# 🚨 THESE THREE MOVED UP FROM tools/ease-rank.py, THEY WERE NOT COPIED. Each was computed
+# only on the laptop, so the nightly sweep could not use any of them and every list had to be
+# re-derived by hand. Same reason harvest_tier moved. Two implementations of one rule is the
+# drift this project keeps paying for.
+# ⚠️ NOTHING PERSONAL CAME WITH THEM. The country he may work in is `work_authorization`, the
+# places he can reach are `commute.metro_places`, and the hours he will accept are
+# `remote.accepted_timezones`. All three are read from the config, never written here.
+
+_REQ = (
+    (re.compile(r"(?:job-boards|boards)(?:\.eu)?\.greenhouse\.io/[^/]+/jobs/(\d+)"), "gh"),
+    (re.compile(r"[?&]gh_jid=(\d+)"),                                                   "gh"),
+    (re.compile(r"jobs\.ashbyhq\.com/[^/]+/([0-9a-f-]{36})"),                           "ashby"),
+    (re.compile(r"jobs\.lever\.co/[^/]+/([0-9a-f-]{36})"),                              "lever"),
+    (re.compile(r"//([^./]+)\.[^.]+\.myworkdayjobs\.com/[^/]+/job/.*?/([^/]+?)/?$"),    "wd"),
+)
+
+
+def req_key(url: str | None) -> str | None:
+    """The REQUISITION's identity, from the ATS rather than from the link that reached us.
+
+    🚨 ONE JOB HAS SEVERAL URLS AND A STRING COMPARE CANNOT SEE THAT. Measured 2026-09-01:
+    an application was submitted to `job-boards.greenhouse.io/acme/jobs/4000000001` while
+    the scanner held the same job as `acme.example.com/careers/job?gh_jid=4000000001`.
+    Same Greenhouse id, different host, so the send queue offered a role applied to four days
+    earlier as its best new lead.
+
+    ⚠️ Falls back to the normalised URL on an unknown board. That fallback is too narrow and
+    can still show a duplicate, which is the right direction to fail: showing one costs a
+    minute of reading, hiding a live role costs the role.
+    """
+    u = (url or "").strip()
+    for rx, ats in _REQ:
+        m = rx.search(u)
+        if m:
+            return f"{ats}:" + ":".join(g.lower() for g in m.groups() if g)
+    return re.sub(r"^https?://", "", u.lower()).rstrip("/") or None
+
+
+_AUTH_Q = re.compile(r"authoriz|sponsor|work permit|visa|right to work|"
+                     r"legally (?:eligible|able)", re.I)
+_LANG_Q = re.compile(r"\b(german|french|spanish|portuguese|mandarin|cantonese|japanese|"
+                     r"korean|dutch|italian|hebrew|arabic)[- ]speaking\b|"
+                     r"fluent in (?!english)", re.I)
+_ROUTINE_Q = re.compile(r"background (?:check|screen)|drug (?:test|screen)|at least 18|"
+                        r"reference check|e-?verify", re.I)
+
+
+def _tz_re(cfg):
+    """Timezones he will NOT take, as a pattern. Empty when none are configured."""
+    bad = (cfg.get("remote", {}) or {}).get("reject_timezones") or []
+    return re.compile("|".join(re.escape(z) for z in bad), re.I) if bad else None
+
+
+def question_class(q: str | None, cfg: dict | None = None) -> str:
+    """'blocking' | 'decide' | 'benign' for one gate-shaped question.
+
+    🚨 A GATE-SHAPED QUESTION IS NOT A DISQUALIFIER, AND TREATING IT AS ONE HID EVERY BANDED
+    ROLE. `harvest_tier` flags anything gate-shaped, correctly: it cannot know whose
+    application it is. A reader that then drops every flagged row excludes
+    "Are you legally authorized to work in the United States?", which is a routine yes.
+    Measured 2026-09-01: all fourteen rows reaching the send list were rangeless, because a
+    US work-authorisation question sits on every posting that publishes a band.
+
+    ⭐ THE DECIDING FACT IS THE COUNTRY NAMED, NOT THE SHAPE OF THE SENTENCE. The identical
+    phrasing is a yes for the United States and a hard no for Canada, and both appeared in
+    one sweep.
+    ⚠️ THE DEFAULT IS `decide`, NEVER `benign`. An unrecognised gate must cost a human a
+    glance, because the failure that matters is a role he cannot take reaching the queue.
+    """
+    cfg = C.load() if cfg is None else cfg
+    s = (q or "").strip()
+    if not s:
+        return "benign"
+    tz = _tz_re(cfg)
+    if _LANG_Q.search(s) or (tz and tz.search(s)):
+        return "blocking"
+    # 📌 _US and _FOREIGN are the module's own lists, reused rather than re-declared. They
+    # are far more thorough than anything written beside a single caller, and they already
+    # know that "Ontario, CA" is California.
+    foreign, us = _FOREIGN.search(s), _US.search(s)
+    if foreign and not us:
+        return "blocking"
+    if _AUTH_Q.search(s):
+        auth = cfg.get("work_authorization", {}) or {}
+        ok = {str(x).upper() for x in (auth.get("eligible_countries") or [])}
+        if us and ok & {"US", "USA", "UNITED STATES"}:
+            return "benign"
+        return "blocking" if foreign else "benign"
+    if _ROUTINE_Q.search(s):
+        return "benign"
+    return "decide"
+
+
+# ⚠️ A BLANK FIELD IS NOT A PLACEHOLDER. The first version matched `^\s*$` and flagged every
+# posting that simply states no location, which contradicts this module's own rule that
+# absence is never a rejection. Caught by test_gates_decisions on its first run.
+_PLACEHOLDER = re.compile(r"update location|^-+$|^n/?a$|^tbd$", re.I)
+
+
+def location_conflict(location: str | None, remote_verdict: str | None,
+                      cfg: dict | None = None) -> str | None:
+    """A one-line warning about the board's location field, or None. NEVER a decision.
+
+    ⚠️ THE FIELD AND THE BODY DISAGREE, AND THE FIELD IS OFTEN THE LIAR. One board tags a
+    requisition "REMGA - Remote Georgia, REMMA - Remote Massachusetts" while its body reads
+    "Work From Home (Remote in United States)". another employer's field is the literal string
+    "USA - Update Location". Veeva publishes one requisition under three cities. Measured
+    2026-09-01: of 316 live rows, 76 named a place outside his metro and 3 were placeholders.
+
+    📌 It raises a hand so a human reads the posting. The verdict order is
+    human > measurement > model, and a board's location string is none of the three.
+    """
+    cfg = C.load() if cfg is None else cfg
+    loc = (location or "").strip()
+    if not remote_verdict:
+        return "location never judged: remote_verdict is empty, and unjudged is not commutable"
+    if not loc:
+        return None                      # absence is not a rejection
+    if _PLACEHOLDER.search(loc):
+        return f"location is a placeholder ({loc!r}): read the posting before sending"
+    if eligibility(loc) == "eligible" and REMOTE_TXT.search(loc):
+        return None
+    if C.metro_match(loc, cfg) or REMOTE_TXT.search(loc):
+        return None
+    return (f"location names {loc!r}, outside his metro, while remote_verdict says "
+            f"{remote_verdict}: the field and the verdict disagree")

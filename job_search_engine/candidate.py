@@ -190,6 +190,32 @@ def metro_match(location: str | None, cfg: dict | None = None) -> bool:
     return False
 
 
+def excluded_company(name: str | None, cfg: dict | None = None) -> bool:
+    """True when this employer is on the never-apply list.
+
+    🚫 TWO DIFFERENT REASONS SHARE ONE LIST, and a later reader needs to know that. Some
+    entries are a VALUES decision about employers that would otherwise be good roles. Others
+    are there because the postings are not employment at all: one "employer" gated every
+    posting on the phrase "to qualify for this business opportunity" and produced nineteen
+    near-duplicate rows in a single sweep. The config file carries the per-entry reason.
+
+    ⚠️ COMPARE ON LETTERS AND DIGITS ONLY. A plain lowercase substring test matched
+    "AcmeTravel" and missed "Acme Travel", so an employer could defeat the list by
+    rendering its own name with a space. Board tokens, markdown and punctuation vary across
+    the same employer constantly and the exclusion has to survive all of it.
+    ⚠️ Deliberately NOT a word-boundary match: a board token like "palantirtech" is the same
+    employer and must still be caught.
+    """
+    cfg = cfg or load()
+
+    def flat(s):
+        return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+    names = [flat(n) for n in ((cfg.get("targeting", {}) or {}).get("exclude_companies") or [])]
+    low = flat(name)
+    return any(n and n in low for n in names)
+
+
 def near_state_re(cfg: dict | None = None):
     cfg = load() if cfg is None else cfg
     st = (cfg.get("commute") or {}).get("near_states") or []

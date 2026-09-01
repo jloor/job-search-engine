@@ -678,3 +678,34 @@ CREATE TABLE IF NOT EXISTS content_item (
   scheduled_for TEXT,
   published_url TEXT
 );
+
+-- ── a considered no ──────────────────────────────────────────────────────────────────────
+-- 🚨 NOT APPLYING IS THE CORRECT OUTCOME FOR MOST ROLES, AND IT WAS THE ONE OUTCOME THAT LEFT
+-- NO TRACE. An `application` row exists only when he applies, so a role read, judged
+-- unreachable and deliberately skipped was recorded nowhere any query could reach. It lived as
+-- prose in a vault note.
+-- ⚠️ MEASURED 2026-09-01. Two roles were assessed on 2026-08-21 and correctly skipped: one
+-- needed a Secret clearance, the other restricted residency to two states. Eleven days later
+-- both were back at the TOP of the send queue and were recommended again.
+--
+-- ⭐ IT IS A SEPARATE TABLE, NOT A `verdict` ON scan_candidate, and that is deliberate.
+-- `verdict` is the MODEL's fit judgement; this is a HUMAN's decision. Collapsing them destroys
+-- the fit signal and makes "strong but passed" indistinguishable from "weak", the same mistake
+-- the place table avoids by keeping judged, address and measured in separate columns.
+--
+-- 📌 `req_key` is the ATS requisition id from gates.req_key(), never the raw URL: one job has
+-- several links and a string compare has already called them different jobs.
+-- 📌 `scope` is 'requisition' by default. 'company' should stay rare: a dead req does not kill
+-- a company, and the ghosting rule says to keep employers warm.
+CREATE TABLE IF NOT EXISTS role_passed (
+  id           INTEGER PRIMARY KEY,
+  req_key      TEXT NOT NULL UNIQUE,
+  url          TEXT,
+  company      TEXT,
+  title        TEXT,
+  reason       TEXT NOT NULL,           -- the disqualifier, not a summary of the role
+  scope        TEXT NOT NULL DEFAULT 'requisition',
+  passed_at    TEXT NOT NULL,
+  passed_by    TEXT NOT NULL DEFAULT 'human'
+);
+

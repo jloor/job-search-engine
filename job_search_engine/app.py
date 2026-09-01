@@ -553,6 +553,15 @@ MIGRATIONS = [
     # no future sweep can prove the posting existed, and that record is the entire reason
     # the vanish log exists: a posting that dies mid-process is evidence of what was
     # applied to. Measured cost: 2,504 vanishes against 157,867 rows.
+    # ⭐ THE DECISION LAYER, written nightly by job_decide. Each is an ANNOTATION on a row
+    # the model already scored, never a change to `verdict`: verdict is the model's fit
+    # reading and these are the mechanical facts that decide whether a good fit is reachable.
+    # ⚠️ They were computed on a laptop until 2026-09-01, so the nightly sweep produced a
+    # list that still needed the same four checks re-run by hand every time.
+    "ALTER TABLE scan_candidate ADD COLUMN decide_location TEXT",
+    "ALTER TABLE scan_candidate ADD COLUMN decide_passed TEXT",
+    "ALTER TABLE scan_candidate ADD COLUMN decide_excluded TEXT",
+    "ALTER TABLE scan_candidate ADD COLUMN decided_at TEXT",
     "ALTER TABLE board_state ADD COLUMN vanished_at TEXT",
     # ⚠️ TWO COLUMNS, NOT ONE. vanished_at is "first noticed missing" and is only a
     # suspicion; vanish_confirmed_at is "a second sweep agreed, and it was reported". With
@@ -3868,6 +3877,11 @@ REMOTE_BATCH    = int(os.environ.get("REMOTE_BATCH", "24"))
 REMOTE_EVERY_MIN = int(os.environ.get("REMOTE_EVERY_MIN", "37"))
 COMP_BATCH      = int(os.environ.get("COMP_BATCH", "18"))
 COMP_EVERY_MIN  = int(os.environ.get("COMP_EVERY_MIN", "41"))
+# 📌 A PRIME-ISH INTERVAL, like its neighbours, so the cheap jobs do not all land on the same
+# minute. job_decide reads rows the model has already scored and calls no API, so it is free
+# and can run often; the point of running it at all is that its answer changes when the
+# CONFIG changes, not only when a new posting arrives.
+DECIDE_EVERY_MIN = int(os.environ.get("DECIDE_EVERY_MIN", "53"))
 # Workday enrichment. One request per posting, so it is bounded and paced rather than fast.
 WORKDAY_ENRICH_BATCH = int(os.environ.get("WORKDAY_ENRICH_BATCH", "150"))
 WORKDAY_ENRICH_PACE  = float(os.environ.get("WORKDAY_ENRICH_PACE", "1.0"))
@@ -4553,6 +4567,63 @@ REMOTE_SCHEMA = {
                 "hybrid", "onsite", "unclear"]},
             "residency_requirement": {"type": ["string", "null"]},
             "evidence": {"type": "string"}}}}}}
+
+
+def job_decide() -> str:
+    """Annotate every scored candidate with the mechanical facts that decide reachability.
+
+    🚨 IT ANNOTATES, IT NEVER RE-SCORES. `verdict` is the model's reading of FIT and stays
+    untouched. These three columns answer a different question: is a good fit actually
+    reachable. Collapsing them into `verdict` would make "strong but unreachable"
+    indistinguishable from "weak", which is the mistake the place table avoids by keeping
+    judged, address and measured apart.
+
+    ⚠️ WHY IT IS A JOB AND NOT A READER. All three checks ran only on the laptop until
+    2026-09-01, so the nightly sweep produced a list that had to be re-filtered by hand every
+    time. Two roles rejected on the merits on 2026-08-21 came back to the top of the send
+    queue eleven days later, because the considered no had nowhere to live and nothing
+    queried the note that recorded it.
+
+    📌 Nothing here drops a row. It writes a reason; the reader decides what to do with it.
+    A rule that deletes is a rule nobody can audit later.
+    """
+    try:
+        import candidate as _C
+        import gates as _G
+    except Exception as e:                                    # noqa: BLE001
+        return f"skipped: {type(e).__name__}"
+    cfg = _C.load()
+    if not cfg:
+        return "skipped: no candidate config"
+
+    def _flat(s):
+        return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+    n_loc = n_pass = n_excl = 0
+    rows = []
+    with db() as c:
+        passed = {}
+        for r in c.execute("SELECT req_key, scope, company, reason FROM role_passed"):
+            d = dict(r)
+            passed[d["req_key"]] = d["reason"]
+        rows = [dict(r) for r in c.execute(
+            "SELECT id, company, url, location, remote_verdict FROM scan_candidate "
+            " WHERE triaged=1 AND verdict='strong'")]
+        stamp = now()
+        for r in rows:
+            loc = _G.location_conflict(r["location"], r["remote_verdict"], cfg)
+            key = _G.req_key(r["url"])
+            why = passed.get(key) or passed.get("company:" + _flat(r["company"] or ""))
+            excl = ("on exclude_companies"
+                    if _C.excluded_company(r["company"] or "", cfg) else None)
+            n_loc += bool(loc)
+            n_pass += bool(why)
+            n_excl += bool(excl)
+            c.execute("UPDATE scan_candidate SET decide_location=?, decide_passed=?, "
+                      "decide_excluded=?, decided_at=? WHERE id=?",
+                      (loc, why, excl, stamp, r["id"]))
+    return (f"decided {len(rows)} strong candidate(s): {n_loc} location flag(s), "
+            f"{n_pass} already passed, {n_excl} excluded employer(s)")
 
 
 def job_remote_check() -> str:
@@ -7251,6 +7322,10 @@ def job_table() -> list:
             ("triage", TRIAGE_EVERY_MIN * 60, job_triage),
             ("remote_check", REMOTE_EVERY_MIN * 60, job_remote_check),
             ("comp", COMP_EVERY_MIN * 60, job_comp),
+            # ⭐ AFTER remote_check and comp, because it READS what they wrote:
+            # remote_verdict decides the location flag and there is no point flagging a row
+            # whose verdict has not been taken yet.
+            ("decide", DECIDE_EVERY_MIN * 60, job_decide),
             ("place", PLACE_EVERY_MIN * 60, job_place),
             # ⚠️ INTERVAL 0 MEANS MANUAL ONLY, and this is the first job to use it. It is
             # registered here rather than left as a loose function for the reason recorded
