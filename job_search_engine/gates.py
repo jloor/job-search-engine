@@ -128,6 +128,55 @@ def gate(posting: dict, cfg: dict | None = None, too_far: set | None = None) -> 
     return False, "out on geography"
 
 
+# 🚨 THE BOARD'S REMOTE FLAG LIES, AND THE BODY SAYS SO IN PLAIN ENGLISH. Added 2026-09-03.
+# Measured that day on ten shortlisted roles, every one carrying Ashby isRemote=true:
+#   OpenAI    "Willingness to work in-office in San Francisco"
+#   Outset    "Based in the San Francisco Bay Area, able to work onsite from our SF office"
+#   Airwallex "This role is based in San Francisco (3 days in office)"
+#   Rerun     "based in the Bay Area, hybrid, with 3 days a week in our SF office"
+#   Notion    "#LI-Onsite"
+#   Ramp      "hybrid in New York, with time in-office"
+# Six of ten. The flag is what the employer ticked in a form; the sentence is what they mean.
+#
+# ⭐ FREE, AND IT RUNS BEFORE THE PAID READER. No model, no HTTP. Its whole job is to stop a
+# posting being called remote on the strength of a checkbox its own text contradicts.
+# ⚠️ It reports a CONTRADICTION, it does not write a verdict. An office requirement in a city
+# inside his metro is a decision, not a rejection, and only cascade_hybrid owns that call.
+# 📌 Deliberately narrow. It requires an OFFICE WORD next to an OBLIGATION word, so "we have
+# offices in Santa Clara and Charlotte for employees who prefer them" does not match, and
+# neither does a benefits paragraph mentioning an office snack budget.
+_OFFICE_OBLIGATION = re.compile(
+    r"(?:"
+    r"\b\d\s*(?:\+\s*)?days?\s+(?:a|per)\s+week\s+(?:in|at|from)\b[^.]{0,40}\boffice\b"
+    r"|\bin[- ]office\b[^.]{0,60}\b(?:required|expectation|expected|willingness|must)\b"
+    r"|\b(?:willingness|willing|able|expected|required|must be able)\b[^.]{0,60}"
+    r"\b(?:work|working)\b[^.]{0,30}\b(?:in[- ]office|onsite|on[- ]site|from (?:our|the) office)\b"
+    r"|\bthis role is (?:based in|hybrid)\b"
+    r"|\bbased in\b[^.]{0,60}\b(?:able to work (?:onsite|from))\b"
+    r"|\bmust (?:live|reside|be located)\b"
+    r"|\brelocat(?:e|ion) (?:to|is) (?:required|expected)\b"
+    r"|#LI-Onsite"
+    r"|#LI-Hybrid"
+    r")", re.I)
+
+
+def office_obligation(description: str | None) -> str | None:
+    """The sentence in the body that contradicts a board's remote flag, or None.
+
+    Returns the matched span so a human reads the employer's own words rather than a verdict.
+    ⚠️ A match is NOT a rejection. The office may be in his metro, in which case this is the
+    input to cascade_hybrid and to his own decision, not the end of the conversation.
+    """
+    if not description:
+        return None
+    text = re.sub(r"\s+", " ", description)
+    m = _OFFICE_OBLIGATION.search(text)
+    if not m:
+        return None
+    start = max(0, m.start() - 90)
+    return text[start:m.end() + 90].strip()
+
+
 def cascade_hybrid(remote_verdict: str, location: str | None, residency: str | None,
                    cfg: dict | None = None) -> str:
     """Turn a hybrid/residency verdict into a WHERE question and answer it.

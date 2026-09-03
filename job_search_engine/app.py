@@ -4848,6 +4848,35 @@ def job_remote_check() -> str:
     # 🚨 metro_place_re, NOT metro_re: this path WRITES a verdict with no model and no
     # measurement, so it must only fire on a curated place name. Under metro_re a bare
     # ", PA" was enough, and Philadelphia was recorded as commutable.
+    # 🚨 FIRST, THE CHEAPEST AND MOST WRONG-PRONE CASE: a board flag that says remote over a
+    # body that says otherwise. Added 2026-09-03 after ten shortlisted roles, ALL carrying
+    # Ashby isRemote=true, turned out to name an office requirement six times: OpenAI,
+    # Outset, Airwallex, Rerun, Notion and Ramp. The flag is what someone ticked in a form.
+    # ⭐ Free, and it runs before the model queue so the model never spends a call on a
+    # posting whose own text already answered the question.
+    # ⚠️ It writes `hybrid`, never `onsite`, and then hands to cascade_hybrid. An office in
+    # his metro is a DECISION, and only cascade_hybrid owns whether a place is reachable.
+    contra = {"n": 0, "cascaded": 0}
+    with db() as con:
+        flagged = [dict(r) for r in con.execute(
+            "SELECT id, location, description FROM scan_candidate "
+            " WHERE cast(score as int) >= ? AND remote_verdict IS NULL "
+            "   AND is_remote = 1 AND description IS NOT NULL AND description <> '' "
+            " ORDER BY cast(score as int) DESC LIMIT ?",
+            (TRIAGE_BAND_MIN, REMOTE_BATCH * 8)).fetchall()]
+        for c in flagged:
+            span = _G.office_obligation(c["description"])
+            if not span:
+                continue
+            after = _G.cascade_hybrid("hybrid", c["location"], None, cfg)
+            con.execute("UPDATE scan_candidate SET remote_verdict=?, remote_evidence=? "
+                        "WHERE id=?",
+                        (after, f"the board flagged this remote and the posting contradicts "
+                                f"it: \"{span[:220]}\". No model was asked.", c["id"]))
+            contra["n"] += 1
+            if after != "hybrid":
+                contra["cascaded"] += 1
+
     metro = _C.metro_place_re(cfg)
     rule_done = {"n": 0, "cascaded": 0}
     if metro:
@@ -4881,10 +4910,12 @@ def job_remote_check() -> str:
                     rule_done["cascaded"] += 1
 
     if not _have_key:
-        return (f"{rule_done['n']} settled free by the metro rule "
-                f"({rule_done['cascaded']} cascaded to commutable); "
+        free = rule_done["n"] + contra["n"]
+        return (f"{free} settled free ({contra['n']} by a body that contradicts the board's "
+                f"remote flag, {rule_done['n']} by the metro rule, "
+                f"{rule_done['cascaded'] + contra['cascaded']} cascaded to commutable); "
                 f"no AI key, so nothing was read"
-                if rule_done["n"] else "skipped: no AI key")
+                if free else "skipped: no AI key")
 
     with db() as con:
         rows = [dict(r) for r in con.execute(

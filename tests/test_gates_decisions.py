@@ -107,6 +107,38 @@ check("a rejected timezone as a location IS flagged",
 check("a specific city outside the metro is still flagged",
       "disagree" in (gates.location_conflict("Austin, TX", "fully_remote", CFG) or ""), True)
 
+# ---------------------------------------------------------- board flag vs body
+# 🚨 Added 2026-09-03. Ten shortlisted roles ALL carried Ashby isRemote=true and six named an
+# office requirement in their own text. The flag is what someone ticked in a form; the
+# sentence is what they meant. This runs free, before any model call.
+# ⭐ The negative cases matter more than the positives. A detector that fires on "we have
+# offices for employees who prefer them", or on an in-office snack budget, would delete real
+# remote roles, and that is the expensive direction to be wrong in.
+print("\noffice obligation: a body that contradicts a remote flag")
+for _txt, _want, _why in (
+        ("Willingness to work in-office in San Francisco", True, "OpenAI"),
+        ("Based in the San Francisco Bay Area, able to work onsite from our SF office",
+         True, "Outset"),
+        ("This role is based in San Francisco (3 days in office)", True, "Airwallex"),
+        ("This role is based in the Bay Area, hybrid, with 3 days a week in our SF office",
+         True, "Rerun"),
+        ("#LI-Onsite A Note on AI", True, "Notion, a tag and nothing else"),
+        ("This role is hybrid in New York, with time in-office", True, "Ramp"),
+        ("Candidates must reside in the continental United States", True, "residency demand"),
+        # 🚫 MUST NOT FIRE. Each appears in a genuinely remote posting.
+        ("We have offices in Santa Clara, CA and Charlotte, NC for employees who prefer to "
+         "work regularly or occasionally from an office.", False, "LeanTaaS, offices offered"),
+        ("100% remote first culture (must be based in the US)", False, "Redox"),
+        ("In-office perks: lunch, snacks, drinks, and more", False, "a benefits line"),
+        ("Fully remote, US-based team.", False, "plainly remote"),
+        ("", False, "empty description"),
+        (None, False, "no description at all")):
+    check(f"office obligation ({_why})", gates.office_obligation(_txt) is not None, _want)
+
+# It returns the employer's own sentence, so a human reads words rather than a verdict.
+_span = gates.office_obligation("blah This role is based in San Francisco (3 days in office) blah")
+check("returns the sentence, not a boolean", "3 days in office" in (_span or ""), True)
+
 print()
 if fails:
     for f in fails:

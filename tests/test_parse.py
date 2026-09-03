@@ -1310,8 +1310,19 @@ On Wed, Aug 12, 2026 the candidate wrote:
         # the top 24 qualified, 68 were unreachable. Asserted on the SQL, because the
         # symptom is a job that succeeds while doing nothing.
         _rc = _src_of(_app3.job_remote_check)
+        # ⚠️ Compared against the LAST LIMIT, not the first. Corrected 2026-09-03 when a second
+        # free query was added ahead of the metro rule: it legitimately has no remote filter,
+        # because it selects on is_remote=1 to catch a board flag its own body contradicts.
+        # Against `index(...)` that new LIMIT came first and the guard failed on a change it
+        # was never about. The assertion that matters is unchanged: a LIMIT must come AFTER
+        # the remote filter, so the filter is inside the SQL rather than applied to a page of
+        # rows already fetched.
         check("the remote-mention filter is inside the query, not after the LIMIT",
-              _rc.index("LIKE '%remote%'") < _rc.index("LIMIT ?"), True)
+              _rc.index("LIKE '%remote%'") < _rc.rindex("LIMIT ?"), True)
+        # 🚨 And the new query must not have quietly dropped the score band, which is what
+        # keeps this job from reading the whole table on every run.
+        check("the board-flag query is score-bounded too",
+              _rc.count("cast(score as int) >= ?") >= 2, True)
 
         # ═══════════════════════════════════ the MCP read surface over queue and places
         #
