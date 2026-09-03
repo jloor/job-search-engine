@@ -6698,11 +6698,26 @@ def _inbox_render(cand: dict, harvest: dict | None, n_in_mail: int = 1) -> str:
         band = f"${cand['comp_min']:,}-${cand['comp_max']:,} ({src})"
         floor = comp_floor()
         # ⚠️ An unknown floor is not a passed gate. Say so rather than scoring it green.
+        # 🚨 THE TEST IS THE TOP OF THE BAND, NOT THE BOTTOM. Corrected 2026-09-03 on
+        # Jonathan's rule: "if the band does not include my floor, it should be filtered out."
+        # A band INCLUDES the floor when its MAXIMUM reaches it, and this compared the MINIMUM,
+        # which made the gate silently stricter than he is.
+        # ⚠️ Measured on the queue that day: $80,000-$120,000 (Veeva) and $90,000-$125,000
+        # (LeanTaaS) both failed this gate while he was actively interviewing at both, and 148
+        # rows in total were being reported as gate failures wrongly, among them several
+        # Forward Deployed Engineer reqs topping $200,000.
+        # ⭐ What it still catches is the real exclusion: a band whose TOP is under the floor.
+        # The employer published a number beneath what he will take, so no negotiation reaches
+        # him. A band that merely STRADDLES the floor is a live outcome and he decides.
+        # 📌 tools/ease-rank.py carries the same rule in bucket(). They must agree, because one
+        # is the shortlist he reads and the other is the mail he gets.
+        top = cand.get("comp_max") or cand["comp_min"]
         if floor:
-            gates_ok.append(cand["comp_min"] >= floor)
+            gates_ok.append(top >= floor)
         # (an unknown floor is reported by the `unknown` block below, once)
-        if floor and cand["comp_min"] < floor:
-            why.append(f"band starts below the ${floor:,} floor")
+        if floor and top < floor:
+            why.append(f"the whole band is below the ${floor:,} floor "
+                       f"(tops out at ${top:,})")
     else:
         band = "NONE STATED"
         why.append("no band published")

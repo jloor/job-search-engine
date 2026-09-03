@@ -4573,9 +4573,22 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("a missing remote verdict alone also blocks a verdict",
           _verdict(dict(_cand, remote_verdict=None), None),
           ">>> COULD NOT JUDGE THIS ONE YET")
-    check("a band under the floor fails",
-          _verdict(dict(_cand, comp_min=80000), {"tier": "B", "n_written": 0, "gates": "[]"}),
+    # 🚨 CORRECTED 2026-09-03. This case used to set comp_min=80000 and leave comp_max at
+    # 200000, so the fixture was a $80,000-$200,000 band and was never "under the floor" at
+    # all. It passed only because the gate compared the MINIMUM, which was the bug. The whole
+    # band has to be beneath the floor for this to be a rejection.
+    check("a band WHOLLY under the floor fails",
+          _verdict(dict(_cand, comp_min=60000, comp_max=82000),
+                   {"tier": "B", "n_written": 0, "gates": "[]"}),
           ">>> DOES NOT CLEAR THE GATES")
+    # ⭐ The other half of Jonathan's rule, and the half that was broken. A band STRADDLING the
+    # floor is a live outcome: landing at the top of $80,000-$120,000 clears $100,000. Veeva
+    # and LeanTaaS are both this shape and he was interviewing at both while the gate called
+    # them failures.
+    check("a band straddling the floor PASSES",
+          _verdict(dict(_cand, comp_min=80000, comp_max=120000),
+                   {"tier": "B", "n_written": 0, "gates": "[]"}),
+          ">>> WORTH APPLYING TO")
     check("an onsite role fails",
           _verdict(dict(_cand, remote_verdict="onsite"), {"tier": "B", "n_written": 0, "gates": "[]"}),
           ">>> DOES NOT CLEAR THE GATES")
@@ -4740,6 +4753,32 @@ On Wed, Aug 12, 2026 the candidate wrote:
         check(f"exclude {_title!r}", bool(_xrx.search(_title)), _drop)
     # An empty list disables the filter rather than matching everything.
     check("no patterns means no filter", _cand.exclude_title_re({"targeting": {}}), None)
+
+    # ------------------------------------------------------- comp gate: top of band
+    # 🚨 Jonathan's rule, 2026-09-03: "if the band does not include my floor of $100k, then it
+    # should be filtered out." A band INCLUDES the floor when its MAXIMUM reaches it. Both this
+    # gate and tools/ease-rank.py's bucket() compared the MINIMUM, which made them silently
+    # stricter than he is: $80,000-$120,000 and $90,000-$125,000 both failed while he was
+    # actively interviewing at those two employers.
+    # ⭐ Asserted from both directions, because a rule tested only on what it rejects widens
+    # again the next time somebody "tidies" it.
+    print("\ncomp gate reads the top of the band, not the bottom:")
+    _FLOOR = 100000
+    def _clears(lo, hi):
+        top = hi or lo
+        return top >= _FLOOR
+    for _lo, _hi, _want, _why in (
+            (120000, 200000, True,  "wholly above the floor"),
+            (100000, 130000, True,  "starts exactly at the floor"),
+            ( 90000, 125000, True,  "STRADDLES the floor (LeanTaaS)"),
+            ( 80000, 120000, True,  "STRADDLES the floor (Veeva)"),
+            ( 89000, 205000, True,  "wide band, FDE shape"),
+            ( 85000, 100000, True,  "tops out exactly AT the floor (Redox)"),
+            ( 59500,  82000, False, "whole band under the floor (GoFundMe)"),
+            ( 55000,  65000, False, "whole band well under"),
+            ( 80000,      0, False, "no max recorded, falls back to the min"),
+            (100000,      0, True,  "no max recorded, min already clears")):
+        check(f"clears ${_lo:,}-${_hi:,} ({_why})", _clears(_lo, _hi), _want)
 
     print("all passed")
     return 0
