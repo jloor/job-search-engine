@@ -2991,8 +2991,48 @@ On Wed, Aug 12, 2026 the candidate wrote:
         ("Your code", "Your one-time verification code is 123456", "otp"),
         ("Hello", "I came across your profile and wanted to reach out.", "recruiter_outreach"),
         ("Newsletter", "Here is our monthly update.", "unknown"),
+        # 🚨 2026-09-03. Two forwarded batches of postings, subjects "New leads" and
+        # "Review jobs", bodies of nothing but URLs. The rules returned `unknown`, the
+        # model called both `noise` at high confidence and the takeover cleared
+        # needs_human, because `noise` is in AUTO_HANDLED. Thirteen postings, eight never
+        # worked, gone from the queue in silence.
+        ("New leads",
+         "https://jobs.ashbyhq.com/brellium/ec618c95\n"
+         "https://job-boards.greenhouse.io/coherehealth/jobs/7906311003", "lead"),
+        ("Review jobs",
+         "https://apply.workable.com/healthix/j/AE1736E7E5 "
+         "https://zotecpartners.applytojob.com/apply/2VKJvO11wm", "lead"),
+        # ⚠️ ONE link is not a dump. This stayed `unknown` and correctly raised a human.
+        ("check job", "https://jobs.ashbyhq.com/vesta/13c60807", "unknown"),
+        # ⚠️ A recruiter with a link and a real sentence is still outreach. The lead rule
+        # must not eat the label off any message that actually says something.
+        ("Career Opportunity",
+         "I came across your profile and wanted to reach out about an opening. "
+         "https://job-boards.greenhouse.io/x/jobs/1 Happy to share more about the team "
+         "and the work if you are open to a conversation this week.", "recruiter_outreach"),
     ]:
         check(f"classify: {_want}", _appc.classify(_subj, _body)[0], _want)
+
+    # A lead is a to-do list, so it can never be auto-handled away.
+    check("lead needs a human", _appc.needs_human_for("lead", False), 1)
+    check("lead is not auto-handled", "lead" in _appc.AUTO_HANDLED, False)
+
+    # 🚨 The model may not DEMOTE a message out of ALWAYS_HUMAN. rules=assessment_invite
+    # plus model=noise at high confidence used to write `noise` and clear needs_human, so
+    # a time-boxed invitation left the queue on one confident sentence. The guard is
+    # one-way: promotion into ALWAYS_HUMAN stays allowed.
+    for _rules, _ai, _blocked in (("assessment_invite", "noise", True),
+                                  ("lead", "noise", True),
+                                  ("incomplete_application", "confirmation", True),
+                                  ("noise", "assessment_invite", False),
+                                  ("unknown", "rejection", False),
+                                  ("confirmation", "rejection", False)):
+        _d = (_rules in _appc.ALWAYS_HUMAN and _ai not in _appc.ALWAYS_HUMAN)
+        check(f"demotion {_rules}->{_ai} blocked", _d, _blocked)
+
+    # The model must be able to NAME every rule label, or the two readers disagree by
+    # construction and the disagreement log fills with noise.
+    check("model can name 'lead'", "lead" in _appc.AI_LABELS, True)
 
     # ⭐ Only confirmation and noise may skip a human, and assessment_invite and
     # incomplete_application are named explicitly so a future addition to AUTO_HANDLED
