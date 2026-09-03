@@ -4710,7 +4710,6 @@ On Wed, Aug 12, 2026 the candidate wrote:
     import candidate as _cand
     _xcfg = {"targeting": {"exclude_title_patterns": [
         r"(?<!assistant )(?<!associate )(?<!deputy )(?<!asst )(?<!asst. )\bdirector\b",
-        r"\bvice president\b", r"\bvp,?\b", r"\bchief [a-z]+ officer\b",
         r"\bintern(ship)?\b"]}}
     _xrx = _cand.exclude_title_re(_xcfg)
     for _title, _drop in (
@@ -4723,9 +4722,15 @@ On Wed, Aug 12, 2026 the candidate wrote:
             ("Assistant Director of Integrations", False),
             ("Associate Director, Implementation", False),
             ("Deputy Director of Support", False),
-            ("VP, Customer Success", True),
-            ("Vice President of Engineering", True),
-            ("Chief Technology Officer", True),
+            # 🚫 VP AND C-LEVEL ARE NOT EXCLUDED, and that is a decision, not an
+            # omission. Jonathan removed them 2026-09-03: he asked about Director only, and
+            # at banks "Assistant Vice President" is a senior individual-contributor grade,
+            # so a blanket VP rule deletes real IC roles. Asserted as KEPT so a future edit
+            # cannot quietly re-add them.
+            ("VP, Customer Success", False),
+            ("Vice President of Engineering", False),
+            ("Chief Technology Officer", False),
+            ("Platform Integration Specialist - Assistant Vice President", False),
             ("Service Desk & AV Support Intern", True),
             # Ordinary targets must be untouched by an exclusion list.
             ("Senior Integration Coordinator", False),
