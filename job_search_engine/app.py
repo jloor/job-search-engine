@@ -3491,10 +3491,30 @@ class _TargetTitleProxy:
 TARGET_TITLE = _TargetTitleProxy()
 
 
+def excluded_title():
+    """The title exclusion, re-read whenever the config changes on disk. None when unset."""
+    try:
+        import candidate as _C
+        return _C.exclude_title_re()
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
 def gate_posting(p: dict) -> tuple[bool, str]:
     """Return (passes, reason_if_not). Only definitional filters live here."""
     if p.get("is_remote") is False:
         return False, "not remote"
+    # 🚨 A LEVEL HE CANNOT REACH IS A DEFINITIONAL FILTER, not a low score. Added
+    # 2026-09-03 on Jonathan's rule: no Director titles, because a Director job assumes
+    # managing people with direct reports and he has never held that. The auto-applier had
+    # already proved the cost of not having this, sending 18 Director and VP applications
+    # among 224, including Director of Business Applications and Senior Director,
+    # Implementation Services.
+    # ⚠️ The pattern, not the word. "Assistant Director" and "Associate Director" survive,
+    # because that is the shape he ran at Phreesia reporting to the Director of Deployments.
+    _x = excluded_title()
+    if _x and _x.search(p.get("title") or ""):
+        return False, f"excluded title: {p.get('title')}"
     # None means the platform did not say. Unknown is not a rejection: per P6 absence is
     # data, and dropping every Greenhouse posting for lacking a boolean would discard the
     # largest board population outright.

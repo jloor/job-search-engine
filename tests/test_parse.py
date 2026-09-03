@@ -4698,6 +4698,44 @@ On Wed, Aug 12, 2026 the candidate wrote:
               " the full suite.")
         return 0
 
+    # ------------------------------------------------------------ title exclusion
+    # 🚨 Jonathan's rule, 2026-09-03: no Director titles, because a Director job assumes
+    # managing people with direct reports and he has never held that. ASSISTANT Director
+    # stays in scope: that is the shape he ran at Phreesia reporting to the Director of
+    # Deployments, without the title.
+    # ⭐ This is why the entries are FULL REGEXES and are not wrapped like title_patterns.
+    # A bare "director" word collapses the distinction and deletes the reachable half, and
+    # the pattern itself is the only place that difference can be expressed.
+    print("\ntitle exclusion drops director and keeps assistant director:")
+    import candidate as _cand
+    _xcfg = {"targeting": {"exclude_title_patterns": [
+        r"(?<!assistant )(?<!associate )(?<!deputy )(?<!asst )(?<!asst. )\bdirector\b",
+        r"\bvice president\b", r"\bvp,?\b", r"\bchief [a-z]+ officer\b",
+        r"\bintern(ship)?\b"]}}
+    _xrx = _cand.exclude_title_re(_xcfg)
+    for _title, _drop in (
+            ("Director, Forward Deployed Engineering", True),
+            ("Senior Director, Implementation Services", True),
+            ("Managing Director", True),
+            ("Director of Business Applications", True),
+            # ⭐ The carve-out. If these three start failing, the rule has eaten the half
+            # of the level he can actually reach.
+            ("Assistant Director of Integrations", False),
+            ("Associate Director, Implementation", False),
+            ("Deputy Director of Support", False),
+            ("VP, Customer Success", True),
+            ("Vice President of Engineering", True),
+            ("Chief Technology Officer", True),
+            ("Service Desk & AV Support Intern", True),
+            # Ordinary targets must be untouched by an exclusion list.
+            ("Senior Integration Coordinator", False),
+            ("Implementation Discovery Lead", False),
+            ("Forward Deployed Engineer", False),
+            ("Solutions Architect", False)):
+        check(f"exclude {_title!r}", bool(_xrx.search(_title)), _drop)
+    # An empty list disables the filter rather than matching everything.
+    check("no patterns means no filter", _cand.exclude_title_re({"targeting": {}}), None)
+
     print("all passed")
     return 0
 

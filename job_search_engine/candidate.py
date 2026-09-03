@@ -83,6 +83,25 @@ def title_re(cfg: dict | None = None):
     return re.compile(rf"\b({_alt(pats)})\b", re.I) if pats else None
 
 
+def exclude_title_re(cfg: dict | None = None):
+    r"""Titles to drop even when title_patterns matched them.
+
+    🚨 UNLIKE title_re, THE ENTRIES ARE FULL REGEXES AND ARE NOT WRAPPED. title_re wraps
+    its words in `\b(...)\b`, which is right for a recall filter over plain words. An
+    exclusion needs to say "this word, but not when another word comes first", and that
+    cannot be expressed inside a wrapper it does not control.
+
+    ⭐ The case that forced it, Jonathan's 2026-09-03: exclude Director, keep Assistant
+    Director. His reasoning is that a Director job assumes managing people with direct
+    reports, which he has not held, while the ASSISTANT Director shape is work he already
+    did at Phreesia without the title, reporting to the Director of Deployments. A bare
+    "director" pattern collapses that distinction and deletes the reachable half.
+    """
+    cfg = load() if cfg is None else cfg
+    pats = (cfg.get("targeting") or {}).get("exclude_title_patterns") or []
+    return re.compile("|".join(pats), re.I) if pats else None
+
+
 def metro_re(cfg: dict | None = None):
     """Places reachable from the origin, plus the near-state suffixes.
 
