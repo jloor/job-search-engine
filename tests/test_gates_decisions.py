@@ -135,6 +135,40 @@ for _txt, _want, _why in (
         (None, False, "no description at all")):
     check(f"office obligation ({_why})", gates.office_obligation(_txt) is not None, _want)
 
+# ── underscore-joined location fields ──────────────────────────────────────────────
+# 🚨 AN UNDERSCORE IS A WORD CHARACTER, so \b does not fall where a reader assumes and every
+# \b-anchored pattern in gates.py silently failed on these. Found 2026-09-03 on five distinct
+# location strings in the live queue. It failed in BOTH directions, which is the reason the fix
+# is a separator normalisation rather than one edited regex.
+for _loc, _want, _why in (
+        # The false REJECT. The router then measured a distance to this string, returned
+        # 2,017 minutes, and the row was filed as over the commute ceiling.
+        ("US_Remote", True, "remote hidden behind an underscore"),
+        ("US_REMOTE", True, "same, upper case"),
+        ("Remote_US", True, "same, other order"),
+        # Unchanged behaviour, so the normalisation cannot be the thing that starts matching.
+        ("Remotely based", True, "the suffix case this file already protects"),
+        ("New York, NY", False, "a real place is not remote"),
+        ("", False, "empty")):
+    check(f"remote text ({_why})",
+          bool(gates.REMOTE_TXT.search(gates.norm_loc(_loc))), _want)
+
+for _loc, _want, _why in (
+        # The false KEEP, and the worse half: an ineligible country read as unknown.
+        ("IN_Bangalore_Virtual", "ineligible", "foreign city hidden behind an underscore"),
+        ("Bangalore", "ineligible", "the same city, unjoined, already worked"),
+        ("New York, NY", "eligible", "a US place stays eligible"),
+        ("US_Remote", "unknown", "no country named is still unknown")):
+    check(f"eligibility ({_why})", gates.eligibility(_loc), _want)
+
+# ⚠️ NORMALISE FOR MATCHING, NEVER FOR LOOKUP. The place table is keyed on the board's raw
+# string, so a rewritten location would turn a commute rejection into a silent miss.
+check("norm_loc leaves a normal location untouched", gates.norm_loc("New York, NY"), "New York, NY")
+check("norm_loc opens out a joiner", gates.norm_loc("AZ_Mesa_HQ"), "AZ Mesa HQ")
+check("gate keeps the RAW string for the too_far lookup",
+      gates.gate({"location": "AZ_Mesa_HQ", "description": ""}, CFG,
+                 too_far={"AZ_Mesa_HQ"})[1], "over the commute ceiling")
+
 # It returns the employer's own sentence, so a human reads words rather than a verdict.
 _span = gates.office_obligation("blah This role is based in San Francisco (3 days in office) blah")
 check("returns the sentence, not a boolean", "3 days in office" in (_span or ""), True)

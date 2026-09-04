@@ -82,6 +82,26 @@ _REGION = re.compile(r"\b(emea|apac|latam|anz|dach|benelux|mena|europe|asia|afri
 # 'e', so a posting whose location field reads "Remotely based" matched nothing. One was
 # found sitting unread at the top of the remote_check backlog for exactly this reason.
 REMOTE_TXT = re.compile(r"\b(remote(?:ly)?|distributed|work from home|wfh|anywhere)\b", re.I)
+
+# 🚨 AN UNDERSCORE IS A WORD CHARACTER, SO \b DOES NOT FALL WHERE A READER ASSUMES.
+# Some boards emit location fields as underscore-joined tokens: US_Remote, IN_Bangalore_Virtual,
+# CA_Ontario_Virtual, AZ_Mesa_HQ. Every \b-anchored pattern in this module silently fails on
+# them, and it fails in BOTH directions, which is why this is a separator problem and not one
+# broken regex:
+#   US_Remote            REMOTE_TXT missed it, the router then measured a distance to a string
+#                        and returned 2,017 minutes, and the row was rejected as too far.
+#   IN_Bangalore_Virtual eligibility() returned "unknown" instead of "ineligible". Bare
+#                        "Bangalore" is correctly ineligible. That is a FALSE KEEP, and a
+#                        false keep on an ineligible country is the worse half.
+# ⚠️ NORMALISE FOR MATCHING ONLY, NEVER FOR LOOKUP. The place table is keyed on the raw
+# location string, so `loc in too_far` must keep the original. Rewriting it there would turn
+# a commute rejection into a silent miss.
+_JOINER = re.compile(r"[_]+")
+
+
+def norm_loc(location: str | None) -> str:
+    """Location text with token joiners turned into spaces, for regex matching only."""
+    return _JOINER.sub(" ", location or "")
 BODY_REMOTE = re.compile(
     r"\b(fully remote|100% remote|remote[- ]first|remote.friendly|work from anywhere|"
     r"remote (?:role|position|opportunity)|or remote|remote or)\b", re.I)
@@ -89,6 +109,7 @@ BODY_REMOTE = re.compile(
 
 def eligibility(location: str | None) -> str:
     """'eligible', 'ineligible', or 'unknown'. Unknown is never a rejection."""
+    location = norm_loc(location)
     loc = (location or "").strip()
     if not loc:
         return "unknown"
@@ -103,6 +124,9 @@ def gate(posting: dict, cfg: dict | None = None, too_far: set | None = None) -> 
     """Return (keep: bool, reason: str) for one posting, before any model is involved."""
     cfg = C.load() if cfg is None else cfg
     loc = (posting.get("location") or "").strip()
+    # ⚠️ `loc` stays RAW for the too_far lookup, which is keyed on the board's own string.
+    # `loc_t` is the same text with underscores opened out, for pattern matching only.
+    loc_t = norm_loc(loc)
 
     # 1. ELIGIBILITY FIRST, always. See the module docstring: checking remote first is
     #    what let "UK Remote" through, because it is genuinely remote.
@@ -111,7 +135,7 @@ def gate(posting: dict, cfg: dict | None = None, too_far: set | None = None) -> 
 
     if posting.get("is_remote") is True:
         return True, "board flagged remote"
-    if REMOTE_TXT.search(loc):
+    if REMOTE_TXT.search(loc_t):
         return True, "remote in the location text"
     if not loc:
         return True, "no location stated"
@@ -123,7 +147,7 @@ def gate(posting: dict, cfg: dict | None = None, too_far: set | None = None) -> 
         return False, "over the commute ceiling"
 
     near, metro = C.near_state_re(cfg), C.metro_re(cfg)
-    if (near and near.search(loc)) or (metro and metro.search(loc)):
+    if (near and near.search(loc_t)) or (metro and metro.search(loc_t)):
         return True, "commutable, or not yet ruled on"
     return False, "out on geography"
 
