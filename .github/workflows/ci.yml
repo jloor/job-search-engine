@@ -17,6 +17,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: python3 tests/test_parse.py
       - run: python3 tests/test_gates_decisions.py
+      - run: python3 tests/test_scan_description_storage.py
+      # ⚠️ test_posting_age.py existed but was never listed here, so it had
+      # never run in CI. Added 2026-09-03 with the storage-truncation guard.
+      - run: python3 tests/test_posting_age.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #

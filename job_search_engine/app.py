@@ -1459,6 +1459,18 @@ AI_EFFORT         = os.environ.get("AI_EFFORT", "low").strip()
 # Bodies are truncated before they are sent. A rejection says what it says in the first
 # paragraph, and the tail of a long thread is mostly quoted history and signature blocks.
 AI_MAX_BODY_CHARS = int(os.environ.get("AI_MAX_BODY_CHARS", "6000"))
+# 🚨 AI_MAX_BODY_CHARS IS A MODEL-INPUT CAP. IT IS NOT A STORAGE CAP, AND USING IT AS ONE
+# COST 48 COVER LETTERS. Both scan_candidate INSERTs used to truncate `description` to it
+# before writing, so the database kept 6,000 characters of a posting and threw the rest away
+# at capture time. Measured 2026-09-03 across 101 packages built in one batch: 48 of their
+# postings stopped at exactly 6,000 characters, cut mid-word, and every letter written
+# against one was written by someone who never saw the end of the requisition.
+# ⭐ THE TWO LIMITS ANSWER DIFFERENT QUESTIONS. Truncating a model's input is a cost
+# decision and it is reversible: send more next time. Truncating at INSERT is destruction,
+# because the board is the only other copy and a requisition disappears. The stored row is
+# the archive. Send a slice of it to the model; never store a slice of the board.
+# The storage cap that remains is a safety valve against a pathological page, not a budget.
+SCAN_MAX_DESCRIPTION_CHARS = int(os.environ.get("SCAN_MAX_DESCRIPTION_CHARS", "400000"))
 # Shared by the mail reader and triage. Raised from 8,000 for packing: a pack of 5 at
 # ~1,500 output tokens each needs room, and a truncated reply costs the whole pack.
 TRIAGE_MAX_TOKENS = int(os.environ.get("TRIAGE_MAX_TOKENS", "24000"))
@@ -3999,7 +4011,7 @@ def _scan_candidates(at: str, new_ids: list, detail: dict) -> str:
                  pst.get("comp"),
                  (None if pst.get("is_remote") is None else (1 if pst["is_remote"] else 0)),
                  pst.get("url"),
-                 (pst.get("description") or "")[:AI_MAX_BODY_CHARS],
+                 (pst.get("description") or "")[:SCAN_MAX_DESCRIPTION_CHARS],
                  # ⚠️ All five stay NULL when nothing was found, and NULL is what the paid
                  # comp job selects on. So a posting this could not read still reaches the
                  # model, and a posting it could read never costs anything.
@@ -7295,7 +7307,7 @@ def _inbox_evaluate(url: str) -> dict:
                 (now(), pst["req_id"], pst["board"], pst["title"], pst.get("location"),
                  pst.get("comp"),
                  (None if pst.get("is_remote") is None else (1 if pst["is_remote"] else 0)),
-                 url, (pst.get("description") or "")[:AI_MAX_BODY_CHARS],
+                 url, (pst.get("description") or "")[:SCAN_MAX_DESCRIPTION_CHARS],
                  *(band or (None, None, None, None, None)),
                  pst.get("company"), "inbox_url",
                  pst.get("posted_at"), pst.get("updated_at"),
