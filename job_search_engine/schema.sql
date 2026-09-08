@@ -287,6 +287,30 @@ CREATE TABLE IF NOT EXISTS scan_board (
 );
 CREATE INDEX IF NOT EXISTS idx_scan_board_enabled ON scan_board(enabled);
 
+-- 🚨 The UNIQUE above is CASE SENSITIVE, and that is not what a board token means.
+-- Workday's /wday/cxs/ endpoint answers to any casing of the site path, so
+-- 'acme:wd5:Acme_Careers' and 'acme:wd5:acme_careers' are one board. The UNIQUE
+-- treats them as two, and on 2026-09-05 a load from an aggregator, which lowercases
+-- everything, re-added eight boards that were already enabled under their real casing.
+-- INSERT OR IGNORE did not stop it. Both ids swept, so every posting on those boards was
+-- counted twice in board_state and paid for twice in triage.
+--
+-- ⚠️ It also broke a READ. A check for "employers tracked but not watched" compared a
+-- lowercase registry against real-cased tokens and reported two watched boards as missing.
+-- Both had been enabled the whole time. The bug reads as a coverage hole, not as duplication.
+--
+-- ⭐ Why an index and not only the loader guard: the loader is one writer. This holds for
+-- every writer, including a hand-run INSERT and any future importer.
+--
+-- ⚠️ APPLYING THIS TO AN OLD DATABASE CAN FAIL, and the failure is correct. If duplicate
+-- casings still exist as rows, the CREATE is rejected until they are removed. There is no
+-- data to merge in that case: the duplicate carries no board_state, scan_change or
+-- scan_candidate rows, because only one casing was ever swept. Delete the row that has
+-- none, keep the one with the history, then apply this. That is what was done on
+-- 2026-09-07 for the fourteen groups that existed then.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_board_platform_token_nocase
+  ON scan_board(platform, lower(token));
+
 -- 🚨 The flood guard. A board with no state yet is INDISTINGUISHABLE from a board where
 -- every requisition appeared at once, and "appeared" is what feeds triage. Without this,
 -- adding the 2,060-board registry would present ~174,000 postings as new discoveries and

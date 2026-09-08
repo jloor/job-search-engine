@@ -77,6 +77,33 @@ def _alt(words) -> str:
     return "|".join(sorted(words, key=len, reverse=True))
 
 
+def signoff_alt(cfg: dict | None = None) -> str:
+    """A regex alternation of the candidate's own name, for stripping a mail sign-off.
+
+    🚨 THE NAME MUST NOT BE HARDCODED IN THIS PACKAGE. It is public and the profile is not.
+    Until 2026-09-08 the answer parser carried the operator's own first name and short form
+    inline, which put a real person's name in a public repository and made the parser wrong
+    for anybody else running this engine.
+
+    ⚠️ NO CONFIG MEANS NO NAME RULE, never a fallback name. That is the same choice `load()`
+    makes, and the cost is small: the generic sign-offs ("thanks,", "regards,", "sent from
+    my ") still catch most signatures. A stale or borrowed name would silently truncate a
+    real answer, which is the failure this parser exists to prevent.
+
+    `signoff_aliases` carries what the full name cannot yield, such as a short form.
+    """
+    cfg = load() if cfg is None else cfg
+    cand = cfg.get("candidate") or {}
+    full = (cand.get("name") or "").strip()
+    parts = [w for w in re.split(r"\s+", full) if len(w) > 1]
+    # ⚠️ THE FULL NAME IS ITS OWN ENTRY. People sign off with the whole name, and the
+    # alternation is anchored to the end of the line, so "Alex|Rivera" does not match the
+    # line "Alex Rivera". A test caught that; the parts alone are not enough.
+    names = {full, *parts} | {str(a).strip() for a in (cand.get("signoff_aliases") or [])}
+    names = {n for n in names if n}
+    return _alt([re.escape(n) for n in names]) if names else ""
+
+
 def title_re(cfg: dict | None = None):
     cfg = load() if cfg is None else cfg
     pats = (cfg.get("targeting") or {}).get("title_patterns") or []
@@ -91,10 +118,10 @@ def exclude_title_re(cfg: dict | None = None):
     exclusion needs to say "this word, but not when another word comes first", and that
     cannot be expressed inside a wrapper it does not control.
 
-    ⭐ The case that forced it, Jonathan's 2026-09-03: exclude Director, keep Assistant
+    ⭐ The case that forced it, the operator's rule of 2026-09-03: exclude Director, keep Assistant
     Director. His reasoning is that a Director job assumes managing people with direct
     reports, which he has not held, while the ASSISTANT Director shape is work he already
-    did at Phreesia without the title, reporting to the Director of Deployments. A bare
+    did at a prior employer without the title, reporting to a Director. A bare
     "director" pattern collapses that distinction and deletes the reachable half.
     """
     cfg = load() if cfg is None else cfg

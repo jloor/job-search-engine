@@ -1329,7 +1329,7 @@ URL_RE = re.compile(r"https?://\S+")
 def looks_like_a_lead_dump(subject: str, body: str) -> bool:
     """A message that is mostly job-posting links and almost no prose.
 
-    🚨 WHY THIS EXISTS. On 2026-08-29 and 2026-09-02 Jonathan forwarded himself two
+    🚨 WHY THIS EXISTS. On 2026-08-29 and 2026-09-02 the operator forwarded himself two
     batches of postings, subjects "New leads" and "Review jobs", bodies consisting of
     nothing but URLs. The rules correctly returned `unknown`. The model then read them,
     labelled both `noise` at high confidence, and the takeover added on 2026-08-23 wrote
@@ -2236,7 +2236,7 @@ def job_ai_read() -> str:
         scope_sql = ("" if AI_READ_SCOPE == "all"
                      else " AND (m.classification IS NULL OR m.classification = 'unknown')")
         # 🚨 NEVER PAY A MODEL TO READ OUR OWN VERDICT MAIL. A verdict sent to
-        # <company>@jobs.jonathanloor.com returns through the catch-all and classifies as
+        # <company>@jobs.<MAIL_DOMAIN> returns through the catch-all and classifies as
         # `unknown`, which is exactly what this job selects. Filtering on the SENDER rather
         # than on the body text matters: a body-text rule would be forgeable by anyone who
         # copied our footer, and that is a classifier this project has already proved can be
@@ -2325,7 +2325,7 @@ def job_ai_read() -> str:
             # at nuance and can still be wrong. This records the pair and puts it in the
             # audit log so a human decides, and so the set of disagreements is available
             # later as the evidence for improving RULES.
-            # 🚨 THE MODEL NOW OWNS message.classification. Jonathan's decision, 2026-08-23,
+            # 🚨 THE MODEL NOW OWNS message.classification. The operator's decision, 2026-08-23,
             # after the rules auto-rejected two applications from confirmation emails.
             #
             # ⚠️ Three gates still apply, and none of them is about which reader is smarter:
@@ -3042,7 +3042,7 @@ def _workday_list(api_url: str) -> dict:
 # or it silently works on half the rows.
 # ⭐ AN ATS TENANT CODE IS NOT PART OF THE COMPANY NAME, so it does not live in the column
 # that holds one. Workday publishes many tenants with an internal code in front of the legal
-# name: "MS0309 GE Healthcare IITS USA Corp.", "LE001 Contoso, Inc.", "5100 Kyndryl Solutions
+# name: "MS0309 Initech Health IITS USA Corp.", "LE001 Contoso, Inc.", "5100 Globex Solutions
 # Private Limited". Written straight into `company` the two facts are concatenated, and every
 # consumer that normalises a name for matching stops matching. That happened: the queue dedupe
 # that keeps already-applied companies out stopped recognising 413 rows, including one the
@@ -3517,13 +3517,13 @@ def gate_posting(p: dict) -> tuple[bool, str]:
     if p.get("is_remote") is False:
         return False, "not remote"
     # 🚨 A LEVEL HE CANNOT REACH IS A DEFINITIONAL FILTER, not a low score. Added
-    # 2026-09-03 on Jonathan's rule: no Director titles, because a Director job assumes
+    # 2026-09-03, the operator's rule: no Director titles, because a Director job assumes
     # managing people with direct reports and he has never held that. The auto-applier had
     # already proved the cost of not having this, sending 18 Director and VP applications
     # among 224, including Director of Business Applications and Senior Director,
     # Implementation Services.
     # ⚠️ The pattern, not the word. "Assistant Director" and "Associate Director" survive,
-    # because that is the shape he ran at Phreesia reporting to the Director of Deployments.
+    # because that is the shape he ran at a prior employer, reporting to a Director.
     _x = excluded_title()
     if _x and _x.search(p.get("title") or ""):
         return False, f"excluded title: {p.get('title')}"
@@ -6051,7 +6051,7 @@ def job_verify() -> str:
 # changes later, that is a new row or it belongs in `notes`. Rewriting the log is how a
 # log stops being evidence.
 #
-# ⚠️ `at` IS WHEN IT HAPPENED, NOT WHEN WE LEARNED OF IT. Redox's availability request is
+# ⚠️ `at` IS WHEN IT HAPPENED, NOT WHEN WE LEARNED OF IT. An availability request is
 # stamped 2026-08-27T12:29Z, the recruiter's send time, though this system only saw it six
 # hours later through a hand forward. The gap between those two IS the forhire@ blind spot,
 # and it is only visible if `at` stays honest.
@@ -6486,7 +6486,7 @@ _GATE_AUDIT_SCHEMA = {
 
 # ── 📥 mail a job link, get a verdict back ───────────────────────────────────────────────
 # ⚠️ A LIST, AND "jobs" IS IN THE DEFAULT ON PURPOSE. The domain is already
-# jobs.jonathanloor.com, so "jobs@jobs.jonathanloor.com" is what a person actually types, and
+# jobs.<MAIL_DOMAIN>, so "jobs@jobs.<MAIL_DOMAIN>" is what a person actually types, and
 # that is exactly what happened on the first real use: the mail arrived, the URL parsed, and
 # the job ignored it because the filter wanted "job@". An alias that only works when you
 # remember which singular/plural it is, is a trap rather than a feature.
@@ -6501,7 +6501,7 @@ INBOX_MAX_URLS_PER_MSG = int(os.environ.get("INBOX_MAX_URLS_PER_MSG", "10"))
 # self-reply path is acceptable beside a /send that refuses without a human's Ed25519
 # signature. /send exists so an agent cannot decide on its own to answer a RECRUITER; that
 # gate is untouched. This path can only ever mail ONE address, read from the environment, so
-# a caller who compromises it gains the ability to send Jonathan an email about a job posting
+# a caller who compromises it gains the ability to send the operator an email about a job posting
 # and nothing else. If this ever grows a `to` parameter, it has become /send without the
 # approval and must be deleted instead.
 INBOX_REPLY_TO   = os.environ.get("INBOX_REPLY_TO", "").strip()
@@ -6742,11 +6742,11 @@ def _inbox_render(cand: dict, harvest: dict | None, n_in_mail: int = 1) -> str:
         floor = comp_floor()
         # ⚠️ An unknown floor is not a passed gate. Say so rather than scoring it green.
         # 🚨 THE TEST IS THE TOP OF THE BAND, NOT THE BOTTOM. Corrected 2026-09-03 on
-        # Jonathan's rule: "if the band does not include my floor, it should be filtered out."
+        # The operator's rule: "if the band does not include my floor, it should be filtered out."
         # A band INCLUDES the floor when its MAXIMUM reaches it, and this compared the MINIMUM,
         # which made the gate silently stricter than he is.
-        # ⚠️ Measured on the queue that day: $80,000-$120,000 (Veeva) and $90,000-$125,000
-        # (LeanTaaS) both failed this gate while he was actively interviewing at both, and 148
+        # ⚠️ Measured on the queue that day: $80,000-$120,000 and $90,000-$125,000
+        # both failed this gate while he was actively interviewing at both employers, and 148
         # rows in total were being reported as gate failures wrongly, among them several
         # Forward Deployed Engineer reqs topping $200,000.
         # ⭐ What it still catches is the real exclusion: a band whose TOP is under the floor.
@@ -7449,11 +7449,19 @@ def parse_numbered_answers(body: str) -> tuple:
     """
     # 🚨 A SIGNATURE MUST NOT BECOME THE TAIL OF HIS LAST ANSWER. Continuation across a blank
     # line is deliberate, because an essay answer runs to several paragraphs. That same rule
-    # would otherwise glue "Thanks, Jonathan / Sent from my iPhone" onto answer 2 and put it in
+    # would otherwise glue "Thanks, <name> / Sent from my iPhone" onto answer 2 and put it in
     # a job application.
+    # ⚠️ The name comes from the profile, never from this file. See candidate.signoff_alt.
+    # ⚠️ Imported locally and defensively, the same as every other candidate.py call site
+    # here: a missing or broken profile must not stop an answer being parsed at all.
+    try:
+        import candidate as _Csig
+        _names = _Csig.signoff_alt()
+    except Exception:                                         # noqa: BLE001
+        _names = ""
     sig = re.compile(r"^\s*(--\s*$|thanks[,!.]?\s*$|thank you[,!.]?\s*$|best[,!.]?\s*$|"
-                     r"regards[,!.]?\s*$|cheers[,!.]?\s*$|sent from my |sent via |"
-                     r"jonathan\s*$|jon\s*$)", re.I)
+                     r"regards[,!.]?\s*$|cheers[,!.]?\s*$|sent from my |sent via "
+                     + (rf"|({_names})\s*$" if _names else "") + r")", re.I)
     out, cur, leftover = {}, None, []
     for line in (body or "").splitlines():
         if line.lstrip().startswith(">"):          # quoted original, not his words
@@ -7486,7 +7494,7 @@ def job_inbox_answers() -> str:
     where = " OR ".join(["lower(to_alias) LIKE ?"] * len(INBOX_ALIASES))
     with db() as con:
         msgs = [dict(r) for r in con.execute(
-            # 🚨 SKIP OUR OWN MAIL. A verdict sent to <company>@jobs.jonathanloor.com comes
+            # 🚨 SKIP OUR OWN MAIL. A verdict sent to <company>@jobs.<MAIL_DOMAIN> comes
             # straight back in through the catch-all, carrying the [JOB-nnn] tag, so without
             # this the service would parse its OWN email as his answers and store the question
             # list as though he had written it.
@@ -8530,7 +8538,7 @@ async def send(request: Request,
             # ⭐ RECORD THE OUTBOUND HALF, HERE, BECAUSE THIS IS THE ONLY PLACE THAT KNOWS.
             # The relay watches inbound mail and has never seen anything he sends, so every
             # conversation in the database was half a conversation. Measured 2026-08-27:
-            # four replies (PermitFlow, SingleStore, and two to Redox) existed only as prose
+            # four replies to three employers existed only as prose
             # in a chat session, and two next actions still asked him to do things he had
             # already done. Recording it by hand works and is forgotten; recording it at the
             # moment of the send cannot be.

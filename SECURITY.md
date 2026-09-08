@@ -291,7 +291,7 @@ message.
 
 ## 📥 The inbox reply path (`job_inbox_url`), added 2026-08-29
 
-Mail a job link to `<INBOX_ALIAS>@jobs.jonathanloor.com` and the service replies with a fit
+Mail a job link to `<INBOX_ALIAS>@jobs.<MAIL_DOMAIN>` and the service replies with a fit
 verdict. That reply is the ONLY outbound mail this service sends without a human's Ed25519
 approval, and the exception is deliberately shaped so it cannot become a general one.
 
@@ -299,7 +299,7 @@ approval, and the exception is deliberately shaped so it cannot become a general
 
 - 🚨 **The recipient is not a parameter.** It is `INBOX_REPLY_TO`, read from the environment.
   There is no code path that lets a caller choose who receives the mail. An attacker who fully
-  controls the trigger gains the ability to send **Jonathan** an email about a job posting.
+  controls the trigger gains the ability to send **the operator** an email about a job posting.
 - 🚨 **`/send` is untouched.** It still requires `X-Approval`, a signature only the operator can
   mint, and it is still the only way to answer a recruiter. This path cannot reply to a message,
   cannot address an employer, and cannot be reached through `/send`.

@@ -127,8 +127,8 @@ for _txt, _want, _why in (
         ("Candidates must reside in the continental United States", True, "residency demand"),
         # 🚫 MUST NOT FIRE. Each appears in a genuinely remote posting.
         ("We have offices in Santa Clara, CA and Charlotte, NC for employees who prefer to "
-         "work regularly or occasionally from an office.", False, "LeanTaaS, offices offered"),
-        ("100% remote first culture (must be based in the US)", False, "Redox"),
+         "work regularly or occasionally from an office.", False, "offices offered"),
+        ("100% remote first culture (must be based in the US)", False, "US-only remote"),
         ("In-office perks: lunch, snacks, drinks, and more", False, "a benefits line"),
         ("Fully remote, US-based team.", False, "plainly remote"),
         ("", False, "empty description"),

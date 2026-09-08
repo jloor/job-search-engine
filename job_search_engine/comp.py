@@ -13,7 +13,7 @@ that a queue where four rows in five have no number cannot be ranked by pay at a
 evidence, and a scanner that silently drops cheap postings destroys the comp intelligence
 that tells him what the market actually pays for the title.
 
-⚠️ A BARE MONEY REGEX REPORTS THE WRONG NUMBER, CONFIDENTLY. A real GoFundMe posting says
+⚠️ A BARE MONEY REGEX REPORTS THE WRONG NUMBER, CONFIDENTLY. A real nonprofit posting says
 "raised more than $40 billion since 2010". Currency alone archives that as the salary. So a
 match must satisfy all three of: two amounts read as a range, pay vocabulary near them, and
 a magnitude that could actually be pay. The span it came from is stored beside the numbers,

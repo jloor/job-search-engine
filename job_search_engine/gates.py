@@ -344,7 +344,7 @@ def location_conflict(location: str | None, remote_verdict: str | None,
     ⚠️ THE FIELD AND THE BODY DISAGREE, AND THE FIELD IS OFTEN THE LIAR. One board tags a
     requisition "REMGA - Remote Georgia, REMMA - Remote Massachusetts" while its body reads
     "Work From Home (Remote in United States)". another employer's field is the literal string
-    "USA - Update Location". Veeva publishes one requisition under three cities. Measured
+    "USA - Update Location". One employer publishes a single requisition under three cities. Measured
     2026-09-01: of 316 live rows, 76 named a place outside his metro and 3 were placeholders.
 
     📌 It raises a hand so a human reads the posting. The verdict order is

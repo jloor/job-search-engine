@@ -444,7 +444,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # returns the wrong value is worse than one that returns nothing.
     print("\nthe otp code is extracted, and it is the code:")
     _OTP_BODY = ("![logo abc123def456](cid:6a8cac62cbb6f_c34ed0108243@prod-jben-web-x9f2a-4nt24.mail) "
-                 "Hi Jonathan, Copy and paste this code into the security code field on your "
+                 "Hi Alex, Copy and paste this code into the security code field on your "
                  "application: # Kp7Qm2Rt After you enter the code, resubmit your application.")
     # ⚠️ The noun form. "Application Submission Successful!" matched nothing and was filed
     # unknown; the list held "application submitted" but not "submission successful".
@@ -666,7 +666,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
             _c.execute("INSERT INTO application (id,posting_id,status,alias_used,company_raw,"
                        "role_raw) VALUES (1,1,?,'acme@jobs.example.com','Acme',"
                        "'Solutions Architect')", (status,))
-            body = ("Dear Jonathan, After careful consideration we have decided to not move "
+            body = ("Dear Alex, After careful consideration we have decided to not move "
                     "forward with your application at this time.")
             if name_role:
                 body += " Regarding the Solutions Architect role."
@@ -2727,7 +2727,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
           (95000, 120000, "year"))
 
     # 🚨 THE CASE THAT JUSTIFIES THE PAY-VOCABULARY RULE. This shape is from a real
-    # GoFundMe posting. A bare currency regex archives $40 billion as the salary.
+    # nonprofit posting. A bare currency regex archives $40 billion as the salary.
     check("'raised more than $40 billion' is NOT pay",
           CMP.from_body("We have helped people raise more than $40 billion to $50 billion "
                         "since 2010."), None)
@@ -2977,7 +2977,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
         # said "received your resume" against a pattern reading "received your
         # application". Greeting and object both vary by vendor.
         ("Thanks for applying to OpenRouter!",
-         "Hi Jonathan,\n\nWe have received your resume for Scaled Support Specialist role "
+         "Hi Alex,\n\nWe have received your resume for Scaled Support Specialist role "
          "at OpenRouter! We appreciate your interest in joining the team. We will review "
          "your application and get back to you if there are next steps.\n\nAll the best,\n\n"
          "OpenRouter Hiring Team", "confirmation"),
@@ -3184,7 +3184,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
             _c7.execute("INSERT INTO application VALUES (?,?,?,?,?)",
                         (_i, _co, "Engineer", _st, f"a{_i}@x"))
         _msg = {"subject": "Update from Employer G", "body_text": "regarding your application",
-                "body_reply": None, "from_addr": "noreply@labcorp.com"}
+                "body_reply": None, "from_addr": "noreply@acmecorp.com"}
         _got = [a["id"] for a in _appm._match_candidates(_c7, _msg)]
         check("shortlist finds the named employer", _got, [1])
         # A closed application is not a candidate: nothing inbound should reopen it.
@@ -3214,8 +3214,8 @@ On Wed, Aug 12, 2026 the candidate wrote:
     try:
         _r = _app7._board_reqs(
             "workday",
-            "https://motorolasolutions.wd5.myworkdayjobs.com/wday/cxs/"
-            "motorolasolutions/Careers/jobs")
+            "https://acmecorp.wd5.myworkdayjobs.com/wday/cxs/"
+            "acmecorp/Careers/jobs")
     finally:
         _app7._workday_list = _saved
 
@@ -3223,7 +3223,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # bulletFields varies by tenant, while externalPath is unique and builds the URL.
     check("workday req_id is externalPath", _r[0]["req_id"], "/job/Texas/TSS_R66354")
     check("workday rebuilds the public url", _r[0]["url"],
-          "https://motorolasolutions.wd5.myworkdayjobs.com/Careers/job/Texas/TSS_R66354")
+          "https://acmecorp.wd5.myworkdayjobs.com/Careers/job/Texas/TSS_R66354")
     check("workday reads remote from location", _r[0]["is_remote"], True)
     check("workday non-remote stays None", _r[1]["is_remote"], None)
     # The shared _add() dedupe must cover a new platform too; a repeated req_id on one
@@ -3725,8 +3725,8 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("...letters in the code too",
           _appw.split_ats_company("LE001 Contoso, Inc."), ("LE001", "Contoso, Inc."))
     check("...and a bare numeric one",
-          _appw.split_ats_company("5100 Kyndryl Solutions Private Limited"),
-          ("5100", "Kyndryl Solutions Private Limited"))
+          _appw.split_ats_company("5100 Globex Solutions Private Limited"),
+          ("5100", "Globex Solutions Private Limited"))
     check("a name with no code is returned whole, with no code",
           _appw.split_ats_company("Anthropic"), ("", "Anthropic"))
     # ⚠️ THE FALSE-POSITIVE GUARD IS THE HALF THAT MATTERS. A splitter that eats a real name
@@ -3985,10 +3985,10 @@ On Wed, Aug 12, 2026 the candidate wrote:
     print()
     print("posting liveness:")
     _appv = load_app()
-    _GH = "https://job-boards.greenhouse.io/singlestore/jobs/7793656"
-    _LV = "https://jobs.lever.co/redoxengine/d8ea5cec-9f2d-4218-ba4e-5fe734579973"
-    _AS = "https://jobs.ashbyhq.com/edia/afedb893-d5a8-4e9d-8327-babb9d36efed"
-    _WD = ("https://kyndryl.wd5.myworkdayjobs.com/KyndrylProfessionalCareers"
+    _GH = "https://job-boards.greenhouse.io/globex/jobs/7793656"
+    _LV = "https://jobs.lever.co/initech/d8ea5cec-9f2d-4218-ba4e-5fe734579973"
+    _AS = "https://jobs.ashbyhq.com/vandelay/afedb893-d5a8-4e9d-8327-babb9d36efed"
+    _WD = ("https://hooli.wd5.myworkdayjobs.com/HooliProfessionalCareers"
            "/job/Norwalk-CT-USA/Deskside_R-1")
     _rg, _rb = _appv._live_get, _appv._live_board_exists
     try:
@@ -4273,7 +4273,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # marketing copy is dropped. These pin both halves.
     print("\nWorkday prose gates:")
     check("url parses", bool(app._WD_URL.match(
-        "https://alkami.wd12.myworkdayjobs.com/Alkami/job/US-Remote/Engineer_JR-1")), True)
+        "https://acme.wd12.myworkdayjobs.com/Acme/job/US-Remote/Engineer_JR-1")), True)
     check("a non-Workday url does not", bool(app._WD_URL.match(
         "https://job-boards.greenhouse.io/x/jobs/1")), False)
     _keep = "Work Authorization : We cannot offer employment sponsorship at this time."
@@ -4293,7 +4293,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
     print("\ninbox_url:")
     check("unconfigured skips rather than crashing",
           app.job_inbox_url().startswith("inbox_url: SKIPPED"), True)
-    # 🚨 "jobs@jobs.jonathanloor.com" IS WHAT A PERSON TYPES. On the first real use the mail
+    # 🚨 "jobs@jobs.<MAIL_DOMAIN>" IS WHAT A PERSON TYPES. On the first real use the mail
     # arrived and the URL parsed, and the job ignored it because the filter wanted "job@".
     check("the plural alias is accepted", "jobs" in app.INBOX_ALIASES, True)
     check("the singular alias is accepted", "job" in app.INBOX_ALIASES, True)
@@ -4306,11 +4306,11 @@ On Wed, Aug 12, 2026 the candidate wrote:
                              "https://job-boards.greenhouse.io/vesta/jobs/2")), 2)
     check("one role at SEVERAL companies all survive",
           len(app.inbox_urls("https://job-boards.greenhouse.io/toast/jobs/1 "
-                             "https://jobs.ashbyhq.com/harvey/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee "
-                             "https://jobs.lever.co/redox/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")), 3)
+                             "https://jobs.ashbyhq.com/soylent/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee "
+                             "https://jobs.lever.co/umbrella/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")), 3)
     check("a mixed batch keeps the postings and drops the noise",
           len(app.inbox_urls("https://job-boards.greenhouse.io/vesta/jobs/1 "
-                             "https://jobs.ashbyhq.com/harvey/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee "
+                             "https://jobs.ashbyhq.com/soylent/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee "
                              "https://click.mailer.com/track/xyz "
                              "https://www.linkedin.com/company/vesta "
                              "https://unsubscribe.example.com/u?x=1")), 2)
@@ -4592,9 +4592,9 @@ On Wed, Aug 12, 2026 the candidate wrote:
           _verdict(dict(_cand, comp_min=60000, comp_max=82000),
                    {"tier": "B", "n_written": 0, "gates": "[]"}),
           ">>> DOES NOT CLEAR THE GATES")
-    # ⭐ The other half of Jonathan's rule, and the half that was broken. A band STRADDLING the
-    # floor is a live outcome: landing at the top of $80,000-$120,000 clears $100,000. Veeva
-    # and LeanTaaS are both this shape and he was interviewing at both while the gate called
+    # ⭐ The other half of that rule, and the half that was broken. A band STRADDLING the
+    # floor is a live outcome: landing at the top of $80,000-$120,000 clears $100,000. Two
+    # live requisitions were both this shape and he was interviewing at both while the gate called
     # them failures.
     check("a band straddling the floor PASSES",
           _verdict(dict(_cand, comp_min=80000, comp_max=120000),
@@ -4615,7 +4615,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # ── 📝 answers mailed back ────────────────────────────────────────────────────────
     print("\ninbox_answers:")
     _b = ("1. Integrations are where two companies' assumptions meet.\n\n"
-          "That is also where they break.\n\n2) A weekend go-live.\n\nThanks,\nJonathan\n"
+          "That is also where they break.\n\n2) A weekend go-live.\n\nThanks,\nAlex\n"
           "Sent from my iPhone")
     _a, _left = app.parse_numbered_answers(_b)
     check("a multi-paragraph answer stays whole",
@@ -4624,7 +4624,30 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # 🚨 Continuation across a blank line is deliberate for essays, and would otherwise glue a
     # sign-off onto the last answer and put it in a job application.
     check("a signature is NOT appended to the last answer",
-          "iPhone" not in " ".join(_a.values()) and "Jonathan" not in " ".join(_a.values()), True)
+          "iPhone" not in " ".join(_a.values()) and "Alex" not in " ".join(_a.values()), True)
+
+    # 🚨 THE NAME COMES FROM THE PROFILE, NOT FROM THE PACKAGE. Until 2026-09-08 the parser
+    # carried the operator's own name inline, in a public repository.
+    # The case above does not prove the name rule at all, because "Thanks," already stops it.
+    # A BARE name on its own line is the case that needs it.
+    _bare = "1. A real answer.\n\nAlex Rivera\nSent from my iPhone"
+    _pc2 = _oP.environ.get("CANDIDATE_CONFIG")
+    _oP.environ["CANDIDATE_CONFIG"] = str(HERE.parent / "seed" / "candidate.toml")
+    try:
+        import candidate as _Cs; _Cs._cache.clear()
+        check("signoff_alt carries the full name AND its parts",
+              sorted(_Cs.signoff_alt().split("|")), ["Alex", "Alex\\ Rivera", "Rivera"])
+        _ab, _ = app.parse_numbered_answers(_bare)
+        check("a BARE profile name is stripped", "Rivera" not in " ".join(_ab.values()), True)
+    finally:
+        if _pc2 is None: _oP.environ.pop("CANDIDATE_CONFIG", None)
+        else: _oP.environ["CANDIDATE_CONFIG"] = _pc2
+        import candidate as _Cs; _Cs._cache.clear()
+
+    # ⚠️ NO CONFIG MEANS NO NAME RULE, never a borrowed one. The answer survives intact
+    # rather than being truncated by somebody else's surname.
+    check("with no profile, a bare name is NOT treated as a signature",
+          "Rivera" in " ".join(app.parse_numbered_answers(_bare)[0].values()), True)
     check("quoted original text is ignored",
           app.parse_numbered_answers("> 1. their words\n1. mine")[0], {1: "mine"})
     # ⚠️ Nothing he wrote is discarded. Unnumbered text becomes a note.
@@ -4723,9 +4746,9 @@ On Wed, Aug 12, 2026 the candidate wrote:
         return 0
 
     # ------------------------------------------------------------ title exclusion
-    # 🚨 Jonathan's rule, 2026-09-03: no Director titles, because a Director job assumes
+    # 🚨 The operator's rule, 2026-09-03: no Director titles, because a Director job assumes
     # managing people with direct reports and he has never held that. ASSISTANT Director
-    # stays in scope: that is the shape he ran at Phreesia reporting to the Director of
+    # stays in scope: that is the shape he ran at a prior employer, reporting to the Director of
     # Deployments, without the title.
     # ⭐ This is why the entries are FULL REGEXES and are not wrapped like title_patterns.
     # A bare "director" word collapses the distinction and deletes the reachable half, and
@@ -4747,7 +4770,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
             ("Associate Director, Implementation", False),
             ("Deputy Director of Support", False),
             # 🚫 VP AND C-LEVEL ARE NOT EXCLUDED, and that is a decision, not an
-            # omission. Jonathan removed them 2026-09-03: he asked about Director only, and
+            # omission. The operator removed them 2026-09-03: he asked about Director only, and
             # at banks "Assistant Vice President" is a senior individual-contributor grade,
             # so a blanket VP rule deletes real IC roles. Asserted as KEPT so a future edit
             # cannot quietly re-add them.
@@ -4766,7 +4789,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
     check("no patterns means no filter", _cand.exclude_title_re({"targeting": {}}), None)
 
     # ------------------------------------------------------- comp gate: top of band
-    # 🚨 Jonathan's rule, 2026-09-03: "if the band does not include my floor of $100k, then it
+    # 🚨 The operator's rule, 2026-09-03: "if the band does not include my floor, then it
     # should be filtered out." A band INCLUDES the floor when its MAXIMUM reaches it. Both this
     # gate and tools/ease-rank.py's bucket() compared the MINIMUM, which made them silently
     # stricter than he is: $80,000-$120,000 and $90,000-$125,000 both failed while he was
@@ -4781,15 +4804,42 @@ On Wed, Aug 12, 2026 the candidate wrote:
     for _lo, _hi, _want, _why in (
             (120000, 200000, True,  "wholly above the floor"),
             (100000, 130000, True,  "starts exactly at the floor"),
-            ( 90000, 125000, True,  "STRADDLES the floor (LeanTaaS)"),
-            ( 80000, 120000, True,  "STRADDLES the floor (Veeva)"),
+            ( 90000, 125000, True,  "STRADDLES the floor, top clears it"),
+            ( 80000, 120000, True,  "STRADDLES the floor, wider band"),
             ( 89000, 205000, True,  "wide band, FDE shape"),
-            ( 85000, 100000, True,  "tops out exactly AT the floor (Redox)"),
-            ( 59500,  82000, False, "whole band under the floor (GoFundMe)"),
+            ( 85000, 100000, True,  "tops out exactly AT the floor"),
+            ( 59500,  82000, False, "whole band under the floor"),
             ( 55000,  65000, False, "whole band well under"),
             ( 80000,      0, False, "no max recorded, falls back to the min"),
             (100000,      0, True,  "no max recorded, min already clears")):
         check(f"clears ${_lo:,}-${_hi:,} ({_why})", _clears(_lo, _hi), _want)
+
+    # 🚨 A board token is CASE INSENSITIVE and the plain UNIQUE (platform, token) is not.
+    # Workday's /wday/cxs/ endpoint answers to any casing of the site path, so an aggregator
+    # that lowercases tokens re-added eight already-enabled boards and each one swept twice. schema.sql carries a unique index on (platform, lower(token)) to stop
+    # it for every writer, not just the loader. This proves the index is really in the schema
+    # and really bites, because an index nobody tested is a comment.
+    print("\nscan_board rejects a case-duplicate token:")
+    import sqlite3 as _sB
+    _cB = _sB.connect(":memory:")
+    _cB.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+    _insB = ("INSERT INTO scan_board (platform, token, api_url, added_at, enabled) "
+             "VALUES (?,?,'https://x.invalid','2026-09-07T00:00:00+00:00',1)")
+
+    def _acceptsB(platform, token):
+        try:
+            _cB.execute(_insB, (platform, token))
+            return True
+        except _sB.IntegrityError:
+            return False
+
+    check("real casing inserts", _acceptsB("workday", "acme:wd5:Acme_Careers"), True)
+    check("lowercase twin", _acceptsB("workday", "acme:wd5:acme_careers"), False)
+    check("uppercase twin", _acceptsB("workday", "ACME:WD5:ACME_CAREERS".lower()), False)
+    # ⚠️ The index must not over-reach. The same token under a DIFFERENT platform is a
+    # different board and stays legal, or adding a platform would collide with an old one.
+    check("same token, other platform", _acceptsB("greenhouse", "acme:wd5:acme_careers"), True)
+    check("board count after", _cB.execute("SELECT COUNT(*) FROM scan_board").fetchone()[0], 2)
 
     print("all passed")
     return 0
