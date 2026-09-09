@@ -1,30 +1,86 @@
-# relay
+# job-search-engine
 
-Mail ingress and egress for the job-search platform. Inbound arrives from ImprovMX as
-webhooks, gets archived and classified; outbound goes back out through SMTP, but only
-after a human signs the exact bytes.
+The engine behind one person's job search. It reads job boards every night, decides what is
+worth a human's attention, and handles the mail that comes back.
+
+It is one FastAPI service with a scheduler, deployed as a container, talking to libSQL.
+
+## What it actually does
+
+**The intake half.** A nightly sweep reads roughly three thousand employer job boards across
+Greenhouse, Ashby, Lever, Workday, Workable, SmartRecruiters, Breezy and Teamtailor, diffs each
+board against what it held the night before, and emits only what appeared or vanished. A board's
+first sweep seeds it rather than reporting every open requisition as a discovery. New postings
+are scored against a written profile, then gated on things that do not bend: remote or not, a
+pay floor, working hours and time zone, a real commute measurement, excluded employers, excluded
+titles.
+
+**The mail half.** Inbound arrives from ImprovMX as webhooks, is archived, and is classified
+twice: once by rules and once by a model, so a disagreement is visible rather than averaged
+away. Outbound exists but is deliberately hard to use.
 
 ```
-ImprovMX  ──webhook──▶  relay (Magic Container)  ──SQL over HTTPS──▶  Bunny Database
-*@jobs.example.com        │                                       (libSQL)
+ImprovMX  ──webhook──▶  engine (Magic Container)  ──SQL over HTTPS──▶  Bunny Database
+*@jobs.example.com        │                                        (libSQL)
                                └──SMTP 587──▶ smtp.improvmx.com ──▶ recruiter
                                               ▲
                                      approve.py signs first
 ```
 
+🚨 **The service cannot send mail on its own.** `/send` refuses anything without an Ed25519
+approval minted by `approve.py`, which runs on the operator's laptop and prints the exact bytes
+before signing them. A compromised container, or a stolen API token, still cannot send a message.
+That separation is the whole human gate; a boolean in a JSON body was never one.
+
 Security model, threat by threat: **[SECURITY.md](SECURITY.md)**. Read it before changing
 anything in the auth path.
+
+## What is NOT in this repository
+
+No applications, no employers, no compensation figures, no recruiter contacts, no résumé, and no
+personal profile. Those live in a separate private repository and reach the engine at runtime
+through `config/candidate.toml`. A missing profile yields **no rules rather than stale ones**:
+the scanner declines instead of guessing.
+
+`seed/candidate.toml` is a fictional profile so the engine can be run end to end without any of
+that. Everything in it is invented.
+
+## The scheduled jobs
+
+`scan` · `triage` · `comp` · `decide` · `place` · `remote_check` · `verify` · `interactions` ·
+`match_application` · `track` · `ai_read` · `inbox_url` · `inbox_answers` · `gate_audit` ·
+`harvest` · `workday_enrich` · `backup` · `sync_repo`
+
+`/diag/jobs` reports when each last ran and whether that is too long ago. ⚠️ A green `/health`
+is not a working deploy: the service once served health perfectly while every scheduled job
+failed on a missing import. Smoke-test a job, not a port.
 
 ## Files
 
 | File | What |
 |---|---|
-| `app.py` | The service. FastAPI, one file. |
-| `schema.sql` | Tables. Runs unchanged on local SQLite and Bunny Database. |
-| `approve.py` | Operator CLI. Signs one outgoing message. Runs on his laptop, never in the container. |
-| `bunny.py` | Provisions the database, mints its token, applies the schema. |
+| `job_search_engine/app.py` | The service and every scheduled job. FastAPI, one file. |
+| `job_search_engine/schema.sql` | Tables. Runs unchanged on local SQLite and Bunny Database. |
+| `job_search_engine/gates.py` | Remote, hours and location gating. The rules that reject. |
+| `job_search_engine/comp.py` | Reads a pay band off a board field or out of prose, with no model call. |
+| `job_search_engine/candidate.py` | Loads the operator profile. Returns `{}` rather than raising. |
+| `job_search_engine/approve.py` | Operator CLI. Signs one outgoing message. Never runs in the container. |
+| `job_search_engine/bunny.py` | Provisions the database, mints its token, applies the schema. |
+| `job_search_engine/backup.py` | Encrypted nightly snapshots. Age/X25519. |
+| `job_search_engine/gitsync.py` | Pulls the private working copy the profile is read from. |
 | `deploy.sh` | Builds `linux/amd64`, smoke-tests the image, pushes to GHCR. |
 | `Dockerfile` | Non-root (uid 10001), no `--proxy-headers` (see SECURITY.md). |
+| `tests/` | Plain scripts, not pytest. CI runs them on 3.11, 3.12 and 3.13. |
+
+⚠️ **Tests are run as scripts.** `python3 tests/test_parse.py`. Running `pytest` collects nothing
+and reports success, which is not the same thing.
+
+## Why the README reads like a logbook
+
+Most of what follows is operational history: what broke, what the symptom looked like, and why
+the fix has the shape it does. It is kept in the repository rather than in a wiki because the
+failure and the code that prevents it should be readable in the same place. Several entries
+exist because something reported success and had not done anything.
 
 ## 🚨 A rebuild must produce a database the operator's tools can write into (2026-08-22)
 
@@ -251,7 +307,7 @@ green, and the silence looks exactly like a quiet night.
   `uptime_s` is in the response.
 - ⚠️ **`stuck` is not `stale`, and it is the more urgent of the two.** `run_once` takes a
   non-blocking lock with no timeout, so a wedged job holds it forever and answers
-  `skipped: <name> is already running` to everything — which is also the correct answer while
+  `skipped: <name> is already running` to everything, which is also the correct answer while
   a long job is legitimately mid-run. `running_for_s` is what separates them.
 - ⚠️ **A job with `interval_s: 0` is MANUAL ONLY and can never be stale**, because nothing
   ever scheduled it. `workday_enrich` is the first one. Without that exemption its limit
@@ -285,7 +341,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" "https://<host>/diag/ai?live=tru
 
 🚨 **`triage`, `remote_check` and `comp` all return `nothing to …` when there is no work, and
 an expired key, a dead endpoint, a renamed model or an exhausted quota produce exactly those
-same strings** — the jobs return before they call anything. The paid path can therefore be
+same strings**. The jobs return before they call anything. The paid path can therefore be
 broken for weeks while every green light stays green.
 
 `?live=true` sends a few tokens through the real provider with the real key and the real
@@ -465,7 +521,7 @@ in the working copy. Without it every commit fails with `failed to write commit 
 copy pushing to the same repo. `rollout.py volume` refuses to attach while the app runs
 more than one, and that guard has already fired once for real.
 
-## Second reading: a model labels what the rules could not — 2026-08-13
+## Second reading: a model labels what the rules could not (2026-08-13)
 
 `classify()` matches wordings somebody thought to write down. It is right about most mail
 and wrong in exactly one direction: it answers `unknown` for a phrasing that is not in the
@@ -481,7 +537,7 @@ mail from an agency recruiter is about a job at a different company. From a prob
 
 | Field | From a recruiter's mail |
 |---|---|
-| `employer` | Northwind Health — **not** Halcyon Search, who sent it |
+| `employer` | Northwind Health, **not** Halcyon Search, who sent it |
 | `comp_mentioned` | `$135,000-$155,000 base`, verbatim |
 | `interview_at` | `Thursday at 11am ET`, as written, not resolved to a date |
 | `deadline` | `Friday` |
@@ -544,7 +600,7 @@ sqlite3 relay.db "SELECT date(created_at) d, count(*) n, sum(input_tokens) fresh
 ```
 
 Verdicts land in `ai_reading`, one row per message, keyed by `message_id`. The job reads
-`body_reply` — the same stripped text `classify()` reads — so when the two disagree they
+`body_reply`, the same stripped text `classify()` reads, so when the two disagree they
 disagree about the same words.
 
 🚨 **It writes to `ai_reading` and to nothing else.** It cannot change
@@ -627,14 +683,14 @@ AI_MODEL=gpt-5.6-luna
 ```
 
 **To revert:** `AI_PROVIDER=anthropic`, `AI_MODEL=claude-sonnet-5`. Nothing else changes,
-and no redeploy is needed — both paths ship in every image.
+and no redeploy is needed. Both paths ship in every image.
 
 📌 **Prompt caching does not engage on the OpenAI path, and it does not matter.** OpenAI
 caches automatically above ~1024 prompt tokens; ours measured **697**, and three identical
 requests returned `cached_tokens: 0` every time. At Luna's $0.10/M input the entire input
 cost is $0.00007 a message. Padding the prompt to reach the threshold would mean paying
 for padding to earn a discount on padding. The Anthropic breakpoint stays live on the
-revert path, where it is worth 30–46%.
+revert path, where it is worth 30 to 46%.
 
 ⚠️ **`openai_compat` via OpenRouter puts mail with two parties**, OpenRouter and the
 upstream provider, each with its own retention terms. Prefer OpenAI direct for anything
