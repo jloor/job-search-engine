@@ -4909,14 +4909,30 @@ def job_remote_check() -> str:
             for c in plain:
                 # 🚨 metro_match, not a regex search: this WRITES a verdict with no model and
                 # no measurement, so the token must sit beside a near state.
-                if not _C.metro_match(c["location"] or "", cfg):
+                loc = c["location"] or ""
+                if _C.metro_match(loc, cfg):
+                    after = _G.cascade_hybrid("onsite", loc, None, cfg)
+                    why = (f"onsite by rule: the posting says nothing about remote and its "
+                           f"location ({loc[:120]}) is in the metro. No model was asked.")
+                # ⭐ THE SYMMETRIC CASE, added 2026-09-12. Before this, only a NEAR office got
+                # a free verdict and a plainly unreachable one stayed NULL forever. NULL means
+                # "nobody looked", which is not what we know here: the posting names a real
+                # place, that place is not reachable, and the text never claims remote.
+                # ⚠️ Leaving it NULL was not neutral. Consumers that admit a null verdict let
+                # these into a shortlist, and on 2026-09-12 seven ordinary onsite jobs in
+                # Pune, Quebec, Mobile, Louisville, Boston and Ohio reached one that way.
+                # 📌 It can only ever move a row OUT of contention, never into it, which is
+                # why a rule may write it without a model. far_from_metro() refuses to answer
+                # unless it can actually place the location.
+                elif _C.far_from_metro(loc, cfg):
+                    after = "onsite"
+                    why = (f"onsite by rule: the posting says nothing about remote and its "
+                           f"location ({loc[:120]}) is not reachable from his metro. No model "
+                           f"was asked.")
+                else:
                     continue
-                after = _G.cascade_hybrid("onsite", c["location"], None, cfg)
                 con.execute("UPDATE scan_candidate SET remote_verdict=?, remote_evidence=? "
-                            "WHERE id=?",
-                            (after, f"onsite by rule: the posting says nothing about remote and "
-                                    f"its location ({(c['location'] or '')[:120]}) is in the "
-                                    f"metro. No model was asked.", c["id"]))
+                            "WHERE id=?", (after, why, c["id"]))
                 rule_done["n"] += 1
                 if after != "onsite":
                     rule_done["cascaded"] += 1

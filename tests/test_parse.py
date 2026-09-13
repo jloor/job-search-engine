@@ -1706,6 +1706,38 @@ On Wed, Aug 12, 2026 the candidate wrote:
                             "open to candidates residing in the US except Connecticut, "
                             "New Jersey, New York, Rhode Island", _cfg2),
           "remote_with_residency")
+    # 🚨 far_from_metro() WRITES AN ONSITE VERDICT WITH NO MODEL, so the bar for saying "far"
+    # has to be higher than the bar for saying nothing. Added 2026-09-12 after seven ordinary
+    # onsite jobs in Pune, Quebec, Mobile, Louisville, Boston and Ohio reached a shortlist,
+    # because only the NEAR half of this rule existed and a null verdict reads as "unjudged".
+    check("a state outside near_states is far",
+          _cand.far_from_metro("Louisville, KY", _cfg2), True)
+    check("a two-word far state is recognised too",
+          _cand.far_from_metro("Princeton, West Virginia", _cfg2), True)
+    check("a named foreign country is far",
+          _cand.far_from_metro("Quebec, Canada", _cfg2), True)
+    # ⭐ THE SAFETY CASES. Each of these must stay UNJUDGED rather than be called far, because
+    # this rule can only be trusted while it refuses to guess.
+    check("a country alone is NOT far: it places nothing",
+          _cand.far_from_metro("United States", _cfg2), False)
+    check("an empty location is NOT far", _cand.far_from_metro("", _cfg2), False)
+    check("a bare 'Remote' is NOT far", _cand.far_from_metro("Remote", _cfg2), False)
+    check("a near state is NOT far", _cand.far_from_metro("Piscataway, NJ", _cfg2), False)
+    # 🚨 A MULTI-OFFICE POSTING MUST NEVER BE CALLED FAR. One reachable office anywhere in the
+    # string settles it, and the reachable one is often not first.
+    check("one near office among far ones is NOT far",
+          _cand.far_from_metro("San Francisco, CA, New York, NY", _cfg2), False)
+    check("...and the near half still matches",
+          _cand.metro_match("San Francisco, CA, New York, NY", _cfg2), True)
+    # 📌 The same-name trap that metro_match already guards, from the other side.
+    check("the wrong Newark is far", _cand.far_from_metro("Newark, CA", _cfg2), True)
+    check("the right Newark is not", _cand.far_from_metro("Newark, NJ", _cfg2), False)
+    # ⚠️ near and far must never both be true for one location.
+    for _loc in ("Newark, NJ", "Newark, CA", "New York", "United States", "Quebec, Canada",
+                 "", "Remote", "San Francisco, CA, New York, NY", "Princeton, West Virginia"):
+        check(f"near and far are exclusive: {_loc!r}",
+              _cand.metro_match(_loc, _cfg2) and _cand.far_from_metro(_loc, _cfg2), False)
+
     _cfg_ro = dict(_cfg, remote=dict(_cfg["remote"], policy="remote_only"))
     check("remote_only does NOT cascade a hybrid",
           _g.cascade_hybrid("hybrid", "New York, NY", "", _cfg_ro), "hybrid")

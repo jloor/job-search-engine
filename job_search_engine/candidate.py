@@ -236,6 +236,50 @@ def metro_match(location: str | None, cfg: dict | None = None) -> bool:
     return False
 
 
+def far_from_metro(location: str | None, cfg: dict | None = None) -> bool:
+    """Does this location name a REAL place that is definitely not near him?
+
+    ⭐ THE SYMMETRIC HALF OF metro_match(). That one answers "is this office reachable" and
+    is used to write an onsite verdict for free. Nothing answered the opposite question, so a
+    posting naming a plainly unreachable office and never mentioning remote kept a NULL
+    verdict forever. NULL then reads as "nobody looked", which is indistinguishable from
+    "nobody could tell", and consumers that admit NULL let those rows into a shortlist.
+    Measured 2026-09-12 on the live queue: 7 of 8 unjudged leads were ordinary onsite jobs in
+    Pune, Quebec, Mexico, Mobile AL, Louisville KY, Boston and Ohio.
+
+    🚨 IT MUST BE HARDER TO SAY "FAR" THAN TO SAY NOTHING, because this writes a verdict with
+    no model and no measurement. Two independent conditions, both required:
+      1. metro_match() is False, so no reachable office is named anywhere in the string; and
+      2. the string carries a RECOGNISABLE far marker: a US state outside near_states, or a
+         foreign country.
+    ⚠️ Condition 2 is the whole safety. "United States" alone, "Remote", an empty string or
+    any location we cannot place returns False and stays unjudged. An unplaceable location is
+    not a far one, and guessing here would reject real roles silently.
+    📌 A multi-office posting is safe by construction: condition 1 fails the moment ONE named
+    office is near, so "San Francisco, CA, New York, NY" is never called far.
+    """
+    import gates as _G          # deferred and flat: gates imports THIS module at its
+                                # top level, and the package is imported flat (see gates.py).
+    cfg = load() if cfg is None else cfg
+    loc = (location or "").strip()
+    if not loc or metro_match(loc, cfg):
+        return False
+    if _G.eligibility(loc) == "ineligible":        # a named foreign country or region
+        return True
+    near = {s.upper() for s in ((cfg.get("commute") or {}).get("near_states") or [])}
+    ok = {s.lower() for s in near} | {_US_STATES[s].lower() for s in near if s in _US_STATES}
+    # A state token anywhere in the string that is not one of his near states. Full names are
+    # checked before abbreviations so "Washington" is not read as the two-letter "WA" of some
+    # other phrase, and the abbreviation needs word boundaries or "IN" matches every "in".
+    for full, ab in ((v, k) for k, v in _US_STATES.items()):
+        if full.lower() in ok or ab.upper() in near:
+            continue
+        if re.search(rf"\b{re.escape(full)}\b", loc, re.I) or \
+           re.search(rf"(?:,\s*|\s)\b{re.escape(ab)}\b(?![a-z])", loc):
+            return True
+    return False
+
+
 def excluded_company(name: str | None, cfg: dict | None = None) -> bool:
     """True when this employer is on the never-apply list.
 
