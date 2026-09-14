@@ -211,3 +211,41 @@ def extract(field, body):
     never overwrite the thing it was inferring.
     """
     return from_field(field) or from_body(body)
+
+
+# Hours in a working year. The conventional US full-time figure, 40 x 52.
+HOURS_PER_YEAR = 2080
+_PERIOD_MULTIPLIER = (("hour", HOURS_PER_YEAR), ("day", 260), ("week", 52), ("month", 12))
+
+
+def annual(value, basis) -> int | None:
+    """A pay figure as an ANNUAL number, whatever period it was quoted in.
+
+    🚨 WHY THIS EXISTS, MEASURED 2026-09-14. The salary floor was compared against the RAW
+    stored number, and hourly bands store as whole dollars: $70/hour is stored as 70. So
+    `70 < 100000` marked it under the floor, and EVERY HOURLY POSTING WAS EXCLUDED FROM THE
+    SHORTLIST REGARDLESS OF RATE. Measured on the live queue: 241 rows carry an hourly band,
+    220 are genuinely under the floor, and 21 were hidden wrongly. The best of them scored
+    91, near the top of the whole queue, at $40-$50/hour, and had never once been shown.
+
+    ⚠️ This is the SECOND defect of exactly this shape in the same comparison. On 2026-09-03
+    it compared comp_min instead of comp_max and hid 148 rows, including two employers with
+    live interviews. A filter is only ever tested by asking what it EXCLUDES.
+
+    📌 DETECT ON THE SUBSTRING, NOT THE SUFFIX. The basis vocabulary drifted: the queue holds
+    `hourly/hour`, `unverified_numbers/hour`, `base/hour` AND a bare `hourly`. A test for a
+    trailing "/hour" misses the last of those.
+    ⚠️ An unknown or absent basis is treated as already annual, which is what every non-hourly
+    row in the corpus is. Guessing a period would be worse than assuming the common case.
+    """
+    if value is None:
+        return None
+    try:
+        v = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    b = (basis or "").lower()
+    for token, mult in _PERIOD_MULTIPLIER:
+        if token in b:
+            return v * mult
+    return v

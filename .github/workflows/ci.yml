@@ -29,6 +29,8 @@ jobs:
       - run: python3 tests/test_gitsync_locks.py
       # Added 2026-09-14: a restart must not re-bill the same rolling hour.
       - run: python3 tests/test_fantastic_restart.py
+      # Added 2026-09-14: the floor hid every hourly posting for months.
+      - run: python3 tests/test_comp_annual.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #

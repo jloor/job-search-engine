@@ -6815,13 +6815,25 @@ def _inbox_render(cand: dict, harvest: dict | None, n_in_mail: int = 1) -> str:
         # him. A band that merely STRADDLES the floor is a live outcome and he decides.
         # 📌 tools/ease-rank.py carries the same rule in bucket(). They must agree, because one
         # is the shortlist he reads and the other is the mail he gets.
-        top = cand.get("comp_max") or cand["comp_min"]
+        # 🚨 ANNUALISE BEFORE COMPARING. Hourly bands store as whole dollars, so $70/hour is
+        # stored as 70, and comparing that raw against a $100,000 floor marked EVERY hourly
+        # posting under-floor regardless of rate. Measured 2026-09-14: 21 rows hidden that
+        # way, the best scoring 91 at $40-$50/hour. See comp.annual.
+        raw = cand.get("comp_max") or cand["comp_min"]
+        try:
+            import comp as _CMP
+            top = _CMP.annual(raw, cand.get("comp_basis"))
+        except Exception:                                     # noqa: BLE001
+            top = raw                                         # never let this kill a verdict
         if floor:
             gates_ok.append(top >= floor)
         # (an unknown floor is reported by the `unknown` block below, once)
         if floor and top < floor:
+            # ⚠️ Report the number that was COMPARED, and say so when it was converted, or a
+            # reader sees "$50 is below the $100,000 floor" and distrusts the whole line.
+            per = " per year, converted" if top != raw else ""
             why.append(f"the whole band is below the ${floor:,} floor "
-                       f"(tops out at ${top:,})")
+                       f"(tops out at ${top:,}{per})")
     else:
         band = "NONE STATED"
         why.append("no band published")
