@@ -6634,6 +6634,33 @@ def inbox_urls(text: str) -> list:
 
 
 
+def board_from_url(url: str) -> tuple | None:
+    """(platform, token, api_url) for a posting URL, or None. ONE implementation.
+
+    🚨 IT WAS ABOUT TO BE TWO. This parsing lived inside inbox_register_board, and the
+    Fantastic Jobs ingestion needs exactly the same answer. Two copies of an ATS URL rule is
+    how the Ashby /application suffix ended up fixed in one reader and not the other, which
+    returned a clean HTTP 200 with an empty form and looked like success.
+    """
+    m = re.search(r"(?:job-boards|boards)(?:\.eu)?\.greenhouse\.io/([^/?#]+)/", url or "")
+    if m:
+        tok = m.group(1)
+        return "greenhouse", tok, f"https://boards-api.greenhouse.io/v1/boards/{tok}/jobs?content=true"
+    m = re.search(r"jobs\.ashbyhq\.com/([^/?#]+)/", url or "")
+    if m:
+        tok = m.group(1)
+        return "ashby", tok, f"https://api.ashbyhq.com/posting-api/job-board/{tok}?includeCompensation=true"
+    m = re.search(r"jobs\.lever\.co/([^/?#]+)/", url or "")
+    if m:
+        tok = m.group(1)
+        return "lever", tok, f"https://api.lever.co/v0/postings/{tok}?mode=json"
+    m = _WD_URL.match(url or "")
+    if m:
+        tn, wd, site, _ = m.groups()
+        return "workday", tn, f"https://{tn}.{wd}.myworkdayjobs.com/wday/cxs/{tn}/{site}/jobs"
+    return None
+
+
 def inbox_register_board(url: str) -> str | None:
     """Add this posting's board to the nightly scan if it is not already there.
 
@@ -6647,29 +6674,10 @@ def inbox_register_board(url: str) -> str | None:
     📌 Returns the board key when it added one, None when it was already there or the platform
     has no per-board sweep.
     """
-    api = None
-    m = re.search(r"(?:job-boards|boards)(?:\.eu)?\.greenhouse\.io/([^/?#]+)/", url or "")
-    if m:
-        plat, tok = "greenhouse", m.group(1)
-        api = f"https://boards-api.greenhouse.io/v1/boards/{tok}/jobs?content=true"
-    if not api:
-        m = re.search(r"jobs\.ashbyhq\.com/([^/?#]+)/", url or "")
-        if m:
-            plat, tok = "ashby", m.group(1)
-            api = f"https://api.ashbyhq.com/posting-api/job-board/{tok}?includeCompensation=true"
-    if not api:
-        m = re.search(r"jobs\.lever\.co/([^/?#]+)/", url or "")
-        if m:
-            plat, tok = "lever", m.group(1)
-            api = f"https://api.lever.co/v0/postings/{tok}?mode=json"
-    if not api:
-        m = _WD_URL.match(url or "")
-        if m:
-            tn, wd, site, _ = m.groups()
-            plat, tok = "workday", tn
-            api = f"https://{tn}.{wd}.myworkdayjobs.com/wday/cxs/{tn}/{site}/jobs"
-    if not api:
+    got = board_from_url(url)
+    if not got:
         return None
+    plat, tok, api = got
     with db() as con:
         row = con.execute("SELECT id, enabled FROM scan_board WHERE platform=? AND token=?",
                           (plat, tok)).fetchone()
@@ -7747,6 +7755,58 @@ def _fantastic_known() -> tuple:
     return ids, urls, pairs
 
 
+def _fantastic_seed_board(row: dict, pst: dict) -> str | None:
+    """Record this employer's board, so the free sweep covers them from now on.
+
+    🚨 THIS IS WHY THE GATED ROWS ARE NO LONGER WASTE. Roughly 45% of what this feed returns
+    is filtered out here: wrong title, wrong level, wrong country. Every one of those rows was
+    already BILLED, and until now it was discarded whole. But a Director role at an employer
+    is still proof that the employer exists, posts, and uses a board we can read for nothing.
+    The requisition is useless and the BOARD is not, so seeding runs BEFORE the gates.
+
+    ⭐ source_slug IS A VERIFIED TOKEN, WHICH IS THE WHOLE POINT. Board discovery has been
+    guessing tokens from company names, and guessing is how `greenhouse|community` was derived
+    for The Community Preservation Corporation and landed on "Rome Community Partners". This
+    slug is the employer's real identifier on their real board. ⚠️ The vendor populates it for
+    greenhouse only right now, so everything else falls back to parsing the posting URL.
+
+    ⚠️ DISABLED, deliberately, and this is the opposite of inbox_register_board. A forward is
+    an intent signal: he found that posting and sent it in, so that board is enabled at once.
+    This is merely "an employer matched a query", which is far weaker, and enabling thousands
+    of boards unasked would change what the nightly sweep costs without anyone deciding to.
+    They are recorded and wait for the existing tranche process.
+    """
+    plat = tok = api = None
+    if (row.get("source") or "").lower() == "greenhouse" and (row.get("source_slug") or "").strip():
+        tok = row["source_slug"].strip()
+        plat = "greenhouse"
+        api = f"https://boards-api.greenhouse.io/v1/boards/{tok}/jobs?content=true"
+    else:
+        got = board_from_url(pst.get("url") or "")
+        if got:
+            plat, tok, api = got
+    if not api:
+        return None
+    try:
+        with db() as con:
+            if con.execute("SELECT 1 FROM scan_board WHERE platform=? AND token=?",
+                           (plat, tok)).fetchone():
+                return None
+            con.execute(
+                "INSERT INTO scan_board (platform,token,api_url,source,added_at,enabled,note) "
+                "VALUES (?,?,?,?,?,0,?)",
+                (plat, tok, api, "fantastic", now(),
+                 "seen on the Fantastic Jobs feed; token is "
+                 + ("VERIFIED from source_slug" if row.get("source_slug") else "parsed from the URL")
+                 + ". Disabled: an employer matching a query is weaker evidence than a forward."))
+    except Exception:                                         # noqa: BLE001
+        # 🚨 A BOARD WRITE MUST NOT BE ABLE TO KILL AN INGESTION RUN. Same rule the sweep
+        # already follows for a per-board write: counted, then skipped. Losing a board is
+        # cheap; losing the candidates this run already paid for is not.
+        return None
+    return f"{plat}|{tok}"
+
+
 def _fantastic_store(rows: list, known: tuple) -> dict:
     """Gate, dedupe and insert one page of API records. Returns a tally.
 
@@ -7757,12 +7817,16 @@ def _fantastic_store(rows: list, known: tuple) -> dict:
     """
     import fantastic as _F
     ids, urls, pairs = known
-    tally = {"inserted": 0, "duplicate": 0, "gated": 0, "priced": 0}
+    tally = {"inserted": 0, "duplicate": 0, "gated": 0, "priced": 0, "boards": 0}
     for row in rows:
         pst = _F.to_posting(row)
         if not pst["title"] or not pst["url"]:
             tally["gated"] += 1
             continue
+        # ⭐ BEFORE THE GATES, ON PURPOSE. See _fantastic_seed_board: the requisition may be
+        # useless to him and the employer's board never is, and the row is already paid for.
+        if _fantastic_seed_board(row, pst):
+            tally["boards"] += 1
         # 1. Their id. Stable, and the cheapest possible test.
         if pst["id"] in ids:
             tally["duplicate"] += 1
@@ -7842,7 +7906,7 @@ def job_fantastic() -> str:
         return f"fantastic: SKIPPED, {why}"
     cfg = _fantastic_cfg()
     shared = dict(cfg.get("shared") or {})
-    total = {"returned": 0, "inserted": 0, "duplicate": 0, "gated": 0, "spent": 0}
+    total = {"returned": 0, "inserted": 0, "duplicate": 0, "gated": 0, "spent": 0, "boards": 0}
     notes, remaining = [], None
     known = _fantastic_known()
 
@@ -7905,7 +7969,7 @@ def job_fantastic() -> str:
             continue
         total["returned"] += rows_seen
         total["spent"] += spent
-        for k in ("inserted", "duplicate", "gated"):
+        for k in ("inserted", "duplicate", "gated", "boards"):
             total[k] += tally.get(k, 0)
 
     with db() as con:
@@ -7915,6 +7979,9 @@ def job_fantastic() -> str:
             f"{total['spent']} job credit(s) spent")
     if remaining is not None:
         head += f", {remaining} left this period"
+    if total["boards"]:
+        head += (f"; 🌱 {total['boards']} NEW BOARD(S) recorded, disabled, "
+                 f"awaiting the enable tranche")
     return head + ("; " + "; ".join(notes) if notes else "")
 
 

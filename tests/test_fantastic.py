@@ -226,6 +226,32 @@ check("every named column has a placeholder",
       len(re.search(r"INSERT INTO scan_candidate \((.*?)\) VALUES",
                     re.sub(r'"\s*\n\s*"', "", _ins), re.S).group(1).split(",")))
 
+# 🚨 THE GATED ROWS ARE PAID FOR. Seeding must happen BEFORE the gates or ~75% of what the
+# feed returns is billed and then discarded whole.
+print("\nboard seeding, which is what makes a gated row worth something:")
+seed = APP_SRC[APP_SRC.index("def _fantastic_seed_board"):]
+seed = seed[:seed.index("def _fantastic_store")]
+store = APP_SRC[APP_SRC.index("def _fantastic_store"):]
+store = store[:store.index("def job_fantastic(")]
+check("a seeded board is DISABLED, unlike a board he mailed in",
+      "enabled,note) \"\n                \"VALUES (?,?,?,?,?,0,?)" in seed
+      or "VALUES (?,?,?,?,?,0,?)" in seed, True)
+check("🚨 seeding runs BEFORE the gates, so a gated row still yields its board",
+      store.index("_fantastic_seed_board") < store.index("gate_posting"), True)
+check("source_slug is preferred over parsing the URL",
+      seed.index("source_slug") < seed.index("board_from_url"), True)
+check("...and it is only trusted for greenhouse, the one platform it is populated for",
+      'row.get("source") or "").lower() == "greenhouse"' in seed, True)
+check("a board write cannot kill the run that paid for the rows",
+      "except Exception" in seed, True)
+check("the note records whether the token was verified or guessed",
+      "VERIFIED from source_slug" in seed, True)
+# ⚠️ ONE implementation of ATS URL parsing. Two copies is how the Ashby suffix fix reached
+# one reader and not the other.
+check("the URL parser is shared, not copied",
+      APP_SRC.count("def board_from_url") == 1
+      and "board_from_url(url)" in APP_SRC[APP_SRC.index("def inbox_register_board"):], True)
+
 print("\nthe expired feed never decides anything a human owns:")
 exp = APP_SRC[APP_SRC.index("def job_fantastic_expired"):]
 exp = exp[:exp.index("def job_fantastic_modified")]
