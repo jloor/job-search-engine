@@ -176,9 +176,26 @@ CREATE TABLE IF NOT EXISTS scan_candidate (
   input_tokens      INTEGER,
   output_tokens     INTEGER,
   cache_read_tokens INTEGER,
-  cache_write_tokens INTEGER
+  cache_write_tokens INTEGER,
+  -- ⭐ THE SENIORITY THE POSTING ITSELF STATES, which nothing here could answer before.
+  -- A discovery source that derives a years-of-experience band ('0-2', '2-5', '5-10',
+  -- '10+') hands over the one gate the title cannot carry: a "Technical Support Engineer"
+  -- asking for 0 to 3 years and one asking for 10 are the same string. Down-levelling is a
+  -- repeated, documented cost, and it was found on a real posting only by opening the
+  -- employer's page by hand after the title had already looked promising.
+  -- ⚠️ DERIVED, NOT PUBLISHED. It is a hint that makes a row worth a second look, never a
+  -- verdict. Nothing gates on it.
+  stated_level      TEXT,
+  -- 📌 Change tracking, written only by the modified feed. NULL everywhere else, including
+  -- on every row the board sweep writes, and that is correct: the sweep re-reads a board
+  -- and computes change locally, so it has no notion of a field-level edit.
+  date_modified     TEXT,
+  modified_fields   TEXT                       -- JSON array, verbatim from the feed
 );
 CREATE INDEX IF NOT EXISTS idx_scan_candidate_triage ON scan_candidate(triaged, at DESC);
+-- The expired feed returns IDs and nothing else, so the join back is on req_id. Without
+-- this index that match is a full scan of every candidate ever seen, once a day.
+CREATE INDEX IF NOT EXISTS idx_scan_candidate_req ON scan_candidate(req_id);
 
 -- One row per unmet requirement on a posting that scored inside the band.
 --
@@ -197,6 +214,40 @@ CREATE INDEX IF NOT EXISTS idx_scan_candidate_triage ON scan_candidate(triaged, 
 -- ⚠️ Band only. A role he matches at 40% produces gaps meaning "he is not that person",
 -- and counting those would swamp the signal. score is denormalised onto the row so a
 -- count can be re-cut by band without joining back.
+-- ─────────────────────────────────────────────────────────────────────────────────────
+-- One row per pull from the Fantastic Jobs API, shaped on scan_run and for the same
+-- reason: a run that began, wrote rows and died was otherwise indistinguishable from one
+-- that never ran at all. The row is opened at START and stamped at finish.
+--
+-- ⭐ IT IS ALSO A COST LEDGER, and that half is not decoration. Job records are the metered
+-- unit, one credit per row RETURNED, and the vendor's pricing page renders in JavaScript so
+-- nothing here can read it. The x-api-* response headers are the only machine-readable
+-- record of what a pull cost, so they are stored per run rather than logged and lost.
+--
+-- ⚠️ query_label IS PART OF THE KEY, not a comment. The watermark is per QUERY: six
+-- different searches have six different windows, and one shared watermark would silently
+-- skip everything the slowest query had not reached yet.
+CREATE TABLE IF NOT EXISTS fantastic_run (
+  id             INTEGER PRIMARY KEY,
+  at             TEXT NOT NULL,
+  endpoint       TEXT NOT NULL,        -- active-ats | expired-ats | modified-ats
+  query_label    TEXT,                 -- which profile query this run covered
+  window_from    TEXT,                 -- the date_created_gte sent, when replaying a gap
+  watermark_to   TEXT,                 -- max(date_created) seen; the next window_from
+  returned       INTEGER NOT NULL DEFAULT 0,
+  inserted       INTEGER NOT NULL DEFAULT 0,
+  duplicate      INTEGER NOT NULL DEFAULT 0,
+  gated          INTEGER NOT NULL DEFAULT 0,   -- returned, paid for, and filtered out here
+  jobs_spent     INTEGER,              -- x-api-jobs-this-request, summed over the pages
+  jobs_remaining INTEGER,              -- x-api-jobs-remaining, as of the last page
+  requests_remaining INTEGER,
+  status         TEXT NOT NULL DEFAULT 'running',   -- running | ok | interrupted | denied
+  finished_at    TEXT,
+  note           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_fantastic_run_wm
+  ON fantastic_run(endpoint, query_label, id DESC);
+
 CREATE TABLE IF NOT EXISTS scan_gap (
   id             INTEGER PRIMARY KEY,
   at             TEXT NOT NULL,
@@ -613,6 +664,19 @@ CREATE TABLE IF NOT EXISTS posting (
   status         TEXT NOT NULL DEFAULT 'unknown',  -- live|unlisted|pulled|filled|unknown
   status_evidence TEXT,
   last_verified  TEXT,
+  -- ⭐ WHERE THE LINK CAME FROM, KEPT APART FROM canonical_url.
+  -- 🚨 canonical_url IS NOT MIGRATED AND MUST NOT BE. It is the record of what was applied
+  -- to on the day it was applied to, and the ghosting rule and any later dispute about a
+  -- pay band both depend on it standing still. Measured 2026-09-14 over 392 applications:
+  -- 344 already point at an employer ATS, 38 at a company careers site, 10 have none and
+  -- ZERO are aggregators. There is nothing to fix.
+  -- 📌 What a second column buys is a DISAGREEMENT. When a discovery source reports a
+  -- different URL for the same requisition, that is information about a repost, and with
+  -- one column it would be a silent overwrite.
+  -- ⚠️ apply_url is TAKEN and means the form endpoint on the same posting. Do not overload
+  -- it: a caller falling back to apply_url would then submit to a discovery link.
+  discovery_url  TEXT,
+  discovery_source TEXT,                 -- 'fantastic' | 'sweep' | 'human'
   UNIQUE(company_id, req_id)
 );
 CREATE INDEX IF NOT EXISTS idx_posting_status ON posting(status, last_verified);

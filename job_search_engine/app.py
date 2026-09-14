@@ -665,6 +665,7 @@ MIGRATIONS = [
      "work_model TEXT, work_model_raw TEXT, hours_stated TEXT, gate_remote INTEGER, "
      "gate_hours INTEGER, gate_comp INTEGER, "
      "status TEXT NOT NULL DEFAULT 'unknown', status_evidence TEXT, last_verified TEXT, "
+     "discovery_url TEXT, discovery_source TEXT, "
      "UNIQUE(company_id, req_id))"),
     "CREATE INDEX IF NOT EXISTS idx_posting_status ON posting(status, last_verified)",
     ("CREATE TABLE IF NOT EXISTS application ("
@@ -744,6 +745,42 @@ MIGRATIONS = [
     ("CREATE TABLE IF NOT EXISTS content_item ("
      "id INTEGER PRIMARY KEY, pillar TEXT NOT NULL, draft_path TEXT, source_ref TEXT, "
      "status TEXT NOT NULL DEFAULT 'idea', scheduled_for TEXT, published_url TEXT)"),
+    # ═══════════════════════════════════════════════════════════════════════════════════
+    # 2026-09-14: THE FANTASTIC JOBS API AS A SECOND DISCOVERY SOURCE.
+    #
+    # 🚨 THREE EDITS PER COLUMN, NOT ONE. CREATE TABLE IF NOT EXISTS will NOT add a column
+    # to a table that already exists, so schema.sql alone is correct for a fresh database
+    # and silently does nothing in production. Every column below is declared in
+    # schema.sql, repeated in the inline CREATE TABLE where one exists, and altered here.
+    # Miss this third step and it works on a laptop and changes nothing where it matters.
+    #
+    # ⭐ WHY A SECOND SOURCE AT ALL. The board sweep reads six ATS platforms. One 55-row
+    # sample from this API came from fifteen, including oraclecloud, successfactors,
+    # phenompeople, eightfold, adp, comeet, dover, applicantpro, jazzhr, icims and taleo.
+    # scan_board supports none of those, so those employers were not merely unswept, they
+    # were unreachable.
+    #
+    # ⚠️ IT IS A DISCOVERY SOURCE AND NOT A SYSTEM OF RECORD. Nothing here rewrites a
+    # verdict, a canonical_url, or a comp figure that came from an employer.
+    "ALTER TABLE scan_candidate ADD COLUMN stated_level TEXT",
+    "ALTER TABLE scan_candidate ADD COLUMN date_modified TEXT",
+    "ALTER TABLE scan_candidate ADD COLUMN modified_fields TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_scan_candidate_req ON scan_candidate(req_id)",
+    "ALTER TABLE posting ADD COLUMN discovery_url TEXT",
+    "ALTER TABLE posting ADD COLUMN discovery_source TEXT",
+    # The run ledger. Opened at start, stamped at finish, and it carries the cost headers
+    # because the vendor's pricing page renders in JavaScript and no script can read it.
+    # ⚠️ The column list must stay identical to schema.sql. This is what an existing
+    # production database runs; the other is what a fresh build runs.
+    ("CREATE TABLE IF NOT EXISTS fantastic_run ("
+     "id INTEGER PRIMARY KEY, at TEXT NOT NULL, endpoint TEXT NOT NULL, query_label TEXT, "
+     "window_from TEXT, watermark_to TEXT, returned INTEGER NOT NULL DEFAULT 0, "
+     "inserted INTEGER NOT NULL DEFAULT 0, duplicate INTEGER NOT NULL DEFAULT 0, "
+     "gated INTEGER NOT NULL DEFAULT 0, jobs_spent INTEGER, jobs_remaining INTEGER, "
+     "requests_remaining INTEGER, status TEXT NOT NULL DEFAULT 'running', "
+     "finished_at TEXT, note TEXT)"),
+    ("CREATE INDEX IF NOT EXISTS idx_fantastic_run_wm "
+     "ON fantastic_run(endpoint, query_label, id DESC)"),
 ]
 
 
@@ -7565,6 +7602,480 @@ def job_inbox_answers() -> str:
     return f"inbox_answers: stored {stored} answer(s) and {notes} note(s)"
 
 
+# ═════════════════════════════════════════════════════════════════════════════════════
+# THE FANTASTIC JOBS API. A second discovery source, and nothing more than that.
+#
+# 🚨 WHY IT EXISTS. The board sweep reads six ATS platforms and it stopped producing: 117
+# new rows on 2026-09-11, then 0 and then 3, because board DISCOVERY ran out while the
+# sweep kept running perfectly. This API indexes 55 platforms and 200,000+ employers, and
+# in one 55-row sample fifteen sources appeared, eleven of which scan_board cannot read at
+# all. Those employers were not unswept, they were unreachable.
+#
+# 🚨 IT IS NOT A SYSTEM OF RECORD AND MUST NEVER BECOME ONE. The database plus the archived
+# job description is the record. Nothing here rewrites a canonical_url, a remote verdict, a
+# fit score, or a pay band that came from an employer's own field.
+#
+# ⚠️ KEEP THE BOARD SWEEP RUNNING. It is free, it covers employers this may miss, and
+# board_state is the only record proving a requisition once existed. Two sources that
+# disagree are information. One source is a dependency.
+#
+# 💵 THE METERED UNIT IS JOB RECORDS RETURNED, NOT REQUESTS. One credit per row in the
+# response, so a filter applied AFTER the response has already been paid for saves nothing.
+# Narrowing happens in the query. The gates below still run before the insert, but what
+# they save is TRIAGE (7,313 input and 742 output tokens per row), which is the second bill
+# and is not the small one.
+FANTASTIC_KEY = os.environ.get("FANTASTIC_API_KEY", "").strip()
+# ⚠️ 0 = MANUAL ONLY, and that is the default deliberately. A key reaching the environment
+# must not start spending on a schedule before anyone has sized a query against the plan.
+FANTASTIC_EVERY_MIN = int(os.environ.get("FANTASTIC_EVERY_MIN", "0"))
+FANTASTIC_EXPIRED_EVERY_MIN = int(os.environ.get("FANTASTIC_EXPIRED_EVERY_MIN", "0"))
+FANTASTIC_MODIFIED_EVERY_MIN = int(os.environ.get("FANTASTIC_MODIFIED_EVERY_MIN", "0"))
+# 🚨 A HARD STOP ON ONE RUN, IN ROWS. Not a page size and not a preference. A filter typo
+# widens the query rather than narrowing it, and the response is billed before anything
+# here can read it, so the only protection is refusing to ask for more pages.
+FANTASTIC_MAX_ROWS = int(os.environ.get("FANTASTIC_MAX_ROWS", "600"))
+# How far behind the watermark has to be before a run replays the gap through the 7-day
+# window instead of asking for the rolling hour. Their own outage-recovery pattern.
+FANTASTIC_GAP_HRS = int(os.environ.get("FANTASTIC_GAP_HRS", "3"))
+# The expired feed costs no job credits, so it may page much further than a paid feed.
+FANTASTIC_EXPIRED_PAGES = int(os.environ.get("FANTASTIC_EXPIRED_PAGES", "120"))
+
+
+def _fantastic_cfg() -> dict:
+    """The query set, which is PERSONAL and therefore lives in the candidate profile.
+
+    🚨 NOTHING ABOUT ONE PERSON MAY BE HARDCODED HERE. This repository is public. The
+    titles somebody searches for are a fact about them and they were chosen from evidence:
+    across 393 applications "support engineer" appears in 65 and has produced zero
+    interviews, while every role that reached an interview carried integration,
+    implementation, onboarding or deployment. That belongs in their config, not in ours.
+
+    ⚠️ No config means NO QUERIES rather than borrowed ones, the same rule the location
+    gate already follows. A scanner running somebody else's searches is worse than one that
+    declines to run.
+    """
+    try:
+        import candidate as _C
+        return (_C.load() or {}).get("fantastic") or {}
+    except Exception:                                         # noqa: BLE001
+        return {}
+
+
+def _fantastic_ready() -> str:
+    """'' when the job can run, or the reason it cannot."""
+    if not FANTASTIC_KEY:
+        return "FANTASTIC_API_KEY is unset"
+    if not _fantastic_cfg().get("queries"):
+        return "no [[fantastic.queries]] in the candidate profile"
+    return ""
+
+
+def _fantastic_open(endpoint: str, label: str, since: str) -> int:
+    """Open a run row BEFORE the first request. Returns its id.
+
+    ⚠️ Opened at the start for the same reason scan_run is: a run that began, spent credits
+    and died is otherwise indistinguishable from one that never ran, and the rows it wrote
+    would read as belonging to a completed pull.
+    """
+    with db() as con:
+        con.execute("INSERT INTO fantastic_run (at,endpoint,query_label,window_from,status) "
+                    "VALUES (?,?,?,?,'running')", (now(), endpoint, label, since or None))
+        return con.execute("SELECT max(id) i FROM fantastic_run").fetchone()["i"]
+
+
+def _fantastic_close(run_id: int, **cols) -> None:
+    sets = ", ".join(f"{k}=?" for k in cols)
+    with db() as con:
+        con.execute(f"UPDATE fantastic_run SET {sets}, finished_at=? WHERE id=?",
+                    (*cols.values(), now(), run_id))
+
+
+def _fantastic_watermark(endpoint: str, label: str) -> str:
+    """The newest date_created this query has already seen, or ''.
+
+    ⭐ PER QUERY, NEVER SHARED. Six searches have six different windows. One shared
+    watermark would silently skip everything the slowest query had not yet reached, and the
+    skip would be invisible: the feed would simply never mention those postings again.
+    """
+    with db() as con:
+        r = con.execute(
+            "SELECT watermark_to FROM fantastic_run "
+            " WHERE endpoint=? AND query_label=? AND status='ok' AND watermark_to IS NOT NULL"
+            " ORDER BY id DESC LIMIT 1", (endpoint, label)).fetchone()
+    return (dict(r)["watermark_to"] if r else "") or ""
+
+
+def _fantastic_gap(endpoint: str, label: str) -> str:
+    """The date_created_gte to replay, or '' to use the rolling hour.
+
+    📌 This is the vendor's documented outage-recovery mechanism and it is the reason the
+    watermark is worth storing at all. The board sweep has the opposite property: it
+    recomputes change locally from a full re-read, so a night it did not run is simply gone
+    with no way to recover it.
+    """
+    wm = _fantastic_watermark(endpoint, label)
+    if not wm:
+        return ""
+    try:
+        seen = datetime.fromisoformat(wm.replace("Z", "+00:00"))
+        if seen.tzinfo is None:
+            seen = seen.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return ""
+    behind = (datetime.now(timezone.utc) - seen).total_seconds() / 3600.0
+    return wm if behind > FANTASTIC_GAP_HRS else ""
+
+
+def _fantastic_known() -> tuple:
+    """(their ids, normalised urls, (company,title) pairs) already in the queue.
+
+    Three dedupe layers, cheapest first. The same requisition WILL arrive from the board
+    sweep and from this API under different keys, and writing it twice means triaging it
+    twice and showing it twice.
+    """
+    import fantastic as _F
+    ids, urls, pairs = set(), set(), set()
+    with db() as con:
+        for r in con.execute("SELECT req_id, url, company, title FROM scan_candidate"):
+            d = dict(r)
+            if (d["req_id"] or "").startswith("fantastic|"):
+                ids.add(_F.their_id(d["req_id"]))
+            if d["url"]:
+                urls.add(_F.norm_url(d["url"]))
+            if d["company"] and d["title"]:
+                pairs.add((d["company"].strip().lower(), (d["title"] or "").strip().lower()))
+    return ids, urls, pairs
+
+
+def _fantastic_store(rows: list, known: tuple) -> dict:
+    """Gate, dedupe and insert one page of API records. Returns a tally.
+
+    🚨 THE GATES RUN BEFORE THE INSERT. The row is already paid for by the time it arrives,
+    so this saves no API credits at all. What it saves is triage, which bills 7,313 input
+    and 742 output tokens for every row that lands in the queue. A wide query is paid for
+    twice, and only one of those two bills can still be avoided here.
+    """
+    import fantastic as _F
+    ids, urls, pairs = known
+    tally = {"inserted": 0, "duplicate": 0, "gated": 0, "priced": 0}
+    for row in rows:
+        pst = _F.to_posting(row)
+        if not pst["title"] or not pst["url"]:
+            tally["gated"] += 1
+            continue
+        # 1. Their id. Stable, and the cheapest possible test.
+        if pst["id"] in ids:
+            tally["duplicate"] += 1
+            continue
+        # 2. The URL, normalised. This is the layer that catches the board sweep having
+        #    already found the same requisition through a different route.
+        nu = _F.norm_url(pst["url"])
+        if nu in urls:
+            tally["duplicate"] += 1
+            ids.add(pst["id"])
+            continue
+        # 3. Company and title, by containment with a five-character floor. Equality misses
+        #    "Invisibletech" against "Invisible Technologies"; a bare substring once matched
+        #    a company named "H" inside five unrelated ones.
+        co, ti = (pst["company"] or "").strip().lower(), pst["title"].strip().lower()
+        if co and any(t == ti and _F.contains(co, c) for c, t in pairs):
+            tally["duplicate"] += 1
+            ids.add(pst["id"])
+            continue
+
+        ok, why = gate_posting(pst)
+        if ok and not TARGET_TITLE.search(pst["title"]):
+            ok, why = False, "off-target title"
+        if ok:
+            ok, why = _location_gate(pst)
+        if not ok:
+            tally["gated"] += 1
+            tally[why] = tally.get(why, 0) + 1
+            ids.add(pst["id"])
+            continue
+
+        # ⭐ THE FREE LOCAL READER FIRST, THEIR EXTRACTION SECOND. comp.extract reads the
+        # posting's own words and records the verbatim span it read them from. Their
+        # ai_salary fields arrive with no evidence at all, so they are the fallback and
+        # they are stored under a source of their own.
+        band = _comp_at_insert(pst) or _F.comp_band(row)
+        with db() as con:
+            con.execute(
+                "INSERT INTO scan_candidate (at,req_id,board,title,location,comp,is_remote,"
+                "url,description,triaged,comp_min,comp_max,comp_basis,comp_evidence,"
+                "comp_source,company,company_source,posted_at,updated_at,posted_source,"
+                "deadline,stated_level) VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (now(), pst["req_id"], pst["board"], pst["title"], pst.get("location"),
+                 pst.get("comp"),
+                 # 🚨 ALWAYS NULL. Their work-arrangement field called one posting On-site
+                 # while the employer's own SmartRecruiters record said remote: true. NULL
+                 # means the source did not say; 0 would read as confirmed not remote.
+                 None,
+                 pst["url"], (pst.get("description") or "")[:SCAN_MAX_DESCRIPTION_CHARS],
+                 *(band or (None, None, None, None, None)),
+                 pst.get("company"), pst.get("company_source"),
+                 pst.get("posted_at"), pst.get("updated_at"),
+                 pst.get("posted_source"), pst.get("deadline"), pst.get("stated_level")))
+            # ⭐ Fill the discovery link on a posting that already exists and lacks one.
+            # It never touches canonical_url: that is the record of what was applied to on
+            # the day it was applied to, and the ghosting rule depends on it standing still.
+            con.execute(
+                "UPDATE posting SET discovery_url=?, discovery_source='fantastic' "
+                " WHERE discovery_url IS NULL AND canonical_url IS NOT NULL "
+                "   AND lower(rtrim(canonical_url,'/')) = ?",
+                (pst["url"], nu))
+        ids.add(pst["id"])
+        urls.add(nu)
+        if co:
+            pairs.add((co, ti))
+        tally["inserted"] += 1
+        if band:
+            tally["priced"] += 1
+    return tally
+
+
+def job_fantastic() -> str:
+    """Poll the new-jobs feed once per configured query and land what clears the gates."""
+    import fantastic as _F
+    why = _fantastic_ready()
+    if why:
+        return f"fantastic: SKIPPED, {why}"
+    cfg = _fantastic_cfg()
+    shared = dict(cfg.get("shared") or {})
+    total = {"returned": 0, "inserted": 0, "duplicate": 0, "gated": 0, "spent": 0}
+    notes, remaining = [], None
+    known = _fantastic_known()
+
+    for q in cfg["queries"]:
+        q = dict(q)
+        label = str(q.pop("label", "") or "unlabelled")
+        since = _fantastic_gap("active-ats", label)
+        run_id = _fantastic_open("active-ats", label, since)
+        p = _F.params(q, shared, since)
+        rows_seen, spent, watermark, tally = 0, 0, "", {}
+        try:
+            # 🚨 THE BUDGET IS PASSED IN, so a page can never overshoot it. Testing the
+            # cap after a page has returned means the overshoot is already billed.
+            for page, quota in _F.pages("active-ats", p, FANTASTIC_KEY,
+                                        budget=FANTASTIC_MAX_ROWS):
+                rows_seen += len(page)
+                spent += quota.get("jobs_spent") or 0
+                remaining = quota.get("jobs_remaining", remaining)
+                for r in page:
+                    dc = str(r.get("date_created") or "")
+                    if dc > watermark:
+                        watermark = dc
+                got = _fantastic_store(page, known)
+                for k, v in got.items():
+                    tally[k] = tally.get(k, 0) + v
+                # 🚨 A BUDGET STOP, NOT A PAGE CAP. It ends the run mid-query on purpose and
+                # records `interrupted`, because a query that returns more than this was not
+                # the query anybody meant to write.
+                if rows_seen >= FANTASTIC_MAX_ROWS:
+                    _fantastic_close(run_id, status="interrupted", returned=rows_seen,
+                                     inserted=tally.get("inserted", 0),
+                                     duplicate=tally.get("duplicate", 0),
+                                     gated=tally.get("gated", 0), jobs_spent=spent,
+                                     jobs_remaining=remaining, watermark_to=watermark or None,
+                                     note=f"stopped at FANTASTIC_MAX_ROWS={FANTASTIC_MAX_ROWS}")
+                    notes.append(f"{label}: STOPPED at {rows_seen} rows, narrow the query")
+                    break
+            else:
+                _fantastic_close(run_id, status="ok", returned=rows_seen,
+                                 inserted=tally.get("inserted", 0),
+                                 duplicate=tally.get("duplicate", 0),
+                                 gated=tally.get("gated", 0), jobs_spent=spent,
+                                 jobs_remaining=remaining,
+                                 # ⚠️ The watermark only advances on a run that FINISHED. A
+                                 # partial run that moved it would leave the rows it never
+                                 # read permanently outside every future window.
+                                 watermark_to=watermark or None,
+                                 note=(f"replayed from {since}" if since else "rolling hour"))
+                notes.append(f"{label}: {rows_seen} returned, {tally.get('inserted',0)} new, "
+                             f"{tally.get('duplicate',0)} dup, {tally.get('gated',0)} gated")
+        except _F.Denied as e:
+            _fantastic_close(run_id, status="denied", note=str(e)[:300])
+            return f"fantastic: SKIPPED, {e}"
+        except Exception as e:                                # noqa: BLE001
+            # One query that fails must not cost the others. Same shape as a board that
+            # will not answer during a sweep: counted, then skipped.
+            _fantastic_close(run_id, status="interrupted", returned=rows_seen,
+                             jobs_spent=spent, note=f"{type(e).__name__}: {e}"[:300])
+            notes.append(f"{label}: FAILED {type(e).__name__}: {e}")
+            continue
+        total["returned"] += rows_seen
+        total["spent"] += spent
+        for k in ("inserted", "duplicate", "gated"):
+            total[k] += tally.get(k, 0)
+
+    with db() as con:
+        log_event(con, "fantastic", json.dumps({**total, "remaining": remaining})[:3500])
+    head = (f"fantastic: {total['returned']} returned, {total['inserted']} new candidate(s), "
+            f"{total['duplicate']} duplicate, {total['gated']} gated; "
+            f"{total['spent']} job credit(s) spent")
+    if remaining is not None:
+        head += f", {remaining} left this period"
+    return head + ("; " + "; ".join(notes) if notes else "")
+
+
+def job_fantastic_expired() -> str:
+    """Mark the requisitions this API says have gone. Complimentary: no job credits.
+
+    ⭐ WHY THIS IS THE CHEAPEST REAL WIN. The ghosting rule was corrected on 2026-09-03 to
+    require a CHECKABLE FACT rather than a stopwatch, because a stopwatch was wrong:
+    measured that day across 46 applications 10+ days silent, 7 requisitions were gone and
+    18 were still live, and the two facts barely correlated. One was 38 days silent on a
+    live req; another was 43 days on a dead one. The check today is a hand-rolled board
+    probe. This is that probe arriving as a feed, for nothing.
+
+    🚨 IT NEVER TOUCHES `application`. posting.status is a fact about a requisition. Whether
+    a dead req makes an application ghosted, and whether the company stays on watch, is a
+    decision with a rule of its own and a human attached to it. job_verify already holds
+    this line and this must not be the job that breaks it.
+
+    ⚠️ ITS COVERAGE IS EXACTLY WHAT THIS SYSTEM INGESTED FROM THIS API, AND IT STARTS AT
+    ZERO. The feed returns internal ids and nothing else, so a posting that arrived through
+    the board sweep, a recruiter mail or a hand-typed URL has no id to match and this job
+    can say nothing about it. That is a real limit, not a bug: it means ingestion has to run
+    before the expired feed can report on anything, and the honest note says how many rows
+    were even eligible.
+    """
+    import fantastic as _F
+    if not FANTASTIC_KEY:
+        return "fantastic_expired: SKIPPED, FANTASTIC_API_KEY is unset"
+    with db() as con:
+        mine = {_F.their_id(dict(r)["req_id"]): dict(r) for r in con.execute(
+            "SELECT id, req_id, url, title, company, board FROM scan_candidate "
+            " WHERE req_id LIKE 'fantastic|%'")}
+    if not mine:
+        return "fantastic_expired: nothing ingested from this source yet, so nothing to match"
+
+    run_id = _fantastic_open("expired-ats", "1d", "")
+    seen, hits = 0, []
+    try:
+        # `1d` is a STABLE SNAPSHOT of the previous UTC day, refreshed at 01:00 UTC, not a
+        # rolling 24-hour window. That is what makes a daily job idempotent.
+        for page, quota in _F.pages("expired-ats", {"time_frame": "1d", "limit": 1000},
+                                    FANTASTIC_KEY, max_pages=FANTASTIC_EXPIRED_PAGES):
+            seen += len(page)
+            for item in page:
+                tid = str(item.get("id") if isinstance(item, dict) else item).strip()
+                if tid in mine:
+                    hits.append(mine[tid])
+    except _F.Denied as e:
+        _fantastic_close(run_id, status="denied", note=str(e)[:300])
+        return f"fantastic_expired: SKIPPED, {e}"
+    except Exception as e:                                    # noqa: BLE001
+        _fantastic_close(run_id, status="interrupted", returned=seen,
+                         note=f"{type(e).__name__}: {e}"[:300])
+        return f"fantastic_expired: FAILED after {seen} id(s): {type(e).__name__}: {e}"
+
+    stamp, marked = now(), 0
+    for row in hits:
+        with db() as con:
+            # The change log, which is where a vanish already lives for the board sweep.
+            con.execute("INSERT INTO scan_change (at,board,req_id,change,title) "
+                        "VALUES (?,?,?,'vanished',?)",
+                        (stamp, row["board"], row["req_id"], row["title"]))
+            # ⚠️ Only a posting whose URL matches. A candidate is a lead; a posting is
+            # something somebody acted on, and only the second is worth a status.
+            cur = con.execute(
+                "UPDATE posting SET status='dead', status_evidence=?, last_verified=? "
+                " WHERE canonical_url IS NOT NULL "
+                "   AND lower(rtrim(canonical_url,'/')) = lower(rtrim(?,'/'))",
+                (f"fantastic expired-ats, {stamp[:10]}", stamp, row["url"] or ""))
+            marked += cur.rowcount or 0
+    with db() as con:
+        log_event(con, "fantastic_expired", json.dumps(
+            {"ids": seen, "eligible": len(mine), "matched": len(hits),
+             "postings_marked": marked})[:3500])
+    _fantastic_close(run_id, status="ok", returned=seen, inserted=marked,
+                     note=f"{len(hits)} of {len(mine)} ingested rows expired")
+    return (f"fantastic_expired: {seen} expired id(s) read, {len(hits)} matched "
+            f"{len(mine)} ingested row(s), {marked} posting(s) marked dead")
+
+
+def job_fantastic_modified() -> str:
+    """Field-level edits on the postings behind LIVE applications. Pro plan only.
+
+    ⭐ IT ANSWERS A PROBLEM ALREADY IN THE RECORD. register-package reads the band from the
+    ARCHIVED job description rather than the queue because on 2026-08-21 two of nineteen
+    queue bands disagreed with the live posting: one employer had cut its top by $45,000 in
+    six days. An employer editing a requisition underneath a package is invisible today
+    unless somebody re-fetches it by hand.
+
+    🚨 IT REQUIRES A PRO PLAN, WHICH STARTS AT $175/MONTH. The Starter tier at $95 does not
+    include it, so on that plan this job is registered, callable, and returns SKIPPED. That
+    is deliberate: a job absent from the table cannot be triggered by hand either, and then
+    the runbook documents a command that returns 404.
+
+    ⚠️ THE UNFILTERED FEED IS 100,000 TO 150,000 JOBS A DAY. It must never be pulled whole.
+    This asks for specific ids only, and if the response contains an id it did not ask for
+    then the filter was ignored and it stops rather than paging through the feed.
+    """
+    import fantastic as _F
+    if not FANTASTIC_KEY:
+        return "fantastic_modified: SKIPPED, FANTASTIC_API_KEY is unset"
+    with db() as con:
+        watch = {_F.their_id(dict(r)["req_id"]): dict(r) for r in con.execute(
+            "SELECT c.id, c.req_id, c.url, c.title FROM scan_candidate c "
+            "  JOIN posting p ON lower(rtrim(p.canonical_url,'/')) = lower(rtrim(c.url,'/')) "
+            "  JOIN application a ON a.posting_id = p.id "
+            " WHERE c.req_id LIKE 'fantastic|%' "
+            "   AND a.status IN ('draft','submitted','interview')")}
+    if not watch:
+        return "fantastic_modified: no live application sits on a posting from this source"
+
+    run_id = _fantastic_open("modified-ats", "watched", "")
+    ids = sorted(watch)
+    changed, seen, stray = [], 0, 0
+    try:
+        for n in range(0, len(ids), 100):
+            chunk = ids[n:n + 100]
+            got, quota = _F.call("modified-ats",
+                                 {"time_frame": "1d", "limit": 1000,
+                                  "id": ",".join(chunk)}, FANTASTIC_KEY)
+            page = got if isinstance(got, list) else []
+            seen += len(page)
+            for r in page:
+                tid = str(r.get("id") or "")
+                if tid not in watch:
+                    stray += 1
+                    continue
+                fields = r.get("modified_fields") or []
+                with db() as con:
+                    con.execute("UPDATE scan_candidate SET date_modified=?, modified_fields=? "
+                                " WHERE id=?",
+                                (r.get("date_modified"), json.dumps(fields), watch[tid]["id"]))
+                # ⚠️ ALERT ONLY ON THE THREE THAT CHANGE A DECISION. Their own 14-day
+                # cosmetic-bump suppression already removes freshness edits, and a changed
+                # description on a posting he has read is not news.
+                if any(f in ("salary", "location", "employment_type", "title")
+                       for f in fields):
+                    changed.append(f"{watch[tid]['title'][:40]}: {', '.join(fields)[:60]}")
+            if stray:
+                raise RuntimeError(
+                    f"modified-ats returned {stray} id(s) that were not requested: the id "
+                    f"filter was ignored, and the unfiltered feed is 100,000+ rows a day")
+    except _F.Denied as e:
+        _fantastic_close(run_id, status="denied", note=str(e)[:300])
+        return (f"fantastic_modified: SKIPPED, {e}. This endpoint needs a Pro plan "
+                f"(from $175/month); the Starter tier does not include it.")
+    except Exception as e:                                    # noqa: BLE001
+        _fantastic_close(run_id, status="interrupted", returned=seen,
+                         note=f"{type(e).__name__}: {e}"[:300])
+        return f"fantastic_modified: FAILED: {type(e).__name__}: {e}"
+
+    for line in changed:
+        with db() as con:
+            log_event(con, "fantastic_modified", line[:400])
+    _fantastic_close(run_id, status="ok", returned=seen, inserted=len(changed),
+                     note=f"{len(watch)} watched")
+    return (f"fantastic_modified: {len(watch)} watched, {seen} modified, "
+            f"{len(changed)} touching salary, location, type or title"
+            + ("; " + "; ".join(changed[:6]) if changed else ""))
+
+
 def job_table() -> list:
     """
     The one place a scheduled job is declared.
@@ -7616,7 +8127,22 @@ def job_table() -> list:
             ("inbox_url", INBOX_EVERY_MIN * 60, job_inbox_url),
             # 📝 Reads his REPLIES to those verdicts and stores the answers. Same cadence:
             # a reply is worth capturing while he is still thinking about the posting.
-            ("inbox_answers", INBOX_EVERY_MIN * 60, job_inbox_answers)]
+            ("inbox_answers", INBOX_EVERY_MIN * 60, job_inbox_answers),
+            # 💵 THE ONLY JOB IN THIS TABLE THAT SPENDS MONEY PER ROW. One job credit per
+            # record RETURNED, so its cadence has to match its time_frame or it pays twice
+            # for the same postings: 1h means poll hourly, 24h means poll in the same hour
+            # each day. Default 0 = manual only, until a query has been sized against the
+            # plan. See job_fantastic.
+            ("fantastic", FANTASTIC_EVERY_MIN * 60, job_fantastic),
+            # ⭐ Complimentary, and the cheapest real win here: it turns the ghosting rule's
+            # "is the requisition gone" from a hand-rolled probe into a feed. Daily, and
+            # AFTER 01:00 UTC, because the 1d window is a stable snapshot of the previous
+            # UTC day rather than a rolling 24 hours.
+            ("fantastic_expired", FANTASTIC_EXPIRED_EVERY_MIN * 60, job_fantastic_expired),
+            # ⚠️ PRO PLAN ONLY, from $175/month. Registered anyway, and it returns SKIPPED
+            # on a lower tier: a job absent from this table cannot be triggered by hand
+            # either, and the runbook then documents a command that returns 404.
+            ("fantastic_modified", FANTASTIC_MODIFIED_EVERY_MIN * 60, job_fantastic_modified)]
 
 
 async def _scheduler() -> None:

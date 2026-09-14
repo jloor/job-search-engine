@@ -289,6 +289,31 @@ time it was demonstrated, so: **a classification is a hint about mail, never an
 authorisation.** Nothing downstream may act on a label without a human reading the
 message.
 
+## 🔎 A discovery source sees the search itself, added 2026-09-14 with `job_fantastic`
+
+**What leaves the box: the QUERY, never the candidate.** Each request carries job titles, a
+location string, an experience band and a list of employers to exclude. Nothing else. No
+name, no address, no résumé, no application history, no mail. The response comes back and
+the judging happens here.
+
+⚠️ **The query is still a disclosure.** A third party that sees "integration OR
+implementation OR onboarding, New York, exclude these six employers, 2 to 10 years" can
+infer a person is looking, roughly what for, and roughly where. That is a real fact about
+somebody, it is sent on a schedule, and it is worth stating rather than discovering later.
+
+🚨 **The excluded-employer list is the most sensitive part of it**, and it is the part that
+looks harmless. It is a values decision about named companies. Pushing it into the request
+saves job credits; keeping it local costs credits and discloses nothing. **Both are
+defensible and the choice belongs to the operator**, so it is a config value: leave
+`exclude_organization` out of `[fantastic.shared]` and the filtering happens here instead.
+
+📌 **`FANTASTIC_API_KEY` is environment-only.** It is never in either repository, and the
+jobs report `SKIPPED` rather than failing when it is unset.
+
+⚠️ **Their descriptions are outsider-written text** and reach a model through `triage`, the
+same as every swept posting. The existing rule holds: a classification is a hint, never an
+authorisation.
+
 ## 📥 The inbox reply path (`job_inbox_url`), added 2026-08-29
 
 Mail a job link to `<INBOX_ALIAS>@jobs.<MAIL_DOMAIN>` and the service replies with a fit

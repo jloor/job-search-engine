@@ -21,6 +21,10 @@ jobs:
       # ⚠️ test_posting_age.py existed but was never listed here, so it had
       # never run in CI. Added 2026-09-03 with the storage-truncation guard.
       - run: python3 tests/test_posting_age.py
+      # Added 2026-09-14 with the Fantastic Jobs discovery source. It is the
+      # first source that bills per row, so its guards belong where they run
+      # on every push rather than where somebody remembers to invoke them.
+      - run: python3 tests/test_fantastic.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #

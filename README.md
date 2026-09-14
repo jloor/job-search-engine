@@ -49,11 +49,90 @@ that. Everything in it is invented.
 
 `scan` · `triage` · `comp` · `decide` · `place` · `remote_check` · `verify` · `interactions` ·
 `match_application` · `track` · `ai_read` · `inbox_url` · `inbox_answers` · `gate_audit` ·
-`harvest` · `workday_enrich` · `backup` · `sync_repo`
+`harvest` · `workday_enrich` · `fantastic` · `fantastic_expired` · `fantastic_modified` ·
+`backup` · `sync_repo`
 
 `/diag/jobs` reports when each last ran and whether that is too long ago. ⚠️ A green `/health`
 is not a working deploy: the service once served health perfectly while every scheduled job
 failed on a missing import. Smoke-test a job, not a port.
+
+## A second discovery source: the Fantastic Jobs API (2026-09-14)
+
+`scan` reads six ATS platforms from `scan_board`. This API indexes **55**, and that gap is
+the reason it is here rather than any judgement about quality. In one 55-row sample the
+sources included oraclecloud, successfactors, phenompeople, eightfold, adp, comeet, dover,
+applicantpro, jazzhr, icims and taleo. `scan_board` reads none of them, so those employers
+were not merely unswept, they were **unreachable**.
+
+🚨 **IT REPLACES THE DISCOVERY LAYER, NOT THE JUDGEMENT LAYER.** The gates read the
+candidate profile, `triage` scores fit, `remote_check` reaches the remote verdict, `place`
+measures the commute, and every one of them is unchanged. Rows land in `scan_candidate`
+with `triaged = 0` and walk the same path as a swept posting.
+
+⚠️ **KEEP `scan` RUNNING.** It is free, it covers employers this may miss, and `board_state`
+is the only record proving a requisition once existed. Two sources that disagree are
+information; one source is a dependency.
+
+### 💵 Job records are the metered unit, not requests
+
+**One credit per row RETURNED.** A filter applied after the response has already been paid
+for saves nothing, so narrowing happens in the query: `title`, `location`,
+`exclude_organization` and `ai_experience_level` all cost nothing to send. The gates still
+run before the insert, but what they save is **triage**, which bills about 7,300 input and
+740 output tokens for every row that lands. A wide query is paid for twice and only the
+second bill can still be avoided.
+
+📌 **The complimentary endpoints cost no job credits at all**: expired, modified and the
+organization feeds. They still cost one API request each.
+
+| Setting | Default | Does |
+|---|---|---|
+| `FANTASTIC_API_KEY` | unset | No key, no job. All three report `SKIPPED`. |
+| `FANTASTIC_EVERY_MIN` | `0` | **Manual only.** Match the cadence to the `time_frame` or it pays twice for the same rows: `1h` means hourly. |
+| `FANTASTIC_EXPIRED_EVERY_MIN` | `0` | Daily, and **after 01:00 UTC**: the `1d` window is a stable snapshot of the previous UTC day, not a rolling 24 hours. |
+| `FANTASTIC_MODIFIED_EVERY_MIN` | `0` | ⚠️ Needs a **Pro plan, from $175/month**. On a lower tier it returns `SKIPPED`. |
+| `FANTASTIC_MAX_ROWS` | `600` | 🚨 A hard stop per query, in rows. A filter typo widens a query rather than narrowing it, and the response is billed before anything here can read it. |
+| `FANTASTIC_GAP_HRS` | `3` | How far behind the watermark must be before a run replays the gap through the 7-day window. |
+
+The query set is **not** in this repository. It is personal, it lives in the operator's
+`[[fantastic.queries]]`, and a service with no profile runs **no queries** rather than
+borrowed ones. Same rule as the location gate.
+
+### What is deliberately not taken
+
+| Field | Why not |
+|---|---|
+| `ai_work_arrangement` → a remote verdict | **Never.** Measured 2026-09-14: it reported On-site while the employer's own SmartRecruiters record said `remote: true, hybrid: false`. Remote is a hard filter, so a wrong value there deletes a viable role in silence. |
+| `is_remote` | Left NULL. NULL means "the source did not say"; `0` reads as "confirmed not remote", which is the exact mistake the gate exists to avoid. |
+| `ai_salary_*` as `comp_source='board'` | It is stored as **`fantastic_ai`**, a value of its own. `board` means the employer published it. A derived figure presented as a published one is worse than a missing one, because a band is what a negotiation later stands on. |
+
+### `fantastic_run` is a ledger, not a log
+
+The vendor's pricing page renders in JavaScript, so nothing here can read it. The
+`x-api-*` response headers are the only machine-readable record of what a pull cost, and
+they are stored per run rather than printed and lost. The row is opened at **start** and
+stamped at finish, the same as `scan_run` and for the same reason: a run that began, spent
+credits and died is otherwise indistinguishable from one that never ran.
+
+⚠️ **The watermark is per query and only advances on a run that FINISHED.** Six searches
+have six windows; one shared watermark would silently skip everything the slowest query had
+not reached, and a partial run that moved it would leave the rows it never read permanently
+outside every future window.
+
+### The expired feed, and the limit worth stating plainly
+
+⭐ It turns the ghosting question from a stopwatch into a fact. Measured 2026-09-03 across
+46 applications 10+ days silent: **7 requisitions were gone and 18 were still live**, and
+the two barely correlated.
+
+🚨 **It never touches `application`.** `posting.status` is a fact about a requisition.
+Whether a dead req makes an application ghosted is a decision with a human attached to it.
+
+⚠️ **Its coverage is exactly what this system ingested from this API, and it starts at
+zero.** The feed returns internal ids and nothing else, so a posting found by the board
+sweep, a recruiter mail or a typed URL has no id to match. Ingestion has to run before the
+expired feed can report anything, and the note it returns says how many rows were even
+eligible.
 
 ## Files
 

@@ -43,8 +43,10 @@ def insert_blocks():
 
 blocks = insert_blocks()
 
-# A third insert site would need the same rule. Failing here is the prompt to read it.
-check("two scan_candidate insert sites", len(blocks), 2)
+# A NEW insert site would need the same rule. Failing here is the prompt to read it, and
+# on 2026-09-14 it worked: the Fantastic Jobs ingestion added the third site and this line
+# is what made somebody open this file before writing its slice expression.
+check("three scan_candidate insert sites", len(blocks), 3)
 
 for _i, _b in enumerate(blocks, 1):
     check(f"insert {_i} does not store at the model-input budget",
