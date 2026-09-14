@@ -58,6 +58,48 @@ def install_key() -> None:
     KEY_PATH.chmod(0o600)
 
 
+def clear_stale_locks() -> list:
+    """Remove git lock files left by a process that died. Returns what was cleared.
+
+    🚨 WHY THIS IS SAFE HERE AND WOULD NOT BE ON A LAPTOP. git refuses to touch a repository
+    holding index.lock, because on a normal machine that lock usually means another git is
+    genuinely running. In THIS container nothing else runs git, and the process is killed and
+    restarted routinely: every environment change ends in a pod restart. So a lock still
+    present when this function runs cannot have a live owner. It is debris, by definition.
+
+    ⚠️ MEASURED 2026-09-14. Two concurrent set-prod-env runs restarted the pod repeatedly,
+    one restart landed mid-git-operation, and /data/repo/.git/index.lock survived on the
+    volume. sync_repo then failed on EVERY attempt thereafter with "Another git process seems
+    to be running", and it would have kept failing forever: ensure_repo had no recovery and
+    the volume outlives the pod. The engine reads the operator's profile from that working
+    copy, so a permanently wedged sync means production silently runs a stale config.
+
+    📌 Narrow on purpose. Only the lock files, never a reset or a re-clone, so a wedged sync
+    is repaired without discarding anything a human might still want to look at.
+    """
+    cleared = []
+    for name in ("index.lock", "HEAD.lock", "config.lock", "shallow.lock"):
+        f = REPO_DIR / ".git" / name
+        try:
+            if f.exists():
+                f.unlink()
+                cleared.append(name)
+        except OSError as e:                                  # noqa: PERF203
+            print(f"gitsync: could not clear {name}: {e}", flush=True)
+    for d in ("refs/heads", "refs/remotes/origin"):
+        base = REPO_DIR / ".git" / d
+        if base.is_dir():
+            for f in base.glob("*.lock"):
+                try:
+                    f.unlink()
+                    cleared.append(f"{d}/{f.name}")
+                except OSError:
+                    pass
+    if cleared:
+        print(f"gitsync: cleared stale lock(s): {', '.join(cleared)}", flush=True)
+    return cleared
+
+
 def ensure_repo() -> pathlib.Path:
     """Clone if the volume is blank, otherwise fetch and hard-reset onto origin/main.
 
@@ -67,6 +109,10 @@ def ensure_repo() -> pathlib.Path:
     """
     install_key()
     DATA.mkdir(parents=True, exist_ok=True)
+    # ⚠️ BEFORE anything touches git. A lock from a killed process wedges fetch AND reset,
+    # and the volume outlives the pod, so nothing self-heals without this.
+    if (REPO_DIR / ".git").is_dir():
+        clear_stale_locks()
     if not (REPO_DIR / ".git").is_dir():
         print(f"gitsync: {REPO_DIR} is blank, cloning", flush=True)
         _run(["git", "clone", "--quiet", REPO_SSH, str(REPO_DIR)])
