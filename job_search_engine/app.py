@@ -7898,6 +7898,48 @@ def _fantastic_store(rows: list, known: tuple) -> dict:
     return tally
 
 
+def _fantastic_too_soon(label: str, interval_min: int) -> int:
+    """Seconds since this query last finished successfully, when that is TOO RECENT.
+
+    🚨 EVERY POD RESTART MAKES EVERY JOB IMMEDIATELY DUE. The scheduler keeps `last` in
+    memory and seeds it to 0.0 on boot, so a restart runs everything at once. That is right
+    for jobs which are cheap or idempotent, and wrong for this one: `time_frame=1h` is a
+    ROLLING window, so a run triggered ten minutes after the last one re-reads the SAME hour
+    and every row in it is BILLED AGAIN. The dedupe below catches the duplicates, but only
+    after they have been paid for. Measured 2026-09-14: three runs inside 25 minutes, at
+    14:28, 14:44 and 14:53, two of them from restarts.
+
+    ⭐ JOB-LOCAL ON PURPOSE. Persisting `last` in the shared scheduler would change the
+    behaviour of all twenty other jobs, several of which SHOULD run on boot. This declines
+    only the job that spends money per row.
+
+    ⚠️ It reads `fantastic_run`, not the clock, so it survives a restart the way an
+    in-memory timer cannot. That table is the record of what was actually spent.
+
+    📌 Returns 0 when the job may run. A non-zero value is the age in seconds of the last
+    successful run, for the caller to report.
+    """
+    if interval_min <= 0:
+        return 0                                  # manual only: a human asked, so run it
+    with db() as con:
+        r = con.execute(
+            "SELECT at FROM fantastic_run "
+            " WHERE endpoint='active-ats' AND query_label=? AND status='ok' "
+            " ORDER BY id DESC LIMIT 1", (label,)).fetchone()
+    if not r:
+        return 0
+    try:
+        was = datetime.fromisoformat(dict(r)["at"].replace("Z", "+00:00"))
+        if was.tzinfo is None:
+            was = was.replace(tzinfo=timezone.utc)
+    except (ValueError, AttributeError):
+        return 0
+    age = int((datetime.now(timezone.utc) - was).total_seconds())
+    # A small tolerance, because the scheduler's own loop drifts by seconds and refusing a
+    # legitimate hourly run would be worse than allowing an occasional early one.
+    return age if age < (interval_min * 60) - 120 else 0
+
+
 def job_fantastic() -> str:
     """Poll the new-jobs feed once per configured query and land what clears the gates."""
     import fantastic as _F
@@ -7910,9 +7952,17 @@ def job_fantastic() -> str:
     notes, remaining = [], None
     known = _fantastic_known()
 
+    skipped = []
     for q in cfg["queries"]:
         q = dict(q)
         label = str(q.pop("label", "") or "unlabelled")
+        # 🚨 BEFORE THE REQUEST, because the request is what costs money. See
+        # _fantastic_too_soon: a restart makes this job due again within minutes and the
+        # rolling window has not moved, so the same rows would be returned and re-billed.
+        recent = _fantastic_too_soon(label, FANTASTIC_EVERY_MIN)
+        if recent:
+            skipped.append(f"{label} ran {recent // 60}m ago")
+            continue
         since = _fantastic_gap("active-ats", label)
         run_id = _fantastic_open("active-ats", label, since)
         p = _F.params(q, shared, since)
@@ -7982,6 +8032,11 @@ def job_fantastic() -> str:
     if total["boards"]:
         head += (f"; 🌱 {total['boards']} NEW BOARD(S) recorded, disabled, "
                  f"awaiting the enable tranche")
+    if skipped:
+        # ⚠️ Reported, never silent. A job that declined and a job that found nothing look
+        # identical in a log that says neither, and they are entirely different facts.
+        head += (f"; ⏭️ {len(skipped)} quer(ies) SKIPPED as too soon after the last run "
+                 f"(a restart makes every job due again): " + ", ".join(skipped[:4]))
     return head + ("; " + "; ".join(notes) if notes else "")
 
 
