@@ -85,14 +85,39 @@ second bill can still be avoided.
 📌 **The complimentary endpoints cost no job credits at all**: expired, modified and the
 organization feeds. They still cost one API request each.
 
-| Setting | Default | Does |
-|---|---|---|
-| `FANTASTIC_API_KEY` | unset | No key, no job. All three report `SKIPPED`. |
-| `FANTASTIC_EVERY_MIN` | `0` | **Manual only.** Match the cadence to the `time_frame` or it pays twice for the same rows: `1h` means hourly. |
-| `FANTASTIC_EXPIRED_EVERY_MIN` | `0` | Daily, and **after 01:00 UTC**: the `1d` window is a stable snapshot of the previous UTC day, not a rolling 24 hours. |
-| `FANTASTIC_MODIFIED_EVERY_MIN` | `0` | ⚠️ Needs a **Pro plan, from $175/month**. On a lower tier it returns `SKIPPED`. |
-| `FANTASTIC_MAX_ROWS` | `600` | 🚨 A hard stop per query, in rows. A filter typo widens a query rather than narrowing it, and the response is billed before anything here can read it. |
-| `FANTASTIC_GAP_HRS` | `3` | How far behind the watermark must be before a run replays the gap through the 7-day window. |
+| Setting | Default | In use | Does |
+|---|---|---|---|
+| `FANTASTIC_API_KEY` | unset | set | No key, no job. All three report `SKIPPED`. |
+| `FANTASTIC_EVERY_MIN` | `0` | **`60`** | **0 = manual only.** Match the cadence to the `time_frame` or it pays twice for the same rows: `1h` means hourly. |
+| `FANTASTIC_EXPIRED_EVERY_MIN` | `0` | **`1440`** | Daily, and **after 01:00 UTC**: the `1d` window is a stable snapshot of the previous UTC day, not a rolling 24 hours. |
+| `FANTASTIC_MODIFIED_EVERY_MIN` | `0` | `0` | ⚠️ Needs a **Pro plan, from $175/month**. On a lower tier it returns `SKIPPED`. |
+| `FANTASTIC_MAX_ROWS` | `600` | default | 🚨 A hard stop per query, in rows. A filter typo widens a query rather than narrowing it, and the response is billed before anything here can read it. |
+| `FANTASTIC_GAP_HRS` | `3` | default | How far behind the watermark must be before a run replays the gap through the 7-day window. |
+
+📌 **The "In use" column is here because the deployment configuration lives in ONE FILE ON
+ONE MACHINE.** The operator's `relay.env` is not in version control, deliberately, since it
+holds credentials. That is right for the key and leaves the non-secret values written down
+nowhere durable: reconstructing them after a lost laptop would mean guessing. Defaults
+document what the code does; this column documents what is actually running, and the two
+are different facts. Update it when a value changes.
+
+### 🚨 A restart makes every job due again, and this one bills per row
+
+The scheduler keeps `last` in memory and seeds it to `0.0` on boot, so **every pod restart
+runs every due job at once**. For twenty of the twenty-one jobs that is right or harmless.
+For this one it is neither: `time_frame=1h` is a ROLLING window, so a run ten minutes after
+the last re-reads the SAME hour and every row is charged again. The dedupe catches the
+duplicates only after they are paid for.
+
+Measured 2026-09-14: three runs inside 25 minutes (14:28, 14:44, 14:53), two of them from
+restarts during a deploy. So `job_fantastic` declines a query whose last SUCCESSFUL run
+finished less than its interval ago, reading `fantastic_run` rather than a clock, because
+the clock is what the restart destroyed.
+
+⚠️ **A skipped run still costs a scheduler slot.** It writes no `fantastic_run` row, but the
+scheduler records the attempt, so a restart shortly after a successful run can push the next
+real poll out by up to a full interval. That is the intended trade, an hour of delay against
+paying twice, and it is a real consequence rather than a free win.
 
 The query set is **not** in this repository. It is personal, it lives in the operator's
 `[[fantastic.queries]]`, and a service with no profile runs **no queries** rather than
