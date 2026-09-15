@@ -107,6 +107,49 @@ try:
 finally:
     urllib.request.urlopen = real
 
+# 🚨 A dead requisition and a wrong URL are different facts with different remedies.
+print("\nan empty read is diagnosed from the EVIDENCE, not guessed:")
+import sqlite3 as _s, tempfile as _t, os as _o
+_db = _t.mkdtemp() + "/h.db"
+# ⚠️ DB_PATH is bound at import, so setting the environment variable after load_app() is
+# too late. The module attribute is what db() reads.
+_prev = getattr(app, "DB_PATH", None); app.DB_PATH = _db
+_c = _s.connect(_db)
+_c.executescript((HERE.parent / "job_search_engine" / "schema.sql").read_text())
+for _m in app.MIGRATIONS:
+    try: _c.execute(_m)
+    except Exception: pass
+_c.commit(); _c.close()
+
+
+def stored(res):
+    with app.db() as con:
+        app._harvest_store(con, None, res)
+        r = con.execute("SELECT suspect, n_fields FROM harvest WHERE url=?",
+                        (res["url"],)).fetchone()
+    return dict(r)
+
+
+r1 = stored({"url": "https://jobs.ashbyhq.com/x/1", "title": "Jobs",
+             "suspect": "TOO FEW FIELDS: this is probably a careers-page wrap"})
+check("🚨 title 'Jobs' + no form is reported as a BOARD INDEX",
+      "BOARD INDEX RETURNED" in (r1["suspect"] or ""), True)
+check("...and the wrong 'careers-page wrap' claim is gone",
+      "probably a careers-page wrap" in (r1["suspect"] or ""), False)
+check("⚠️ ...but it still refuses to call it dead, which `verify` owns",
+      "NOT a liveness verdict" in (r1["suspect"] or ""), True)
+
+r2 = stored({"url": "https://jobs.ashbyhq.com/x/2", "title": "Staff Integration Engineer",
+             "suspect": "TOO FEW FIELDS: this is probably a careers-page wrap"})
+check("a REAL title with no form keeps the original suspect text",
+      "careers-page wrap" in (r2["suspect"] or ""), True)
+
+r3 = stored({"url": "https://jobs.ashbyhq.com/x/3", "title": "Jobs",
+             "text": [{"label": "Name"}]})
+check("a page that DID return fields is never called a board index",
+      "BOARD INDEX" in (r3["suspect"] or ""), False)
+if _prev: app.DB_PATH = _prev
+
 print("\nthe default is the only size measured safe:")
 SRC = (HERE.parent / "job_search_engine" / "app.py").read_text()
 check('HARVEST_CHUNK defaults to 1', 'os.environ.get("HARVEST_CHUNK", "1")' in SRC, True)

@@ -6326,12 +6326,36 @@ def _harvest_call(urls: list) -> dict:
     return out
 
 
+# An ATS serving its BOARD INDEX instead of a posting. Ashby titles that page "Jobs";
+# Greenhouse and Lever use their own equivalents. Matched exactly, lowercased: a real
+# requisition is never titled just this.
+_BOARD_INDEX_TITLES = {"jobs", "careers", "open roles", "job board", "openings",
+                       "current openings", "all jobs"}
+
+
 def _harvest_store(con, candidate_id, res: dict) -> str:
     """One result -> one row. Returns a short verdict string for the job summary."""
     url = res.get("url") or ""
     lists = {k: v for k, v in res.items() if isinstance(v, list)}
     n_fields = sum(len(v) for v in lists.values())
     tier, n_written, gates = harvest_tier(lists)
+    # 🚨 A WRONG DIAGNOSIS STATED CONFIDENTLY IS WORSE THAN NO DIAGNOSIS. The harvester flags
+    # every empty read as "TOO FEW FIELDS: this is probably a careers-page wrap", which means
+    # "the URL points at the wrong page". Measured 2026-09-15: 8 of 8 empty Ashby reads were
+    # nothing of the kind. Each returned the title "Jobs", which is Ashby's BOARD INDEX, which
+    # is what it serves when the requisition has been REMOVED. Those are different facts with
+    # different remedies: one means fix the link, the other means the posting died.
+    #
+    # ⚠️ IT STILL DOES NOT DECIDE LIVENESS, and that rule is not being bent. See the job
+    # docstring: a throttled host and a closed req look identical from one failed call, and
+    # `verify` owns that question. This records WHAT WAS SEEN, never what it means. The
+    # difference between an observation and a verdict is the whole discipline here.
+    if n_fields == 0 and (res.get("title") or "").strip().lower() in _BOARD_INDEX_TITLES:
+        res = {**res, "suspect":
+               f"BOARD INDEX RETURNED: the page titled itself "
+               f"{(res.get('title') or '').strip()!r} and carried no form. On these platforms "
+               f"that is what a REMOVED requisition serves. NOT a liveness verdict: `verify` "
+               f"owns that. Previously mis-reported as a careers-page wrap."}
     con.execute(
         "INSERT INTO harvest (candidate_id,url,read_url,at,ats,tier,n_fields,n_written,gates,"
         "                     fields_json,suspect,error) "
