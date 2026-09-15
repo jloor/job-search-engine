@@ -31,6 +31,8 @@ jobs:
       - run: python3 tests/test_fantastic_restart.py
       # Added 2026-09-14: the floor hid every hourly posting for months.
       - run: python3 tests/test_comp_annual.py
+      # Added 2026-09-15: the harvester returns empty forms under concurrency.
+      - run: python3 tests/test_harvest_chunk.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #

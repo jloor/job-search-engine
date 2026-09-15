@@ -6257,22 +6257,68 @@ HARVEST_MIN_SCORE  = int(os.environ.get("HARVEST_MIN_SCORE", "80"))
 
 
 
+# 🚨 ONE URL PER REQUEST. THE HARVESTER RETURNS EMPTY FORMS UNDER CONCURRENCY.
+# Measured 2026-09-15 against the live service, the SAME four Ashby URLs each time:
+#     batch of 1   25 fields                    ✅
+#     batch of 2   25 fields, 0                 1 of 2
+#     batch of 3   0, 0, 0                      0 of 3
+#     batch of 4   0, 0, 0, 8                   1 of 4
+# Ashby renders its form in JavaScript and harvest.js waits a fixed settle period. Several
+# pages sharing one small Cloud Run instance do not finish painting inside that window, so
+# the snapshot is taken of an empty document.
+#
+# ⚠️ AND IT REPORTS THE FAILURE AS A FINDING. A zero-field read is flagged
+# "TOO FEW FIELDS: this is probably a careers-page wrap", which is a plausible, wrong
+# diagnosis that reads as a legitimate result. That is why this went unnoticed: `harvest`
+# is ONE ROW PER URL, so an empty read MARKS THE URL AS HARVESTED and nothing ever retries
+# it. Lever and Greenhouse are server-rendered and survive the same batch, which is why the
+# failure looked platform-specific rather than structural.
+#
+# 📌 The cost of serialising is small and known: about 7 seconds per form, so a 20-row batch
+# takes roughly 2.5 minutes. The job is scheduled, nothing waits on it, and a correct read
+# is worth a hundred times a fast empty one.
+HARVEST_CHUNK = int(os.environ.get("HARVEST_CHUNK", "1"))
+
+
 def _harvest_call(urls: list) -> dict:
-    """POST to the Cloud Run harvester. Never raises; a transport failure is data."""
+    """POST to the Cloud Run harvester, in chunks. Never raises; a transport failure is data.
+
+    Returns the same shape as the service: {"results": [...]} or {"error": ...}. Merging
+    here rather than at the call site keeps all three callers unchanged.
+    """
     # 📌 Imported inside the function, matching every other outbound caller in this module.
     # `urllib` is NOT imported at module scope: line 20 imports json, os, re and others by
     # name, so a module-level `urllib.request.Request(...)` raises NameError at RUN time.
     import urllib.error, urllib.request
-    body = json.dumps({"urls": urls}).encode()
-    req = urllib.request.Request(
-        f"{HARVESTER_URL}/harvest", data=body,
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {HARVEST_TOKEN}"})
-    try:
-        with urllib.request.urlopen(req, timeout=max(120, 20 * len(urls))) as r:
-            return json.loads(r.read().decode())
-    except Exception as e:                                        # noqa: BLE001
-        return {"error": f"{type(e).__name__}: {e}"}
+    size = max(1, HARVEST_CHUNK)
+    results, first_error = [], ""
+    for i in range(0, len(urls), size):
+        chunk = urls[i:i + size]
+        body = json.dumps({"urls": chunk}).encode()
+        req = urllib.request.Request(
+            f"{HARVESTER_URL}/harvest", data=body,
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {HARVEST_TOKEN}"})
+        try:
+            with urllib.request.urlopen(req, timeout=max(120, 20 * len(chunk))) as r:
+                got = json.loads(r.read().decode())
+        except Exception as e:                                    # noqa: BLE001
+            # ⚠️ ONE FAILED CHUNK MUST NOT DISCARD THE ONES THAT WORKED. The old code
+            # returned a bare error for the whole batch, so a single transport hiccup threw
+            # away every form already read and paid for in wall-clock.
+            first_error = first_error or f"{type(e).__name__}: {e}"
+            continue
+        if got.get("error") and not got.get("results"):
+            first_error = first_error or str(got["error"])
+            continue
+        results.extend(got.get("results") or [])
+    if not results and first_error:
+        return {"error": first_error}
+    out = {"results": results}
+    if first_error:
+        # Partial success is reported as such rather than silently dropped.
+        out["partial_error"] = first_error
+    return out
 
 
 def _harvest_store(con, candidate_id, res: dict) -> str:
