@@ -8794,7 +8794,17 @@ def get_backup(name: str, request: Request, authorization: str | None = Header(N
 # was killed by the CDN at sixty seconds while still writing eligibility.
 # ⚠️ workday_enrich joins these because it paces one HTTP request per posting: a full
 # batch is minutes of wall clock, and the CDN closes the connection at sixty seconds.
-ASYNC_JOBS = {"scan", "backup", "place", "workday_enrich"}
+# ⚠️ harvest JOINS THESE 2026-09-15, because v0.67.0 made it slow ON PURPOSE. Serialising
+# the harvester calls (one URL per request, the only size that reads Ashby correctly) turned
+# a seconds-long job into roughly 2.5 minutes for a 20-row batch. Left synchronous it would
+# block everything after it in the table on every run: gate_audit, inbox_url on its
+# 180-second interval, inbox_answers, and all three fantastic jobs. That is precisely the
+# failure documented on the scheduler loop, where `scan` ran 772 of 804 seconds and nothing
+# below it ran once.
+# 📌 It also fixes the manual path. A synchronous harvest 504s at the CDN every time, so the
+# operator sees a gateway error for a job that is working. As an async job it answers 202
+# with a ticket, like scan and backup.
+ASYNC_JOBS = {"scan", "backup", "place", "workday_enrich", "harvest"}
 _RUNS: dict = {}
 _RUNS_GUARD = threading.Lock()
 

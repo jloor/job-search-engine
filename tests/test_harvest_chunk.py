@@ -150,6 +150,15 @@ check("a page that DID return fields is never called a board index",
       "BOARD INDEX" in (r3["suspect"] or ""), False)
 if _prev: app.DB_PATH = _prev
 
+# 🚨 Serialising made this job slow deliberately, so it must not run in the awaited path.
+print("\na job made slow on purpose must not block the ones behind it:")
+check("harvest is an ASYNC job", "harvest" in app.ASYNC_JOBS, True)
+tbl = (HERE.parent / "job_search_engine" / "app.py").read_text()
+tbl = tbl[tbl.index("def job_table() -> list:"):]
+after = tbl[tbl.index('("harvest"'):]
+check("...and jobs DO sit behind it in the table, which is why it matters",
+      any(f'("{n}"' in after for n in ("inbox_url", "fantastic")), True)
+
 print("\nthe default is the only size measured safe:")
 SRC = (HERE.parent / "job_search_engine" / "app.py").read_text()
 check('HARVEST_CHUNK defaults to 1', 'os.environ.get("HARVEST_CHUNK", "1")' in SRC, True)
