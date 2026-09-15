@@ -52,7 +52,8 @@ class _Resp:
 def fake_urlopen(req, timeout=0):
     body = json.loads(req.data.decode())
     sent.append(body["urls"])
-    return _Resp({"results": [{"url": u, "text": [{"label": "x"}]} for u in body["urls"]]})
+    return _Resp({"results": [{"url": u, "text": [{"label": "x"}]} for u in body["urls"]],
+                  "elapsed_ms": 7000})
 
 
 import urllib.request                                          # noqa: E402
@@ -69,6 +70,8 @@ try:
     check("...each carrying exactly one URL", all(len(c) == 1 for c in sent), True)
     check("...and every result still comes back", len(out["results"]), 5)
     check("...in order", [r["url"] for r in out["results"]], ["u0", "u1", "u2", "u3", "u4"])
+    # ⚠️ A timing that reads as instant hides the cost this change deliberately accepted.
+    check("elapsed_ms is SUMMED across chunks, not dropped", out.get("elapsed_ms"), 35000)
 
     sent.clear()
     app.HARVEST_CHUNK = 2

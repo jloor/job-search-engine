@@ -6291,7 +6291,11 @@ def _harvest_call(urls: list) -> dict:
     # name, so a module-level `urllib.request.Request(...)` raises NameError at RUN time.
     import urllib.error, urllib.request
     size = max(1, HARVEST_CHUNK)
-    results, first_error = [], ""
+    # ⚠️ elapsed_ms IS SUMMED, NOT DROPPED. The first version of this merge returned only
+    # the results, so job_harvest reported "18 read in 0ms" for a run that took two and a
+    # half minutes. A timing that reads as instant hides exactly the cost this change
+    # deliberately accepted, which is the one number a later reader would want.
+    results, first_error, elapsed = [], "", 0
     for i in range(0, len(urls), size):
         chunk = urls[i:i + size]
         body = json.dumps({"urls": chunk}).encode()
@@ -6312,9 +6316,10 @@ def _harvest_call(urls: list) -> dict:
             first_error = first_error or str(got["error"])
             continue
         results.extend(got.get("results") or [])
+        elapsed += int(got.get("elapsed_ms") or 0)
     if not results and first_error:
         return {"error": first_error}
-    out = {"results": results}
+    out = {"results": results, "elapsed_ms": elapsed}
     if first_error:
         # Partial success is reported as such rather than silently dropped.
         out["partial_error"] = first_error
