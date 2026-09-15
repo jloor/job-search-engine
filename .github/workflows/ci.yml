@@ -33,6 +33,8 @@ jobs:
       - run: python3 tests/test_comp_annual.py
       # Added 2026-09-15: the harvester returns empty forms under concurrency.
       - run: python3 tests/test_harvest_chunk.py
+      # Added 2026-09-15: the morning report is a shortlist, not a raw list.
+      - run: python3 tests/test_shortlist.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #

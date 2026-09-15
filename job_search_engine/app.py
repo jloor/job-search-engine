@@ -10038,20 +10038,104 @@ def _mcp_call(name: str, args: dict) -> str:
 
         # 3. What the sweep surfaced. Excludes anything already in the pipeline, on the same
         #    canonical URL, so it is a work list rather than a re-read of his own history.
-        new = _rows("""SELECT c.company, c.title, c.score, c.location, c.remote_verdict,
-                              c.comp_min, c.comp_max, c.url
+        # 🚨 THIS WAS A RAW LIST AND IS NOW A SHORTLIST. Until 2026-09-15 it selected on
+        # score alone, so it showed rows that a human then had to re-filter by hand every
+        # single morning: under the pay floor, location never judged, or carrying a blocking
+        # gate. That work already existed in tools/ease-rank.py and ran ONLY on the
+        # operator's laptop, which meant the container scored everything and then stopped.
+        #
+        # ⭐ NOTHING NEW IS INVENTED HERE. Every rule below already exists in this engine:
+        # comp_floor() and comp.annual for the band, gates.question_class for the gates,
+        # harvest_tier for the writing cost. This joins them to the query that was already
+        # being run.
+        new = _rows("""SELECT c.id, c.company, c.title, c.score, c.location, c.remote_verdict,
+                              c.comp_min, c.comp_max, c.comp_basis, c.comp_source, c.url,
+                              h.tier, h.gates
                          FROM scan_candidate c
+                         LEFT JOIN harvest h ON h.url = c.url
                         WHERE c.at > ? AND c.triaged = 1 AND cast(c.score as int) >= ?
                           AND c.verdict NOT IN ('out_of_scope','duplicate','error')
                           AND NOT EXISTS (SELECT 1 FROM posting p WHERE p.canonical_url = c.url)
-                        ORDER BY cast(c.score as int) DESC LIMIT 25""", (cut, floor))
-        out.append("")
-        out.append(f"3. new in the last {hrs}h at score >= {floor}, not already applied to: {len(new)}")
+                          AND NOT EXISTS (SELECT 1 FROM role_passed rp WHERE rp.url = c.url)
+                        ORDER BY cast(c.score as int) DESC LIMIT 60""", (cut, floor))
+
+        try:
+            import comp as _CMP
+            import gates as _G
+            import candidate as _C
+            _cfg = _C.load()
+        except Exception:                                     # noqa: BLE001
+            _CMP = _G = _C = None
+            _cfg = {}
+        _floor = comp_floor()
+
+        kept, dropped = [], {}
         for r in new:
-            band = (f"${r['comp_min']:,}-${r['comp_max']:,}" if r["comp_min"] and r["comp_max"]
-                    else "no band stated")
+            # 🚨 THE EXCLUSIONS ARE APPLIED LIVE, NOT READ OFF decide_excluded. job_decide
+            # writes that column on its own interval, so a row scored minutes ago has
+            # decided_at = NULL and would walk straight past a company the operator has
+            # already ruled out. Measured 2026-09-15: Destinationknot, which has been on
+            # exclude_companies since 2026-08-29 AND carries a company-scope role_passed
+            # entry, was on this report at score 84 because job_decide had not reached it.
+            # ⚠️ candidate.excluded_company is the SAME rule job_decide uses. Reimplementing
+            # it here would be a second copy that drifts.
+            if _C and _C.excluded_company(r["company"] or "", _cfg):
+                dropped["excluded employer"] = dropped.get("excluded employer", 0) + 1
+                continue
+            _x = excluded_title()
+            if _x and _x.search(r["title"] or ""):
+                dropped["excluded title"] = dropped.get("excluded title", 0) + 1
+                continue
+            # ⚠️ THE FLOOR IS ANNUALISED. An hourly band stores as whole dollars, so $70/hour
+            # is 70, and comparing that raw hid every hourly posting. See comp.annual.
+            top = r["comp_max"] or r["comp_min"]
+            if _CMP and top:
+                top = _CMP.annual(top, r["comp_basis"])
+            if _floor and top and top < _floor:
+                dropped["below the floor"] = dropped.get("below the floor", 0) + 1
+                continue
+            # 🚨 AN UNJUDGED LOCATION NEVER REACHES A SEND LIST. An unverified remote claim
+            # is not a remote role, and remote is the hard filter.
+            if not r["remote_verdict"]:
+                dropped["location not judged yet"] = dropped.get("location not judged yet", 0) + 1
+                continue
+            # ⚠️ ONLY A BLOCKING GATE DROPS A ROW, never a gate-shaped question. The country
+            # named decides, not the shape of the sentence: "are you authorised to work in
+            # the United States" is a routine yes and once hid every banded role.
+            blocked = ""
+            if _G and r["gates"]:
+                try:
+                    for g in json.loads(r["gates"]) or []:
+                        if _G.question_class(g, _cfg) == "blocking":
+                            blocked = g
+                            break
+                except Exception:                             # noqa: BLE001
+                    pass
+            if blocked:
+                dropped["blocking gate on the form"] = dropped.get("blocking gate on the form", 0) + 1
+                continue
+            kept.append({**r, "_top": top})
+
+        out.append("")
+        out.append(f"3. SHORTLIST: new in the last {hrs}h at score >= {floor}, past the floor, "
+                   f"location judged, no blocking gate: {len(kept)}")
+        if dropped:
+            # 📌 Say what was filtered and why. A list that silently shrinks is a list nobody
+            # can audit, and the counts are how a wrong rule gets noticed.
+            out.append("   (filtered: " +
+                       ", ".join(f"{n} {w}" for w, n in sorted(dropped.items())) + ")")
+        for r in kept[:25]:
+            if r["comp_min"] and r["comp_max"]:
+                band = f"${r['comp_min']:,}-${r['comp_max']:,}"
+                if r["_top"] and r["comp_max"] and r["_top"] != r["comp_max"]:
+                    band += f" (~${r['_top']:,}/yr)"
+            else:
+                band = "no band stated"
+            # ⭐ The writing cost, from the harvested form. A is a click, D wants essays.
+            tier = f"tier {r['tier']}" if r["tier"] else "not harvested"
             out.append(f"   {r['score']:>3}  {(r['company'] or '')[:22]:<22} "
-                       f"{(r['title'] or '')[:38]:<38} {band:<22} {r['remote_verdict'] or '?'}")
+                       f"{(r['title'] or '')[:36]:<36} {band:<26} "
+                       f"{(r['remote_verdict'] or '?'):<18} {tier}")
             out.append(f"        {r['url']}")
 
         # 4. The shape, so a session starts from fact rather than from memory.
