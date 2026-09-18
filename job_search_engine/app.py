@@ -9609,7 +9609,7 @@ MCP_TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "min_score": {"type": "integer", "default": 70},
          "min_pay": {"type": "integer",
-                     "description": "annual floor; rows with no band are excluded when set"},
+                     "description": "annual floor. Bands below it are excluded; a role that publishes NO band is kept and labelled, because a silent band is not a low one"},
          "remote": {"type": "string",
                     "description": "fully_remote|remote_in_metro|hybrid_commutable|any"},
          "title": {"type": "string"}, "company": {"type": "string"},
@@ -9781,8 +9781,17 @@ def _mcp_call(name: str, args: dict) -> str:
             # multiplied up. Annualising an hourly rate requires an assumption about hours
             # that the posting did not make, and a floor filter is not the place to invent
             # one. The exclusion is stated in the footer so it is never a silent drop.
-            w.append("c.comp_max IS NOT NULL AND c.comp_max >= ? "
-                     "AND COALESCE(c.comp_basis,'') NOT LIKE '%/hour'")
+            # 🚨 A SILENT BAND IS NOT A LOW ONE, AND THIS FILTER USED TO TREAT THEM THE
+            # SAME. Requiring comp_max dropped every posting that published nothing, which
+            # is most of them on some boards. Measured 2026-09-18: PathPoint's Technical
+            # Implementation Analyst, fit 82 and fully remote, never appeared in a single
+            # list because it states no band. Diagnocat publishes none either and will not,
+            # and it is the furthest-advanced conversation in the pipeline.
+            # ⭐ So the floor now means "nothing I KNOW pays too little", and an unbanded row
+            # survives it and is labelled. The footer says so, because a filter that quietly
+            # changed meaning is worse than either behaviour.
+            w.append("(c.comp_max IS NULL OR (c.comp_max >= ? "
+                     "AND COALESCE(c.comp_basis,'') NOT LIKE '%/hour'))")
             params.append(int(args["min_pay"]))
         want = max(1, min(int(args.get("limit", 25)), 100))
         # 🚨 OVER-FETCH, THEN DEDUPE. The exclusion cannot be expressed cleanly in SQLite,
@@ -9794,7 +9803,14 @@ def _mcp_call(name: str, args: dict) -> str:
             "SELECT c.title, c.board, c.company, c.location, c.score, c.remote_verdict, c.url, "
             "c.comp_min, c.comp_max, c.comp_basis, c.comp_source FROM scan_candidate c "
             "WHERE " + " AND ".join(w) +
-            " ORDER BY c.comp_max DESC NULLS LAST, cast(c.score as int) DESC LIMIT ?",
+            # ⚠️ THE SORT HID UNBANDED ROWS A SECOND TIME. comp_max DESC NULLS LAST puts
+            # every silent posting below every noisy one, so on a limited page it falls off
+            # the end even when nothing filtered it. A published band should not buy
+            # visibility twice. With a pay floor given the band is the subject and leads;
+            # without one, fit leads and the band breaks the tie.
+            (" ORDER BY c.comp_max DESC NULLS LAST, cast(c.score as int) DESC LIMIT ?"
+               if args.get("min_pay") else
+               " ORDER BY cast(c.score as int) DESC, c.comp_max DESC NULLS LAST LIMIT ?"),
             tuple(params))
 
         # 🚨 EXCLUDE WHAT HE HAS ALREADY APPLIED TO. This tool's description has always said
@@ -9857,8 +9873,9 @@ def _mcp_call(name: str, args: dict) -> str:
             note += (f"\n\n📌 {dropped} role(s) hidden because he has already applied to them, "
                      f"matched on canonical URL or on company and title.")
         if args.get("min_pay"):
-            note += ("\n\n⚠️ A pay floor excludes every role with no published band, and "
-                     "hourly bands are excluded rather than annualised.")
+            note += ("\n\n📌 A pay floor keeps roles that publish NO band, labelled as such: "
+                     "a silent band is not a low one. It excludes only bands below the floor, "
+                     "and hourly bands, which are not annualised.")
         return "\n".join(out) + note
 
     if name == "commute_check":

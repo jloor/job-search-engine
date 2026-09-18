@@ -1355,10 +1355,16 @@ On Wed, Aug 12, 2026 the candidate wrote:
         _p = _app3._mcp_call("search_queue", {"min_score": 70, "min_pay": 100000})
         check("a pay floor keeps the role above it", "rich" in _p, True)
         check("...and drops the one below it", "poor" in _p, False)
-        # ⚠️ Silently dropping unpriced roles hides most of the queue behind a filter that
-        # looks like it only removed cheap jobs.
-        check("...drops unpriced roles but SAYS it did",
-              "quiet" not in _p and "no published band" in _p, True)
+        # 🚨 CHANGED 2026-09-18, AND THE OLD ASSERTION IS WHY. This used to require that a
+        # pay floor DROP every unpriced role, as long as it admitted doing so in the footer.
+        # Admitting it was not enough: a filter named for a floor was removing postings whose
+        # pay nobody knows, which on some boards is most of them. PathPoint's Technical
+        # Implementation Analyst, fit 82 and fully remote, never reached a single list that
+        # day, and Diagnocat publishes no range at all and is the furthest-advanced
+        # conversation in the pipeline.
+        # ⭐ The floor now means "nothing I KNOW pays too little".
+        check("...keeps an unpriced role, labelled, rather than dropping it",
+              "quiet" in _p and "no band published" in _p, True)
         # Annualising an hourly rate needs an assumption about hours the posting never made.
         # ⚠️ Asserted on the RENDERED RATE, not the word "hourly": the footer explaining the
         # exclusion contains that word, so the obvious substring check passes on the
