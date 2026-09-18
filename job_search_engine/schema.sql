@@ -189,6 +189,15 @@ CREATE TABLE IF NOT EXISTS scan_candidate (
   -- 📌 Change tracking, written only by the modified feed. NULL everywhere else, including
   -- on every row the board sweep writes, and that is correct: the sweep re-reads a board
   -- and computes change locally, so it has no notion of a field-level edit.
+  -- 🚨 2026-09-18. WHETHER THE REQUISITION STILL EXISTS. Written only by job_verify_queue,
+  -- which re-reads the scored, gated, not-yet-applied top of the queue. Until then nothing
+  -- re-read the queue at all, so rows scored weeks earlier were still offered as work after
+  -- the employer had pulled them: nine of fifteen leads worked by hand on one day were dead.
+  -- ⚠️ 'dead' hides a row where rows are OFFERED. NULL means never checked and 'unknown'
+  -- means the board could not be read, and neither is evidence that the job is gone.
+  live_status       TEXT,                       -- live | dead | unknown
+  live_evidence     TEXT,
+  live_checked_at   TEXT,
   date_modified     TEXT,
   modified_fields   TEXT                       -- JSON array, verbatim from the feed
 );

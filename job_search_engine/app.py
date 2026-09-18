@@ -479,6 +479,17 @@ MIGRATIONS = [
     "ALTER TABLE scan_candidate ADD COLUMN company_source TEXT",
     # 2026-08-23: the ATS tenant code, split out of `company`. See split_ats_company.
     "ALTER TABLE scan_candidate ADD COLUMN company_code TEXT",
+    # 🚨 2026-09-18. THE QUEUE ADVERTISED WORK THAT NO LONGER EXISTED. job_verify reads only
+    # the postings behind live applications, which is correct for protecting a package that
+    # has already been built. Nothing ever re-read the queue, so a row scored in August was
+    # still offered in September with the requisition long gone. Measured that day: nine of
+    # fifteen leads worked by hand off the queue were already dead, including two the morning
+    # report had listed as the day's shortlist.
+    # ⚠️ IT IS A FACT ABOUT THE REQUISITION, never a judgement about the row's fit. A dead
+    # candidate is filtered from what is offered; its score, its gates and its comp stay.
+    "ALTER TABLE scan_candidate ADD COLUMN live_status TEXT",
+    "ALTER TABLE scan_candidate ADD COLUMN live_evidence TEXT",
+    "ALTER TABLE scan_candidate ADD COLUMN live_checked_at TEXT",
     # ⭐ 2026-08-23. WHO SAID THE STATUS IS WHAT IT IS. job_track moves a row on a real
     # confirmation at the per-company alias, which is strong evidence. A human saying "I clicked
     # submit" is weaker but it is the only evidence available when an employer sends no
@@ -5889,6 +5900,19 @@ VERIFY_STALE_HRS = int(os.environ.get("VERIFY_STALE_HRS", "20"))
 # One request per posting, paced. These are employers' boards, not an API we are entitled to.
 VERIFY_PACE      = float(os.environ.get("VERIFY_PACE", "1.0"))
 
+# ⭐ THE QUEUE HALF OF THE SAME QUESTION, and it is deliberately narrower than the board
+# sweep. Re-probing thousands of scored rows would spend requests on employers who are owed
+# none, which is why job_verify was written to read applications only. What changed is the
+# measurement: the rows a human actually works are the top of the queue, and those are few
+# enough to re-read. So this checks what would be OFFERED, not everything that was scored.
+QVERIFY_EVERY_MIN = int(os.environ.get("QVERIFY_EVERY_MIN", "47"))
+QVERIFY_BATCH     = int(os.environ.get("QVERIFY_BATCH", "18"))
+QVERIFY_MIN_SCORE = int(os.environ.get("QVERIFY_MIN_SCORE", "70"))
+# Longer than VERIFY_STALE_HRS on purpose. A queue row carries no package and no application,
+# so a day-old reading is enough to stop a wasted hour, and three days keeps the request count
+# honest against boards that owe this system nothing.
+QVERIFY_STALE_HRS = int(os.environ.get("QVERIFY_STALE_HRS", "72"))
+
 _LIVE_ASHBY = re.compile(r"jobs\.ashbyhq\.com/([^/?#]+)/([0-9a-fA-F-]{16,})")
 _LIVE_LEVER = re.compile(r"jobs\.lever\.co/([^/?#]+)/([0-9a-fA-F-]{16,})")
 _LIVE_GH    = re.compile(r"(?:job-boards|boards)\.greenhouse\.io/([^/?#]+)/jobs/(\d+)")
@@ -6084,6 +6108,77 @@ def job_verify() -> str:
     note = (f"checked {len(rows)}: {tally['ok']} live, {tally['gone']} dead, "
             f"{tally['blocked']} unreadable, {tally['unaddressable']} unaddressable")
     return note + (f"; DEAD: {', '.join(gone[:8])}" if gone else "")
+
+
+def job_verify_queue() -> str:
+    """Re-read the requisitions behind the TOP of the queue, so a dead row stops being offered.
+
+    🚨 WHY THIS EXISTS, AND WHY job_verify WAS NOT ENOUGH. job_verify reads only the postings
+    behind live applications, because the expensive failure it was built for is a requisition
+    dying underneath a package already built. That reasoning is still right and is unchanged.
+    It leaves a second failure uncovered: the queue offers work, a human picks a row, builds a
+    package, and discovers the posting is gone. Measured 2026-09-18, nine of fifteen leads
+    worked by hand off the queue were already dead.
+
+    ⭐ IT CHECKS WHAT WOULD BE OFFERED, NOT WHAT WAS SCORED. The queue is thousands of rows and
+    most will never be worked. The rows a human sees are the scored, gated, not-yet-applied
+    top of it, and that set is small enough to re-read on a slow interval. Anything below the
+    score floor is never probed, because nobody was going to open it.
+
+    ⚠️ IT WRITES `scan_candidate.live_status` AND NOTHING ELSE. A dead requisition is a fact
+    about the employer's board, not a judgement about the row: the score, the gates and the
+    comp stay exactly as they were. Filtering happens where rows are offered, so the evidence
+    survives even when the row is hidden.
+
+    📌 `unknown` is written on a blocked read, never the previous verdict. A stale 'live'
+    nobody re-read is indistinguishable from a fresh one, which is the confusion the whole
+    pair of jobs exists to remove.
+    """
+    stamp = now()
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(hours=QVERIFY_STALE_HRS)).isoformat(timespec="seconds")
+    with db() as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT c.id, c.url, c.board, c.company, c.title "
+            "  FROM scan_candidate c "
+            " WHERE c.triaged = 1 AND cast(c.score as int) >= ? "
+            "   AND c.verdict NOT IN ('out_of_scope','duplicate','error') "
+            "   AND c.url IS NOT NULL AND trim(c.url) <> '' "
+            # Already applied to, so job_verify owns it. Probing it here would double the
+            # requests against one board and split the verdict across two columns.
+            "   AND NOT EXISTS (SELECT 1 FROM posting p WHERE p.canonical_url = c.url) "
+            "   AND NOT EXISTS (SELECT 1 FROM role_passed rp WHERE rp.url = c.url) "
+            "   AND (c.live_checked_at IS NULL OR c.live_checked_at < ?) "
+            # NULLs first, then the oldest reading, then the best row. A never-checked
+            # candidate is the one we know least about, and score breaks the tie because the
+            # top of the queue is what a human opens first.
+            " ORDER BY c.live_checked_at IS NOT NULL, c.live_checked_at, "
+            "          cast(c.score as int) DESC LIMIT ?",
+            (QVERIFY_MIN_SCORE, cutoff, QVERIFY_BATCH))]
+    if not rows:
+        return "nothing due"
+
+    tally = {"ok": 0, "gone": 0, "blocked": 0, "unaddressable": 0}
+    gone = []
+    for r in rows:
+        res = posting_liveness(r["url"], r["board"] or "")
+        tally[res["state"]] = tally.get(res["state"], 0) + 1
+        if res["state"] == "gone":
+            gone.append(f"{(r['company'] or r['board'] or '')[:22]} {(r['title'] or '')[:34]}")
+        state = {"ok": "live", "gone": "dead"}.get(res["state"], "unknown")
+        with db() as con:
+            con.execute("UPDATE scan_candidate SET live_status=?, live_evidence=?, "
+                        "live_checked_at=? WHERE id=?",
+                        (state, res["evidence"][:400], stamp, r["id"]))
+        if VERIFY_PACE:
+            time.sleep(VERIFY_PACE)
+
+    with db() as con:
+        log_event(con, "verify_queue",
+                  json.dumps({"checked": len(rows), **tally, "gone": gone[:20]})[:3500])
+    note = (f"checked {len(rows)}: {tally['ok']} live, {tally['gone']} dead, "
+            f"{tally['blocked']} unreadable, {tally['unaddressable']} unaddressable")
+    return note + (f"; DEAD: {', '.join(gone[:6])}" if gone else "")
 
 
 # ─────────────────────────────────────────────────────────────────────────────────────
@@ -8320,6 +8415,10 @@ def job_table() -> list:
             # network. A verdict taken after the overnight sweep is worth more than one taken
             # beside it.
             ("verify", VERIFY_EVERY_MIN * 60, job_verify),
+            # ⭐ The queue half of the same question, on its own slower interval. It probes
+            # only the scored, gated, not-yet-applied top of the queue, so a lead that died
+            # since the sweep stops being offered as work. See job_verify_queue.
+            ("verify_queue", QVERIFY_EVERY_MIN * 60, job_verify_queue),
             # Cheap and database-only. It reads resolved mail and writes timeline rows; it
             # makes no network call and cannot see outbound mail, which arrives by hand.
             ("interactions", INTERACTIONS_EVERY_MIN * 60, job_interactions),
@@ -9658,8 +9757,13 @@ def _mcp_call(name: str, args: dict) -> str:
         return "\n".join(out)
 
     if name == "search_queue":
+        # ⚠️ A DEAD REQUISITION IS NOT AN OPPORTUNITY. job_verify_queue re-reads the top of
+        # the queue and marks what has been pulled; this is where that verdict is spent.
+        # Only a confirmed 'dead' hides a row: NULL means never checked and 'unknown' means
+        # the board could not be read, and neither is evidence that the job is gone.
         w = ["cast(c.score as int) >= ?", "c.triaged = 1",
-             "c.verdict NOT IN ('out_of_scope','duplicate','error')"]
+             "c.verdict NOT IN ('out_of_scope','duplicate','error')",
+             "COALESCE(c.live_status,'') <> 'dead'"]
         params = [int(args.get("min_score", 70))]
         mode = (args.get("remote") or "").strip()
         if mode and mode != "any":
@@ -10054,6 +10158,7 @@ def _mcp_call(name: str, args: dict) -> str:
                          FROM scan_candidate c
                          LEFT JOIN harvest h ON h.url = c.url
                         WHERE c.at > ? AND c.triaged = 1 AND cast(c.score as int) >= ?
+                          AND COALESCE(c.live_status,'') <> 'dead'
                           AND c.verdict NOT IN ('out_of_scope','duplicate','error')
                           AND NOT EXISTS (SELECT 1 FROM posting p WHERE p.canonical_url = c.url)
                           AND NOT EXISTS (SELECT 1 FROM role_passed rp WHERE rp.url = c.url)
