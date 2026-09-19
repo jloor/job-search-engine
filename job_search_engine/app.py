@@ -6226,6 +6226,14 @@ def job_verify_queue() -> str:
     # the same service the form harvest already calls, so this adds no new exposure.
     rendered = {"live": 0, "dead": 0, "unknown": 0}
     if HARVESTER_URL and HARVEST_TOKEN and QVERIFY_RENDER_BATCH > 0:
+        # ⚠️ IMPORTED HERE BECAUSE THIS MODULE DOES NOT IMPORT IT AT THE TOP, and the first
+        # production run of this pass proved it: eight rows came back
+        # "render failed: NameError: name 'urllib' is not defined". Every other caller in this
+        # file imports it inside its own function, so this follows them rather than adding a
+        # top-level import that the rest of the file does not expect.
+        # ⭐ The bug cost nothing, which is the design working: the failure was recorded as
+        # evidence on each row and no row got a verdict from it.
+        import urllib.error, urllib.request
         with db() as con:
             blocked = [dict(x) for x in con.execute(
                 "SELECT id, url, company, title FROM scan_candidate "

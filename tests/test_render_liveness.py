@@ -82,6 +82,19 @@ for name, obs in (("dead", GEHC), ("live", CELIGO)):
     ev = app.render_liveness("u", obs)[1]
     check(f"the {name} verdict says what was seen", "rendered: http 200" in ev, True)
 
+# 🚨 THE FIRST PRODUCTION RUN FAILED ON A MISSING IMPORT, and nothing here would have caught
+# it: render_liveness is pure, so every test above passed while the caller could not make a
+# single request. The pass records the failure as evidence rather than inventing a verdict,
+# which is why it cost nothing, but eight rows spent a run learning nothing.
+# ⚠️ app.py imports urllib inside each function that needs it rather than at the top, so this
+# asserts the import is present in the block that makes the call.
+SRC = (HERE.parent / "job_search_engine" / "app.py").read_text()
+block = SRC[SRC.index("def job_verify_queue"):SRC.index('log_event(con, "verify_queue"')]
+print("\nthe caller can actually make the call:")
+check("the render pass imports urllib", "import urllib.error, urllib.request" in block, True)
+check("it posts to the harvester's liveness route", "/liveness" in block, True)
+check("it sends one url per request", 'json.dumps({"url": b["url"]})' in block, True)
+
 print()
 if fails:
     print(f"FAILED: {len(fails)}")
