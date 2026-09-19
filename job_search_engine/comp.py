@@ -39,6 +39,28 @@ _PAY_WORDS = re.compile(
     r"total target cash|expected pay|range for this (?:role|position)", re.I)
 _HOURLY = re.compile(r"hourly|per hour|/\s?hr|an hour", re.I)
 
+# 🚨 A BAND WITHOUT A DOLLAR SIGN IS STILL A BAND, and three real postings proved it on
+# 2026-09-19 while being worked by hand off the "no band published" list. Businessolver:
+# "The pay range for this position is 67K to 105K per year". That row reached a shortlist
+# as an unpriced role, which is a different and much more interesting thing than a role
+# paying 67K. Two of four postings opened that morning had the same shape.
+#
+# ⚠️ THE SHAPE IS DELIBERATELY NARROW. A bare integer in a job posting is usually not money:
+# "7+ years", "2,000 clients", "1998". So only two forms count, a K suffix or explicit
+# comma-thousands, and only inside a sentence that already says salary, pay or compensation.
+# Both guards matter: GiveCampus writes "$100 billion in charitable giving" and "a $140
+# million growth investment" in prose, and neither sentence mentions pay.
+_BARE = r"\d{2,3}\s?[Kk]\b|\d{2,3},\d{3}\b"
+_BARE_RANGE = re.compile(rf"({_BARE})\s*(?:-|–|—|to|and)\s*({_BARE})")
+
+# ⭐ ONE NUMBER IS ALSO AN ANSWER. Feathr states "$55,000 annually, and up to a 10% bonus
+# potential": a single figure, no range, and the row was carried as unpriced against a
+# $100,000 floor. A single amount is only read when the words for a period sit right beside
+# it, so a sentence mentioning compensation AND some unrelated figure does not become a band.
+_SINGLE = re.compile(
+    rf"({_AMOUNT}|{_BARE})\s*(?:per year|per annum|annually|annualized|/\s?yr|a year)"
+    rf"|(?:salary|base pay|pay|compensation)\s*(?:is|of|:)\s*({_AMOUNT}|{_BARE})", re.I)
+
 # ⭐ BASIS IS NOT OPTIONAL. Anthropic's range "includes both the sales commissions/sales
 # bonuses target and annual base salary" and ezCater's is "total target cash compensation",
 # while Relocity's is base salary. Ranking those against each other as if they were the same
@@ -151,7 +173,10 @@ def from_body(body):
     for sentence in re.split(r"(?<=[.!?])\s+|\n+", body):
         if not _PAY_WORDS.search(sentence):
             continue
-        m = _RANGE.search(sentence)
+        # ⚠️ ORDER MATTERS. The dollar-sign pattern runs first because it is the least
+        # ambiguous; the bare form is only reached when no priced range exists in the
+        # sentence, so "$67,000 to $105,000" can never be read as the bare "67 to 105".
+        m = _RANGE.search(sentence) or _BARE_RANGE.search(sentence)
         if not m:
             continue
         hourly = bool(_HOURLY.search(sentence))
@@ -178,6 +203,23 @@ def from_body(body):
             continue
         ctx = flat[max(0, m.start() - 160):m.end() + 40]
         return _result(m, ctx, hourly, "body_regex")
+
+    # ⭐ THIRD PASS: ONE NUMBER, NOT TWO. Last on purpose, so any real range wins first.
+    # A single figure is a band whose min and max are the same, and storing it that way is
+    # honest: the employer stated one number.
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", body):
+        if not _PAY_WORDS.search(sentence):
+            continue
+        m = _SINGLE.search(sentence)
+        if not m:
+            continue
+        tok = m.group(1) or m.group(2)
+        val = _to_number(tok)
+        hourly = bool(_HOURLY.search(sentence))
+        if not _plausible(val, val, hourly):
+            continue
+        one = type("M", (), {"group": staticmethod(lambda i, t=tok: t)})
+        return _result(one, sentence, hourly, "body_regex")
     return None
 
 
