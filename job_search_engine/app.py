@@ -5912,6 +5912,17 @@ QVERIFY_MIN_SCORE = int(os.environ.get("QVERIFY_MIN_SCORE", "70"))
 # so a day-old reading is enough to stop a wasted hour, and three days keeps the request count
 # honest against boards that owe this system nothing.
 QVERIFY_STALE_HRS = int(os.environ.get("QVERIFY_STALE_HRS", "72"))
+# ⭐ THE SECOND PASS, AND IT ONLY RUNS ON WHAT THE FIRST COULD NOT READ. A quarter of the rows
+# the first two runs checked came back blocked: Workday tenants, careers-page wrappers and
+# anything behind JavaScript. No amount of retrying a fetch renders a page, and a blocked row
+# is offered to a human exactly like a live one. The harvester already owns a browser, so this
+# asks it, and only for rows still sitting at `unknown`.
+# ⚠️ Small on purpose. A browser read costs seconds and a Cloud Run instance; a fetch costs
+# nothing. The cheap reader runs first and the expensive one cleans up after it.
+QVERIFY_RENDER_BATCH = int(os.environ.get("QVERIFY_RENDER_BATCH", "8"))
+# The service budgets 90s per URL and renders one at a time here, so this is that plus room
+# for a cold start on a service that scales to zero.
+QVERIFY_RENDER_TIMEOUT = int(os.environ.get("QVERIFY_RENDER_TIMEOUT", "120"))
 
 _LIVE_ASHBY = re.compile(r"jobs\.ashbyhq\.com/([^/?#]+)/([0-9a-fA-F-]{16,})")
 _LIVE_LEVER = re.compile(r"jobs\.lever\.co/([^/?#]+)/([0-9a-fA-F-]{16,})")
@@ -6110,6 +6121,43 @@ def job_verify() -> str:
     return note + (f"; DEAD: {', '.join(gone[:8])}" if gone else "")
 
 
+def render_liveness(url: str, obs: dict) -> tuple[str, str]:
+    """Turn one rendered observation into a verdict, or refuse to.
+
+    🚨 THE READER DESCRIBES AND THIS DECIDES, which is the same split the harvester itself
+    obeys. liveness.js reports the status, the final URL, the field count and which phrases it
+    found. Nothing there knows what a healthy Lever page looks like versus a healthy Workday
+    one, and it should not.
+
+    ⭐ THE ASYMMETRY IS DELIBERATE. Calling a live requisition dead costs a real application;
+    calling a dead one unknown costs one wasted look. So `dead` needs a gone marker AND no
+    sign of a working application page, while almost anything positive returns `live`, and
+    everything else stays `unknown`.
+
+    📌 A LEVER POSTING PAGE HAS ZERO FIELDS AND IS ALIVE. The form lives at /apply, so a field
+    count of nought is normal there. Measured 2026-09-18: the Redox Senior Integration
+    Coordinator page reads 0 fields, 0 file inputs and one "apply for this job".
+    """
+    if obs.get("error"):
+        return "unknown", f"render failed: {str(obs['error'])[:160]}"
+    alive = obs.get("alive_markers") or []
+    gone = obs.get("gone_markers") or []
+    fields = int(obs.get("field_count") or 0)
+    files = int(obs.get("file_inputs") or 0)
+    status = obs.get("http_status")
+    title = (obs.get("title") or "")[:80]
+    ev = (f"rendered: http {status}, {fields} fields, {files} file input(s)"
+          f"{', redirected' if obs.get('redirected') else ''}; title {title!r}")
+    if isinstance(status, int) and status in (404, 410):
+        return "dead", f"{ev}; status says gone"
+    if alive or files or fields >= 4:
+        return "live", f"{ev}; alive markers {alive[:3]}"
+    if gone:
+        return "dead", f"{ev}; gone markers {gone[:2]}"
+    # A page that renders, says nothing either way and offers nothing to fill is not evidence.
+    return "unknown", f"{ev}; no marker either way"
+
+
 def job_verify_queue() -> str:
     """Re-read the requisitions behind the TOP of the queue, so a dead row stops being offered.
 
@@ -6173,11 +6221,46 @@ def job_verify_queue() -> str:
         if VERIFY_PACE:
             time.sleep(VERIFY_PACE)
 
+    # ⭐ SECOND PASS: ask the browser about what the fetch could not read. Only rows sitting at
+    # `unknown` are sent, newest verdict first, and only if the harvester is configured. It is
+    # the same service the form harvest already calls, so this adds no new exposure.
+    rendered = {"live": 0, "dead": 0, "unknown": 0}
+    if HARVESTER_URL and HARVEST_TOKEN and QVERIFY_RENDER_BATCH > 0:
+        with db() as con:
+            blocked = [dict(x) for x in con.execute(
+                "SELECT id, url, company, title FROM scan_candidate "
+                " WHERE live_status = 'unknown' AND url IS NOT NULL AND trim(url) <> '' "
+                " ORDER BY live_checked_at DESC LIMIT ?", (QVERIFY_RENDER_BATCH,))]
+        for b in blocked:
+            try:
+                body = json.dumps({"url": b["url"]}).encode()
+                rq = urllib.request.Request(
+                    f"{HARVESTER_URL}/liveness", data=body,
+                    headers={"Content-Type": "application/json",
+                             "Authorization": f"Bearer {HARVEST_TOKEN}"})
+                with urllib.request.urlopen(rq, timeout=QVERIFY_RENDER_TIMEOUT) as resp:
+                    obs = (json.loads(resp.read().decode()).get("results") or [{}])[0]
+            except Exception as e:                                # noqa: BLE001
+                obs = {"error": f"{type(e).__name__}: {e}"}
+            state, ev = render_liveness(b["url"], obs)
+            rendered[state] = rendered.get(state, 0) + 1
+            if state == "dead":
+                gone.append(f"{(b['company'] or '')[:22]} {(b['title'] or '')[:30]} (rendered)")
+            # ⚠️ An unresolved row keeps `unknown` and gets a fresh timestamp anyway, so the
+            # next run reaches rows behind it instead of retrying the same eight for ever.
+            with db() as con:
+                con.execute("UPDATE scan_candidate SET live_status=?, live_evidence=?, "
+                            "live_checked_at=? WHERE id=?", (state, ev[:400], stamp, b["id"]))
+
     with db() as con:
         log_event(con, "verify_queue",
-                  json.dumps({"checked": len(rows), **tally, "gone": gone[:20]})[:3500])
+                  json.dumps({"checked": len(rows), **tally,
+                              "rendered": rendered, "gone": gone[:20]})[:3500])
     note = (f"checked {len(rows)}: {tally['ok']} live, {tally['gone']} dead, "
             f"{tally['blocked']} unreadable, {tally['unaddressable']} unaddressable")
+    if sum(rendered.values()):
+        note += (f"; rendered {sum(rendered.values())}: {rendered['live']} live, "
+                 f"{rendered['dead']} dead, {rendered['unknown']} still unknown")
     return note + (f"; DEAD: {', '.join(gone[:6])}" if gone else "")
 
 
