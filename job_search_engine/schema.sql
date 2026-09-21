@@ -835,7 +835,9 @@ CREATE TABLE IF NOT EXISTS role_passed (
 CREATE TABLE IF NOT EXISTS ai_spend (
          id            INTEGER PRIMARY KEY,
          at            TEXT NOT NULL,
-         purpose       TEXT NOT NULL,      -- TRIAGE | MAIL | MATCH | COMP | REMOTE | GATE_AUDIT | SHARED
+         vendor        TEXT NOT NULL DEFAULT 'openrouter',  -- openrouter | typesafe
+         purpose       TEXT NOT NULL,      -- TRIAGE | MAIL | MATCH | COMP | REMOTE |
+                                           -- GATE_AUDIT | JEV_LEVEL | JEV_REMOTE | SHARED
          key_name      TEXT NOT NULL,      -- the VARIABLE that paid, never the key itself
          model         TEXT,
          input_tokens  INTEGER NOT NULL DEFAULT 0,

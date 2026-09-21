@@ -48,12 +48,15 @@ print("\nthe recording happens where the SPENDING happens, not at the call sites
 spend_fn = SRC.split("def _read_openai_compat", 1)[1].split("\ndef ", 1)[0]
 check("_read_openai_compat calls note_spend", "note_spend(purpose, usage)" in spend_fn)
 check("...and still returns the usage to its caller", "return text, usage" in spend_fn)
-# Exactly one place CALLS it: the definition and a comment also mention the name, so count
-# the call form rather than the bare name. If a second call site ever appears, the recording
-# has drifted back out to the callers and the guarantee is gone.
-check("exactly one call site, inside the spending function",
-      SRC.count("    note_spend(purpose, usage)") == 1
-      and SRC.count("note_spend(") == 3)
+# ⚠️ EXPRESS THE INVARIANT, NOT A COUNT. An earlier version asserted note_spend appeared
+# exactly three times, and adding the Jev hook made it five and failed a check that was
+# measuring nothing. What must hold is narrower: exactly ONE unconditional call on the
+# OpenRouter path, and every other mention is a hook binding at a vendor boundary.
+check("exactly one call on the OpenRouter path",
+      SRC.count("    note_spend(purpose, usage)") == 1)
+_hookbinds = SRC.count("note_spend(p, u, key_name=")
+check("every other call is a vendor hook binding, and there are two",
+      _hookbinds == 2)
 
 print("\nit records the VARIABLE that paid, never a key value:")
 note_fn = SRC.split("def note_spend", 1)[1].split("\ndef ", 1)[0]
@@ -88,6 +91,23 @@ try:
     check("REMOTE names the shared one it actually used",
           rows.get("REMOTE", {}).get("key_name") == "AI_API_KEY")
     check("an unlabelled call is recorded as SHARED", "SHARED" in rows)
+
+    # 🚨 THE DEFECT MEASURING FOUND. note_spend used to ALWAYS resolve the key itself, so a
+    # JEV_REMOTE call looked for AI_API_KEY_JEV_REMOTE, missed, and fell back to AI_API_KEY.
+    # 63 production rows recorded the OpenRouter variable as having paid a TypeSafe bill.
+    relay.note_spend("JEV_REMOTE", {"input_tokens": 1600, "output_tokens": 12,
+                                    "model": "jev-1.13.0"},
+                     key_name="JEV_API_KEY", vendor="typesafe")
+    with relay.db() as con:
+        j = dict(con.execute("SELECT vendor, key_name FROM ai_spend "
+                             "WHERE purpose='JEV_REMOTE'").fetchone())
+    check("a second vendor records ITS OWN key, not the OpenRouter one",
+          j["key_name"] == "JEV_API_KEY")
+    check("...and its own vendor, so the two token pools stay separable",
+          j["vendor"] == "typesafe")
+    with relay.db() as con:
+        o = dict(con.execute("SELECT vendor FROM ai_spend WHERE purpose='COMP'").fetchone())
+    check("an OpenRouter call still defaults to openrouter", o["vendor"] == "openrouter")
 
     print("\n  a broken ledger must never discard a paid answer:")
     _real = relay.db
@@ -162,8 +182,9 @@ check("ask() records where the spending happens, not at the call sites",
 check("both readers name their purpose",
       '_PURPOSE["name"] = "JEV_LEVEL"' in JEVSRC
       and '_PURPOSE["name"] = "JEV_REMOTE"' in JEVSRC)
-check("both jev jobs wire the hook to note_spend",
-      SRC.count("_JEV.SPEND_HOOK = note_spend") == 2)
+check("both jev jobs bind the hook with Jev's own key and vendor",
+      SRC.count('key_name="JEV_API_KEY"') == 2
+      and SRC.count('vendor="typesafe"') == 2)
 check("jev.py never imports app, which would be a cycle", "import app" not in JEVSRC)
 
 print()

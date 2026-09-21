@@ -524,6 +524,11 @@ MIGRATIONS = [
     "ALTER TABLE scan_candidate ADD COLUMN work_arrangement TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN work_arrangement_conf REAL",
     "ALTER TABLE scan_candidate ADD COLUMN work_arrangement_at TEXT",
+    # ⚠️ TOKENS FROM TWO VENDORS ARE NOT COMPARABLE, and a ledger with no vendor column
+    # invites exactly that arithmetic. Jev bills $0.042 per million input tokens and the
+    # OpenRouter model bills a different rate, so summing the column without splitting by
+    # vendor produces a number that looks like money and is not.
+    "ALTER TABLE ai_spend ADD COLUMN vendor TEXT NOT NULL DEFAULT 'openrouter'",
     # 🚨 2026-09-21. job_comp AND job_remote_check SPENT MONEY AND RECORDED NOTHING. Both
     # read their usage into `_u` and dropped it: 126 pay bands and 844 locations judged by
     # the model with no token record anywhere. When the shared key hit its cap, the answer
@@ -1778,7 +1783,8 @@ def _read_anthropic(user: str, cache_system: bool,
 _AI_KEY_FALLBACKS = ("AI_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY")
 
 
-def note_spend(purpose: str, usage: dict) -> None:
+def note_spend(purpose: str, usage: dict, key_name: str = "",
+               vendor: str = "openrouter") -> None:
     """Record one paid call in the ai_spend ledger. Never raises.
 
     🚨 TWO JOBS SPENT MONEY AND RECORDED NOTHING, FOR MONTHS. `job_comp` and
@@ -1802,10 +1808,16 @@ def note_spend(purpose: str, usage: dict) -> None:
     """
     try:
         with db() as con:
+            # 🚨 key_name IS PASSED IN FOR A NON-OPENROUTER VENDOR, NEVER RESOLVED. The first
+            # version always called ai_key_name(purpose). For JEV_REMOTE that looked for
+            # AI_API_KEY_JEV_REMOTE, failed, and fell back to AI_API_KEY, so 63 rows recorded
+            # the OpenRouter key as having paid a TypeSafe bill. The column whose whole job is
+            # "which key paid" was wrong for every row of the second vendor.
             con.execute(
-                "INSERT INTO ai_spend(at, purpose, key_name, model, input_tokens, "
-                "output_tokens, cache_read) VALUES (?,?,?,?,?,?,?)",
-                (now(), (purpose or "SHARED").upper(), ai_key_name(purpose) or "NONE",
+                "INSERT INTO ai_spend(at, vendor, purpose, key_name, model, input_tokens, "
+                "output_tokens, cache_read) VALUES (?,?,?,?,?,?,?,?)",
+                (now(), (vendor or "openrouter").lower(), (purpose or "SHARED").upper(),
+                 key_name or ai_key_name(purpose) or "NONE",
                  usage.get("model") or AI_MODEL, int(usage.get("input_tokens") or 0),
                  int(usage.get("output_tokens") or 0), int(usage.get("cache_read") or 0)))
     except Exception:                                         # noqa: BLE001
@@ -6524,7 +6536,10 @@ def job_jev_level() -> str:
     # recorded nothing, and Jev then made 480 calls the same table could not see, because it
     # does not go through _read_openai_compat. The hook points the recording back here
     # without jev.py importing app.py, which would be a cycle.
-    _JEV.SPEND_HOOK = note_spend
+    # ⚠️ Bound with Jev's OWN key name and vendor. Letting note_spend resolve the key
+    # itself put the OpenRouter variable on 63 TypeSafe calls.
+    _JEV.SPEND_HOOK = lambda p, u: note_spend(p, u, key_name="JEV_API_KEY",
+                                              vendor="typesafe")
 
     if not _JEV.enabled():
         return "jev disabled (set JEV_ENABLED=1 and JEV_API_KEY)"
@@ -6608,7 +6623,10 @@ def job_jev_remote() -> str:
     # recorded nothing, and Jev then made 480 calls the same table could not see, because it
     # does not go through _read_openai_compat. The hook points the recording back here
     # without jev.py importing app.py, which would be a cycle.
-    _JEV.SPEND_HOOK = note_spend
+    # ⚠️ Bound with Jev's OWN key name and vendor. Letting note_spend resolve the key
+    # itself put the OpenRouter variable on 63 TypeSafe calls.
+    _JEV.SPEND_HOOK = lambda p, u: note_spend(p, u, key_name="JEV_API_KEY",
+                                              vendor="typesafe")
 
     if not _JEV.enabled():
         return "jev disabled (set JEV_ENABLED=1 and JEV_API_KEY)"
