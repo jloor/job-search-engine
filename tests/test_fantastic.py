@@ -339,3 +339,16 @@ check("_fantastic_close takes run_id then KEYWORDS only",
                     if p.kind == _insp.Parameter.POSITIONAL_OR_KEYWORD]) == 1), True)
 check("no call site passes status positionally",
       bool('_fantastic_close(run_id, "' not in APP_SRC), True)
+
+# 🚨 A WRONG LOCATION VALUE IS A SILENT FAILURE. The vendor wants full state names and
+# near_states holds two-letter codes. Measured 2026-09-21, 6m, on-site+hybrid:
+#     "NY" -> 0 rows      "New York" -> 280 rows
+# Zero rows, zero credits, no error: indistinguishable from an empty window. The first
+# local backfill reported twelve passes of "0 returned, 0 new" and looked like it worked.
+print("\nstate codes are expanded to the names the vendor accepts:")
+check("a code->name map exists", bool("_US_STATE_NAMES" in APP_SRC), True)
+check("all four near_states are covered",
+      bool(all(f'"{c}": "' in APP_SRC for c in ("NY", "NJ", "CT", "PA"))), True)
+check("the local pass expands the code", bool("_US_STATE_NAMES.get(st.upper()" in APP_SRC), True)
+check("the label keeps the CODE, so a run is readable",
+      bool('f"local:{st}"' in APP_SRC), True)

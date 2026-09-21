@@ -8828,6 +8828,16 @@ def job_fantastic() -> str:
     return head + ("; " + "; ".join(notes) if notes else "")
 
 
+# Two-letter codes to the full names the Fantastic location filter requires. Only the
+# states a commute rule can plausibly name; a different origin adds its own.
+_US_STATE_NAMES = {
+    "NY": "New York", "NJ": "New Jersey", "CT": "Connecticut", "PA": "Pennsylvania",
+    "MA": "Massachusetts", "MD": "Maryland", "DE": "Delaware", "RI": "Rhode Island",
+    "VT": "Vermont", "NH": "New Hampshire", "ME": "Maine", "VA": "Virginia",
+    "DC": "District of Columbia", "OH": "Ohio", "WV": "West Virginia",
+}
+
+
 def job_fantastic_jb() -> str:
     """Poll the LINKEDIN feed, remote-filtered, and land only what no ATS already carries.
 
@@ -8880,8 +8890,21 @@ def job_fantastic_jb() -> str:
                 ((_C.load() or {}).get("commute") or {}).get("near_states") or []]
     except Exception:                                         # noqa: BLE001
         near = []
+    # 🚨 THE VENDOR WANTS THE FULL STATE NAME AND near_states HOLDS TWO-LETTER CODES.
+    # Measured 2026-09-21, 6m, on-site+hybrid, title=integration:
+    #     "NY" -> 0     "New York"     -> 280
+    #     "NJ" -> 0     "New Jersey"   -> 143
+    #     "CT" -> 0     "Connecticut"  ->  67
+    #     "PA" -> 0     "Pennsylvania" -> 159
+    # ⚠️ AND THE FAILURE IS SILENT: a wrong location returns zero rows, spends zero credits
+    # and raises nothing, so it is indistinguishable from an empty window. The first local
+    # backfill reported twelve passes of "0 returned, 0 new" and looked like a working job
+    # with nothing to find.
+    # 📌 near_states stays as CODES because that is what the commute rules match against.
+    # The expansion belongs here, at the one boundary that needs the other form.
     for st in near:
-        passes.append((f"local:{st}", {**base, "location": f'"{st}"',
+        name = _US_STATE_NAMES.get(st.upper(), st)
+        passes.append((f"local:{st}", {**base, "location": f'"{name}"',
                                        "ai_work_arrangement": FANTASTIC_JB_LOCAL_ARRANGEMENT}))
     total = {"returned": 0, "inserted": 0, "duplicate": 0, "gated": 0,
              "ats_dup": 0, "spent": 0}
