@@ -82,8 +82,17 @@ try:
         con.execute("INSERT INTO scan_board(platform,token,api_url,source,added_at,enabled) "
                     "VALUES ('lever','unrelated','https://api.lever.co/v0/postings/unrelated','agg',?,0)", (now,))
 
+    # 🚨 PROBE THE BOARD, NEVER ASSUME IT ANSWERS. The first version of this rule shipped
+    # without a probe and lit nine boards of which SEVEN returned 404: the aggregator had
+    # written several guesses per company and the broken ones sat disabled BECAUSE they were
+    # broken. Stub the fetch so the test is deterministic and offline.
+    _real_fetch = relay._board_reqs
+    relay._board_reqs = lambda plat, url: (
+        [{"req_id": "1", "title": "Role"}] if "anthropic" in url
+        else (_ for _ in ()).throw(RuntimeError("HTTP Error 404: Not Found")))
+
     lit = relay.enable_boards_for_applied_companies()
-    check("it lit the applied-to board", lit == ["lever|anthropic"])
+    check("it lit the applied-to board that ANSWERED", lit == ["lever|anthropic"])
     with relay.db() as con:
         st = {r["token"]: r["enabled"] for r in con.execute("SELECT token, enabled FROM scan_board")}
         note = con.execute("SELECT note FROM scan_board WHERE token='anthropic'").fetchone()["note"]
@@ -93,9 +102,28 @@ try:
     check("the unrelated dark board STAYED dark", st["unrelated"] == 0)
     check("the note says why it was lit", "applied at this company" in (note or ""))
 
+    print("\n  a board that does NOT answer is left dark, with the reason recorded:")
+    with relay.db() as con:
+        con.execute("INSERT INTO company(id,name,ats_platform,ats_token) VALUES (3,'Dead','lever','deadco')")
+        con.execute("INSERT INTO posting(id,company_id,title,captured_at) VALUES (3,3,'Role',?)", (now,))
+        con.execute("INSERT INTO application(id,posting_id,status) VALUES (3,3,'submitted')")
+        con.execute("INSERT INTO scan_board(platform,token,api_url,source,added_at,enabled) "
+                    "VALUES ('lever','deadco','https://api.lever.co/v0/postings/deadco','agg',?,0)", (now,))
+    lit2 = relay.enable_boards_for_applied_companies()
+    with relay.db() as con:
+        d = dict(con.execute("SELECT enabled, note FROM scan_board WHERE token='deadco'").fetchone())
+    check("a 404 board is NOT enabled", d["enabled"] == 0 and "lever|deadco" not in lit2)
+    check("the reason is written on the row", "did not answer a probe" in (d["note"] or ""))
+
     print("\n  it is idempotent, so a 10-minute job does not churn:")
     again = relay.enable_boards_for_applied_companies()
     check("a second run lights nothing", again == [])
+    # ⚠️ A dead board must not be re-probed forever against somebody else's infrastructure.
+    probed = []
+    relay._board_reqs = lambda plat, url: probed.append(url) or []
+    relay.enable_boards_for_applied_companies()
+    check("a board already proven dead is never probed again", probed == [])
+    relay._board_reqs = _real_fetch
 finally:
     if _old is None:
         os.environ.pop("DB_PATH", None)

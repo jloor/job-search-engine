@@ -227,6 +227,22 @@ check("it updates ONLY the five jev columns",
 check("it writes no score, verdict or comp", "SET score" not in job and "comp_max=" not in job)
 check("a failed call writes nothing at all", "continue" in job and "failed += 1" in job)
 
+# 🚨 THE ERROR PATH MUST BE EXERCISED, NOT JUST WRITTEN. Both Jev jobs called log() on a
+# failed call. log() does not exist in app.py; the house function is audit(). Neither job had
+# crashed because no Jev call had yet failed, so a NameError sat in production across six
+# releases behind a branch nothing took. A test that only exercises the happy path cannot
+# see this, and neither can a green deploy.
+print("\nthe FAILURE path of each job calls something that exists:")
+for job in ("job_jev_level", "job_jev_remote"):
+    body = SRC.split(f"def {job}", 1)[1].split("\ndef ", 1)[0]
+    check(f"{job} does not call the non-existent log()", "log(" not in body
+          or "audit(" in body and " log(" not in body.replace("audit(", ""))
+    check(f"{job} records the failure with audit()", "audit(" in body)
+    check(f"{job} counts the failure rather than swallowing it", "failed += 1" in body)
+check("app.py defines audit()", "def audit(" in SRC)
+check("app.py does NOT define log(), so calling it would raise",
+      "\ndef log(" not in SRC)
+
 print()
 if fails:
     print(f"FAILED: {len(fails)}")

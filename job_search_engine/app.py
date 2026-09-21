@@ -2865,24 +2865,60 @@ def enable_boards_for_applied_companies() -> list[str]:
     job_track, from the tracker importer and by hand. Hooking the job_track path would have
     fixed one of three routes and looked complete.
 
-    ⚠️ It never DISABLES anything. enabled=0 elsewhere is a deliberate policy (a Fantastic
-    match is weaker evidence than a forward) and this is not entitled to overrule it.
+    ⚠️ It never DISABLES anything on its own. enabled=0 elsewhere is a deliberate policy (a
+    Fantastic match is weaker evidence than a forward) and this is not entitled to overrule
+    it. The only row it turns OFF is one it just probed and found dead.
+
+    🚨 IT PROBES BEFORE IT ENABLES, AND THE FIRST VERSION DID NOT. Shipped 2026-09-21 without
+    a probe, it lit nine boards of which SEVEN returned 404. The aggregator import had
+    written several guesses per company, the working guess was enabled long ago, and the
+    broken guesses sat disabled beside it. So `enabled = 0` was not a gap: for those rows it
+    meant "this token does not answer", and enabling them on the application signal alone
+    resurrected dead tokens every ten minutes.
+    ⭐ THE NAMES MAKE THE POINT. `lever|anthropic` was dark and 404s; `greenhouse|anthropic`
+    was enabled all along and has produced 78 candidates. The company was never uncovered.
+    A join on company token WITHOUT the platform made a duplicate wrong-platform row look
+    like an uncovered employer.
+    📌 So a 404 is now recorded as a fact on the row rather than retried forever, and the
+    nightly sweep is not handed a board that cannot answer.
     """
-    enabled = []
+    enabled, dead = [], []
     with db() as con:
         rows = [dict(r) for r in con.execute(
-            "SELECT DISTINCT b.id, b.platform, b.token, co.name "
+            "SELECT DISTINCT b.id, b.platform, b.token, b.api_url, co.name "
             "  FROM scan_board b "
             "  JOIN company co ON lower(co.ats_token) = lower(b.token) "
             "  JOIN posting p ON p.company_id = co.id "
             "  JOIN application a ON a.posting_id = p.id "
-            " WHERE b.enabled = 0")]
-        for r in rows:
-            con.execute("UPDATE scan_board SET enabled=1, note=? WHERE id=?",
-                        (f"enabled {now()[:10]}: he applied at this company, which is "
-                         f"stronger evidence than the forward that enables a board via "
-                         f"inbox_url. Was dark since import.", r["id"]))
+            " WHERE b.enabled = 0 "
+            # ⚠️ Never re-probe one already proven dead. Without this the job retries the
+            # same 404 every ten minutes, forever, against somebody else's infrastructure.
+            "   AND COALESCE(b.note,'') NOT LIKE '%did not answer a probe%'")]
+    for r in rows:
+        why = "returned no list of postings"
+        try:
+            got = _board_reqs(r["platform"], r["api_url"])
+            alive = isinstance(got, list)
+        except Exception as e:                                # noqa: BLE001
+            alive, why = False, f"{type(e).__name__}"
+        if alive:
+            with db() as con:
+                con.execute("UPDATE scan_board SET enabled=1, note=? WHERE id=?",
+                            (f"enabled {now()[:10]}: he applied at this company, which is "
+                             f"stronger evidence than the forward that enables a board via "
+                             f"inbox_url. Probed live first: {len(got)} posting(s).", r["id"]))
             enabled.append(f"{r['platform']}|{r['token']}")
+        else:
+            with db() as con:
+                con.execute("UPDATE scan_board SET note=? WHERE id=?",
+                            (f"{now()[:10]}: he applied at this company but this board "
+                             f"did not answer a probe ({why}). Left disabled. The token or "
+                             f"the platform is wrong; the real board is recorded elsewhere "
+                             f"or is not yet known.", r["id"]))
+            dead.append(f"{r['platform']}|{r['token']}")
+    if dead:
+        audit("board_probe_dead",
+              f"{len(dead)} applied-to board(s) did not answer: {', '.join(dead[:6])}")
     return enabled
 
 
@@ -6624,7 +6660,7 @@ def job_jev_level() -> str:
             got = _JEV.read_posting(r["description"])
         except _JEV.JevError as e:                            # noqa: PERF203
             failed += 1
-            log(f"jev level id={r['id']}: {e}")
+            audit("jev_level_error", f"id={r['id']}: {e}")
             continue
         tokens += got["tokens"]
         tally[got["level"]] = tally.get(got["level"], 0) + 1
@@ -6716,7 +6752,7 @@ def job_jev_remote() -> str:
             got = _JEV.read_arrangement(r["title"], r["location"], r["description"], origin)
         except _JEV.JevError as e:                            # noqa: PERF203
             failed += 1
-            log(f"jev remote id={r['id']}: {e}")
+            audit("jev_remote_error", f"id={r['id']}: {e}")
             continue
         tokens += got["tokens"]
         tally[got["arrangement"]] = tally.get(got["arrangement"], 0) + 1
