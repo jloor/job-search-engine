@@ -2844,6 +2844,48 @@ def _floor_release(con, app_id) -> None:
                 (len(ids), _json.dumps(ids), now()))
 
 
+def enable_boards_for_applied_companies() -> list[str]:
+    """Turn on the board of any company he has actually applied to. Returns what it enabled.
+
+    🚨 THE ONE-WAY DOOR THIS CLOSES. `inbox_register_board` enables a board when he MAILS IN a
+    posting, on the reasoning that a forward is strong evidence. Nothing did the same when he
+    APPLIED, which is stronger evidence still: a forward is interest, an application is a
+    decision. So a company could be bulk-imported disabled, applied to, ghosted, put on watch,
+    and its board still never swept.
+
+    ⚠️ MEASURED 2026-09-21, AND THE NAMES ARE WHY THIS MATTERS. Nine boards were dark at
+    companies with a real application on file: Anthropic, Phreesia (the boomerang at his
+    former employer), Cognition, Deepgram, Cortex, Snapdocs on two platforms, Leap and Simon
+    Data. Every one arrived from the aggregator import as enabled=0 and was never turned on.
+    ⭐ The ghosting rule puts a company on WATCH when a requisition dies, so the next opening
+    is caught. A dark board cannot watch anything, so the watch was silently inert at exactly
+    the companies he had chosen.
+
+    📌 SET-BASED ON PURPOSE, NOT A HOOK ON ONE WRITE. Applications reach the database from
+    job_track, from the tracker importer and by hand. Hooking the job_track path would have
+    fixed one of three routes and looked complete.
+
+    ⚠️ It never DISABLES anything. enabled=0 elsewhere is a deliberate policy (a Fantastic
+    match is weaker evidence than a forward) and this is not entitled to overrule it.
+    """
+    enabled = []
+    with db() as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT DISTINCT b.id, b.platform, b.token, co.name "
+            "  FROM scan_board b "
+            "  JOIN company co ON lower(co.ats_token) = lower(b.token) "
+            "  JOIN posting p ON p.company_id = co.id "
+            "  JOIN application a ON a.posting_id = p.id "
+            " WHERE b.enabled = 0")]
+        for r in rows:
+            con.execute("UPDATE scan_board SET enabled=1, note=? WHERE id=?",
+                        (f"enabled {now()[:10]}: he applied at this company, which is "
+                         f"stronger evidence than the forward that enables a board via "
+                         f"inbox_url. Was dark since import.", r["id"]))
+            enabled.append(f"{r['platform']}|{r['token']}")
+    return enabled
+
+
 def job_track() -> str:
     """Move an application on inbound mail: draft to submitted, or open to rejected."""
     if not TRACK_ENABLED:
@@ -3095,6 +3137,11 @@ def job_track() -> str:
         note += f"; UPGRADED {len(upgraded)}: " + "; ".join(upgraded)
     if skipped:
         note += f"; AMBIGUOUS {len(skipped)}: " + "; ".join(skipped)
+    # ⭐ Runs on EVERY pass, not only when something moved. A board can be dark because of an
+    # application recorded months ago by a route this job never touched.
+    lit = enable_boards_for_applied_companies()
+    if lit:
+        note += f"; LIT {len(lit)} dark board(s): " + ", ".join(lit[:6])
     return note
 
 

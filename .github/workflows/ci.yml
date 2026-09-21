@@ -67,6 +67,11 @@ jobs:
       # read as 'onsite'. Guards that the arrangement reader never writes
       # that column, and that the criteria keep their measured wording.
       - run: python3 tests/test_jev_remote.py
+      # Added 2026-09-21: a board could be dark at a company he had APPLIED
+      # to. inbox_url lights a board on a forward; nothing lit one on an
+      # application, which is stronger evidence. Nine were dark, including
+      # Anthropic and Phreesia. Guards that it never lights an unrelated one.
+      - run: python3 tests/test_board_enable.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #
