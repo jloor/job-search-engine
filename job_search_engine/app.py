@@ -490,6 +490,23 @@ MIGRATIONS = [
     "ALTER TABLE scan_candidate ADD COLUMN live_status TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN live_evidence TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN live_checked_at TEXT",
+    # 🚨 2026-09-20. THE SCORE CANNOT SEE SENIORITY, AND 363 ROWS SAY SO. Measured that day
+    # over the live queue: the mean keyword score was 80.8 for entry-level postings, 80.0 for
+    # mid, 79.6 for senior and 76.0 for lead. Flat, with a slight tilt TOWARD entry. Of the
+    # fifty highest-scoring rows, thirty were entry level and four were senior, and 46% of the
+    # whole live queue was entry. That is the measured cause of 130 support applications and
+    # one interview, and no gate or floor change touches it, because the ranking itself is
+    # blind to level.
+    # ⚠️ THESE ARE A SECOND OPINION, NOT A GATE. `job_jev_level` writes them and they are read
+    # where rows are OFFERED, exactly like live_status. The score, the verdict and the comp
+    # stay as they were, so a wrong reading hides a row rather than destroying its evidence.
+    # 📌 `jev_level_conf` is calibrated ACROSS GROUPS, never per answer. It routes a review
+    # queue. It does not authorise anything. Same rule as `message.classification`.
+    "ALTER TABLE scan_candidate ADD COLUMN jev_level TEXT",
+    "ALTER TABLE scan_candidate ADD COLUMN jev_level_conf REAL",
+    "ALTER TABLE scan_candidate ADD COLUMN jev_min_years INTEGER",
+    "ALTER TABLE scan_candidate ADD COLUMN jev_degree_hard REAL",
+    "ALTER TABLE scan_candidate ADD COLUMN jev_checked_at TEXT",
     # ⭐ 2026-08-23. WHO SAID THE STATUS IS WHAT IT IS. job_track moves a row on a real
     # confirmation at the per-company alias, which is strong evidence. A human saying "I clicked
     # submit" is weaker but it is the only evidence available when an employer sends no
@@ -5908,6 +5925,23 @@ VERIFY_PACE      = float(os.environ.get("VERIFY_PACE", "1.0"))
 QVERIFY_EVERY_MIN = int(os.environ.get("QVERIFY_EVERY_MIN", "47"))
 QVERIFY_BATCH     = int(os.environ.get("QVERIFY_BATCH", "18"))
 QVERIFY_MIN_SCORE = int(os.environ.get("QVERIFY_MIN_SCORE", "70"))
+
+# ---- Jev seniority reading. See jev.py for what the model is and what it cannot do. ----
+JEV_EVERY_MIN  = int(os.environ.get("JEV_EVERY_MIN", "41"))
+# ⭐ A BIGGER BATCH THAN ANY OTHER JOB, BECAUSE THE COST IS NOT THE CONSTRAINT. One posting
+# costs about 1,417 input tokens, which is $0.0000595. The whole 363-row live queue read for
+# $0.0216. The rate limit is 1,200 requests a minute, so 60 rows every 41 minutes is a crawl
+# against it and exists only to keep one job from monopolising the scheduler thread.
+JEV_BATCH      = int(os.environ.get("JEV_BATCH", "60"))
+JEV_MIN_SCORE  = int(os.environ.get("JEV_MIN_SCORE", "70"))
+# ⚠️ A POSTING'S LEVEL DOES NOT DRIFT. Unlike liveness, the answer is a property of the text,
+# so a row is read once and left alone. The re-read window exists only so a changed posting
+# (`date_modified` moves) or a reworded question can be picked up deliberately.
+JEV_STALE_DAYS = int(os.environ.get("JEV_STALE_DAYS", "90"))
+# 🚨 THE SHORTLIST DOES NOT FILTER ON THIS YET, AND THAT IS THE POINT OF THE FLAG. Writing the
+# columns is safe and reversible. Acting on them changes what the operator is shown, so it is a
+# second, separate decision made after the numbers have been read against real outcomes.
+JEV_GATE_LEVELS = [s for s in os.environ.get("JEV_GATE_LEVELS", "").split(",") if s.strip()]
 # Longer than VERIFY_STALE_HRS on purpose. A queue row carries no package and no application,
 # so a day-old reading is enough to stop a wasted hour, and three days keeps the request count
 # honest against boards that owe this system nothing.
@@ -6326,6 +6360,90 @@ def record_interaction(con, application_id: int, kind: str, at: str, summary: st
         (application_id, contact_id, message_id, kind, at, (summary or "")[:600],
          artifacts or "", dedupe_key))
     return True
+
+
+def job_jev_level() -> str:
+    """Ask Jev what seniority each queue posting is written for, and record the answer.
+
+    🚨 THE PROBLEM IT SOLVES, MEASURED BEFORE IT WAS BUILT. On 2026-09-20 all 363 live,
+    unworked, scored rows were read. 46% were entry level. The keyword score turned out to
+    carry no level signal at all: 80.8 mean for entry, 80.0 for mid, 79.6 for senior, 76.0
+    for lead. Of the fifty highest-scoring rows, THIRTY were entry level and four senior.
+    The operator has twenty years of experience, and the top of his own queue was mostly
+    jobs beneath him. 130 support applications had produced one interview.
+
+    ⭐ WHY A MODEL AND NOT A REGEX, WHICH WAS TRIED FIRST. `TARGET_TITLE` is a recall filter
+    whose own pattern contains "support", and title text alone cannot separate "Technical
+    Support Engineer I" from "Senior Technical Support Engineer" reliably enough to gate on:
+    the level lives in the requirement list as often as in the title. Jev reads the posting
+    body and answers a typed question about it. It costs $0.0000595 a posting, about an
+    eleventh of what `job_triage` already pays per posting, and answers something triage
+    never answered.
+
+    ⚠️ IT WRITES FIVE COLUMNS AND NOTHING ELSE, and none of them gate anything today. The
+    score, the verdict, the comp and the liveness are untouched. Reading the columns is a
+    separate, later decision (`JEV_GATE_LEVELS`), made after the numbers have been checked
+    against real application outcomes rather than against my own expectations.
+
+    📌 A FAILED CALL WRITES NOTHING. Not a NULL, not a default, not 'unknown'. A row that
+    was never successfully read must be indistinguishable from a row not yet reached, or the
+    next run skips it forever and the gap is invisible.
+    """
+    # ⚠️ Imported here, not at module scope, because the engine's modules import each other
+    # by bare name off sys.path and every other sibling in this file does the same.
+    import jev as _JEV
+
+    if not _JEV.enabled():
+        return "jev disabled (set JEV_ENABLED=1 and JEV_API_KEY)"
+
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(days=JEV_STALE_DAYS)).isoformat(timespec="seconds")
+    with db() as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT c.id, c.title, c.description "
+            "  FROM scan_candidate c "
+            " WHERE c.triaged = 1 AND cast(c.score as int) >= ? "
+            "   AND c.verdict NOT IN ('out_of_scope','duplicate','error') "
+            "   AND COALESCE(c.live_status,'') <> 'dead' "
+            # No body, no question worth asking. A title alone is exactly the signal that
+            # was already proved insufficient, so asking about it would manufacture
+            # confidence rather than measure anything.
+            "   AND c.description IS NOT NULL AND length(c.description) > 200 "
+            "   AND NOT EXISTS (SELECT 1 FROM posting p WHERE p.canonical_url = c.url) "
+            "   AND NOT EXISTS (SELECT 1 FROM role_passed rp WHERE rp.url = c.url) "
+            "   AND (c.jev_checked_at IS NULL OR c.jev_checked_at < ?) "
+            # Never-read rows first, then the best row. Unlike liveness there is no decay to
+            # chase, so the ordering exists to put the operator's likeliest next application
+            # in front of the question soonest.
+            " ORDER BY c.jev_checked_at IS NOT NULL, cast(c.score as int) DESC "
+            " LIMIT ?",
+            (JEV_MIN_SCORE, cutoff, JEV_BATCH))]
+
+    if not rows:
+        return "jev level: nothing to read"
+
+    stamp = now()
+    tally, tokens, failed = {}, 0, 0
+    for r in rows:
+        try:
+            got = _JEV.read_posting(r["description"])
+        except _JEV.JevError as e:                            # noqa: PERF203
+            failed += 1
+            log(f"jev level id={r['id']}: {e}")
+            continue
+        tokens += got["tokens"]
+        tally[got["level"]] = tally.get(got["level"], 0) + 1
+        with db() as con:
+            con.execute(
+                "UPDATE scan_candidate SET jev_level=?, jev_level_conf=?, jev_min_years=?, "
+                "jev_degree_hard=?, jev_checked_at=? WHERE id=?",
+                (got["level"], got["level_conf"], got["min_years"],
+                 got["degree_hard"], stamp, r["id"]))
+
+    spread = " ".join(f"{k}={v}" for k, v in sorted(tally.items()))
+    return (f"jev level: read {len(rows) - failed} of {len(rows)} | {spread or 'none'} | "
+            f"{tokens:,} tokens ${_JEV.cost_usd(tokens):.4f}"
+            + (f" | {failed} failed" if failed else ""))
 
 
 def job_interactions() -> str:
@@ -8510,6 +8628,11 @@ def job_table() -> list:
             # only the scored, gated, not-yet-applied top of the queue, so a lead that died
             # since the sweep stops being offered as work. See job_verify_queue.
             ("verify_queue", QVERIFY_EVERY_MIN * 60, job_verify_queue),
+            # ⭐ AFTER triage and AFTER verify_queue, and both orderings are load-bearing.
+            # It reads `description`, which triage is what populates, and it skips rows already
+            # known dead, so asking a paid question about a vanished requisition never happens.
+            # Its own interval is prime and unshared so it does not land beside them.
+            ("jev_level", JEV_EVERY_MIN * 60, job_jev_level),
             # Cheap and database-only. It reads resolved mail and writes timeline rows; it
             # makes no network call and cannot see outbound mail, which arrives by hand.
             ("interactions", INTERACTIONS_EVERY_MIN * 60, job_interactions),

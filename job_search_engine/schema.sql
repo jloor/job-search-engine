@@ -198,6 +198,18 @@ CREATE TABLE IF NOT EXISTS scan_candidate (
   live_status       TEXT,                       -- live | dead | unknown
   live_evidence     TEXT,
   live_checked_at   TEXT,
+  -- 🚨 SENIORITY, which nothing else in this table could see. Measured 2026-09-20 across 363
+  -- live rows: the mean keyword score was 80.8 for entry, 80.0 for mid, 79.6 for senior and
+  -- 76.0 for lead. The score is blind to level, and 46% of the live queue was entry level.
+  -- ⚠️ A SECOND OPINION, NOT A GATE. Written by job_jev_level and read where rows are
+  -- OFFERED. The score, the verdict and the comp are never touched by it.
+  -- 📌 jev_level_conf is calibrated ACROSS GROUPS, never per answer. It routes a review
+  -- queue; it authorises nothing.
+  jev_level         TEXT,                       -- entry | mid | senior | lead
+  jev_level_conf    REAL,                       -- 0..1, calibrated across groups
+  jev_min_years     INTEGER,                    -- 0:none/0-2  1:3-5  2:5-8  3:8+
+  jev_degree_hard   REAL,                       -- 0..1, degree required with no equivalence
+  jev_checked_at    TEXT,
   date_modified     TEXT,
   modified_fields   TEXT                       -- JSON array, verbatim from the feed
 );

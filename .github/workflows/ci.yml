@@ -35,6 +35,22 @@ jobs:
       - run: python3 tests/test_harvest_chunk.py
       # Added 2026-09-15: the morning report is a shortlist, not a raw list.
       - run: python3 tests/test_shortlist.py
+      # 🚨 THE SAME OMISSION AS test_posting_age.py, AND IT HAPPENED AGAIN.
+      # These four were written 2026-09-18/19 alongside the liveness and comp
+      # work and were never added to this list, so they had never run on a
+      # push. A test that is not listed here does not exist. Audited
+      # 2026-09-20 by diffing tests/*.py against this file. Do that diff when
+      # adding any test, because writing one is not the step that gets missed.
+      - run: python3 tests/test_queue_liveness.py
+      - run: python3 tests/test_render_liveness.py
+      - run: python3 tests/test_comp_unpriced.py
+      - run: python3 tests/test_queue_band_filter.py
+      # Added 2026-09-20 with the Jev seniority reading. The score could not
+      # see level: 46% of the live queue was entry level and the mean keyword
+      # score was flat across every level. Guards the Choice and Score
+      # criteria shapes, which are not interchangeable and return 422 when
+      # swapped, and guards that the API key never reaches an error message.
+      - run: python3 tests/test_jev.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #
