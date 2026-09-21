@@ -8413,6 +8413,28 @@ FANTASTIC_JB_ARRANGEMENT = os.environ.get(
 # one person's commute, and a different origin needs a different list.
 FANTASTIC_JB_LOCAL_ARRANGEMENT = os.environ.get(
     "FANTASTIC_JB_LOCAL_ARRANGEMENT", "On-site,Hybrid")
+# 🚨 24h, NOT THE 1h THE SHARED HELPER DEFAULTS TO. The first real run of this job returned
+# ZERO rows from thirteen passes and spent zero credits, because _F.params falls back to
+# time_frame=1h and LinkedIn genuinely has nothing in an hour. Measured the same minute:
+# 1h returned 0, 24h returned 5, 7d returned 179. A 1h default is right for a feed polled
+# hourly and wrong for one that is scheduled OFF and run by hand at unpredictable intervals.
+# ⚠️ THE API ACCEPTS ONLY 1h, 24h, 7d, 6m. There is nothing between a week and six months,
+# so the backfill window is a different order of magnitude rather than a wider interval.
+FANTASTIC_JB_WINDOW = os.environ.get("FANTASTIC_JB_WINDOW", "24h")
+# ⭐ WHICH PASSES RUN. Exists so the 6m backfill can be LOCAL ONLY. The national remote
+# backlog over six months is both larger and far more perishable than the commutable one,
+# and a six-month-old local posting is at least checkable against a real board. Backfilling
+# both at once would spend thousands of credits on rows the liveness sweep would then find
+# dead. Set to "local" for the backfill, then back to the default.
+FANTASTIC_JB_PASSES = [x.strip().lower() for x in
+                       os.environ.get("FANTASTIC_JB_PASSES", "national,local").split(",")
+                       if x.strip()]
+# 📌 6m IS A ONE-TIME BACKFILL AND MUST NEVER BE A SCHEDULE. It re-bills the same historical
+# rows on every run, which is the trap _fantastic_too_soon exists to prevent, and six months
+# of LinkedIn is mostly dead: the liveness sweep already measured 42% of the scored queue
+# gone. Set FANTASTIC_JB_WINDOW=6m for a single deliberate run, then put it back.
+# ⚠️ 6m is REJECTED outright when a description filter is present ("Description search is
+# not available for time_frame=6m"), so the interface-engine query cannot use it at all.
 
 
 def _fantastic_cfg() -> dict:
@@ -8849,6 +8871,7 @@ def job_fantastic_jb() -> str:
     base = dict(cfg.get("shared") or {})
     # 🚨 THE REMOTE FILTER IS FORCED HERE, not left to the config. A config that forgets it
     # costs 7x on every run, and the failure is invisible: more rows look like more value.
+    base.setdefault("time_frame", FANTASTIC_JB_WINDOW)
     passes = [("national", {**base, "ai_work_arrangement": FANTASTIC_JB_ARRANGEMENT})]
     # ⭐ One local pass PER STATE, because the vendor's location filter takes one place.
     try:
@@ -8865,6 +8888,11 @@ def job_fantastic_jb() -> str:
     notes, remaining, new_ids = [], None, []
     known = _fantastic_known()
 
+    # ⚠️ Filtered by NAME PREFIX, so "local" selects local:NY, local:NJ and the rest.
+    passes = [(n, sh) for n, sh in passes
+              if n.split(":")[0] in FANTASTIC_JB_PASSES]
+    if not passes:
+        return f"fantastic_jb: no pass selected (FANTASTIC_JB_PASSES={FANTASTIC_JB_PASSES})"
     for pass_name, shared in passes:
         for q in queries:
           q = dict(q)
