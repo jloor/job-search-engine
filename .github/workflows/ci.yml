@@ -56,6 +56,11 @@ jobs:
       # and the container and the laptop held two different keys while the
       # secret-agreement check reported agreement it had never verified.
       - run: python3 tests/test_ai_key_purpose.py
+      # Added 2026-09-21: job_comp and job_remote_check read their usage into
+      # `_u` and dropped it, so 126 pay bands and 844 model-judged locations
+      # had no token record and the database's account of spend was a census
+      # of the jobs that happened to record themselves.
+      - run: python3 tests/test_ai_spend.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #

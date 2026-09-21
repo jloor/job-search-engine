@@ -818,3 +818,17 @@ CREATE TABLE IF NOT EXISTS role_passed (
   passed_by    TEXT NOT NULL DEFAULT 'human'
 );
 
+-- Every paid model call, by purpose. Written by note_spend() inside _read_openai_compat.
+-- 🚨 It exists because job_comp and job_remote_check discarded their usage for months, so
+-- the database's account of spend was a census of the jobs that happened to record it.
+CREATE TABLE IF NOT EXISTS ai_spend (
+         id            INTEGER PRIMARY KEY,
+         at            TEXT NOT NULL,
+         purpose       TEXT NOT NULL,      -- TRIAGE | MAIL | MATCH | COMP | REMOTE | GATE_AUDIT | SHARED
+         key_name      TEXT NOT NULL,      -- the VARIABLE that paid, never the key itself
+         model         TEXT,
+         input_tokens  INTEGER NOT NULL DEFAULT 0,
+         output_tokens INTEGER NOT NULL DEFAULT 0,
+         cache_read    INTEGER NOT NULL DEFAULT 0
+       );
+CREATE INDEX IF NOT EXISTS idx_ai_spend_purpose ON ai_spend(purpose, at DESC);

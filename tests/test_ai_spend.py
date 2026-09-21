@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Two jobs spent money and recorded nothing, so the database's account of cost was false.
+
+🚨 WHAT WAS WRONG, FOUND 2026-09-21. job_comp and job_remote_check both read their usage
+into a variable named `_u` and dropped it. 126 pay bands and 844 locations had been judged
+by the model with no token record anywhere.
+
+⚠️ THE DAMAGE WAS NOT THE MISSING ROWS, IT WAS THE CONFIDENT WRONG ANSWER. When the shared
+key hit its cap, "what spent it?" was answered from the database as triage 96%, mail 2.5%,
+audits 1.0%. That was a census of the three jobs that happened to record themselves. The two
+silent ones were not a small slice of the total; they were absent from it, and the total was
+presented as complete.
+
+⭐ SO THE LEDGER SITS WHERE THE SPENDING HAPPENS. note_spend() is called inside
+_read_openai_compat, not at the six call sites, so a new caller cannot forget and a caller
+that drops the returned usage is still counted.
+
+Run:  python3 tests/test_ai_spend.py
+"""
+import json
+import os
+import pathlib
+import sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import test_parse                                             # noqa: E402
+
+relay = test_parse.load_app()
+SRC = (HERE.parent / "job_search_engine" / "app.py").read_text()
+SCHEMA = (HERE.parent / "job_search_engine" / "schema.sql").read_text()
+fails = []
+
+
+def check(label, got, want=True):
+    ok = bool(got) == bool(want)
+    print(f"  {'ok  ' if ok else 'FAIL'}  {label}")
+    if not ok:
+        fails.append(label)
+
+
+print("the ledger is declared and migrated:")
+check("schema.sql declares ai_spend", "CREATE TABLE IF NOT EXISTS ai_spend" in SCHEMA)
+check("a migration creates it too", SRC.count("CREATE TABLE IF NOT EXISTS ai_spend") >= 1)
+check("it is indexed by purpose", "idx_ai_spend_purpose" in SCHEMA)
+
+print("\nthe recording happens where the SPENDING happens, not at the call sites:")
+spend_fn = SRC.split("def _read_openai_compat", 1)[1].split("\ndef ", 1)[0]
+check("_read_openai_compat calls note_spend", "note_spend(purpose, usage)" in spend_fn)
+check("...and still returns the usage to its caller", "return text, usage" in spend_fn)
+# Exactly one place CALLS it: the definition and a comment also mention the name, so count
+# the call form rather than the bare name. If a second call site ever appears, the recording
+# has drifted back out to the callers and the guarantee is gone.
+check("exactly one call site, inside the spending function",
+      SRC.count("    note_spend(purpose, usage)") == 1
+      and SRC.count("note_spend(") == 3)
+
+print("\nit records the VARIABLE that paid, never a key value:")
+note_fn = SRC.split("def note_spend", 1)[1].split("\ndef ", 1)[0]
+check("key_name comes from ai_key_name", "ai_key_name(purpose)" in note_fn)
+check("no os.environ lookup of a key value", "os.environ[" not in note_fn)
+check("bookkeeping cannot raise", "except Exception:" in note_fn and "pass" in note_fn)
+
+print("\nbehaviour, against a real temporary database:")
+import tempfile                                               # noqa: E402
+_d = tempfile.mkdtemp()
+_old_db, _old_key = os.environ.get("DB_PATH"), os.environ.get("AI_API_KEY")
+try:
+    os.environ["DB_PATH"] = str(pathlib.Path(_d) / "t.db")
+    relay.DB_PATH = os.environ["DB_PATH"]
+    os.environ["AI_API_KEY"] = "shared"
+    os.environ["AI_API_KEY_COMP"] = "comp-key"
+    relay.init_db()
+
+    relay.note_spend("COMP", {"input_tokens": 1200, "output_tokens": 30,
+                              "cache_read": 0, "model": "m1"})
+    relay.note_spend("REMOTE", {"input_tokens": 800, "output_tokens": 20,
+                                "cache_read": 5, "model": "m1"})
+    relay.note_spend("", {"input_tokens": 10, "output_tokens": 1,
+                          "cache_read": 0, "model": "m1"})
+    with relay.db() as con:
+        rows = {r["purpose"]: dict(r) for r in con.execute(
+            "SELECT purpose, key_name, input_tokens, output_tokens FROM ai_spend")}
+    check("COMP was recorded", rows.get("COMP", {}).get("input_tokens") == 1200)
+    check("REMOTE was recorded", rows.get("REMOTE", {}).get("input_tokens") == 800)
+    check("COMP names its OWN key variable",
+          rows.get("COMP", {}).get("key_name") == "AI_API_KEY_COMP")
+    check("REMOTE names the shared one it actually used",
+          rows.get("REMOTE", {}).get("key_name") == "AI_API_KEY")
+    check("an unlabelled call is recorded as SHARED", "SHARED" in rows)
+
+    print("\n  a broken ledger must never discard a paid answer:")
+    _real = relay.db
+
+    def _boom(*a, **k):
+        raise RuntimeError("database gone")
+
+    relay.db = _boom
+    try:
+        relay.note_spend("COMP", {"input_tokens": 1, "output_tokens": 1})
+        check("note_spend swallowed a database failure", True)
+    except Exception:                                         # noqa: BLE001
+        check("note_spend swallowed a database failure", False)
+    finally:
+        relay.db = _real
+finally:
+    for k in ("AI_API_KEY_COMP",):
+        os.environ.pop(k, None)
+    if _old_db is None:
+        os.environ.pop("DB_PATH", None)
+    else:
+        os.environ["DB_PATH"] = _old_db
+    if _old_key is None:
+        os.environ.pop("AI_API_KEY", None)
+    else:
+        os.environ["AI_API_KEY"] = _old_key
+
+print("\nthe two jobs that used to discard usage now cannot:")
+for job in ("job_comp", "job_remote_check"):
+    body = SRC.split(f"def {job}", 1)[1].split("\ndef ", 1)[0]
+    # They may still name the variable `_u`; what matters is that the spend is recorded
+    # upstream of them now, so discarding the return value no longer loses the record.
+    check(f"{job} still calls through _read_openai_compat",
+          "_read_openai_compat(" in body)
+
+print()
+if fails:
+    print(f"FAILED: {len(fails)}")
+    for f in fails:
+        print("  -", f)
+    sys.exit(1)
+print("all checks passed")

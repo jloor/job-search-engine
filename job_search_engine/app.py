@@ -507,6 +507,26 @@ MIGRATIONS = [
     "ALTER TABLE scan_candidate ADD COLUMN jev_min_years INTEGER",
     "ALTER TABLE scan_candidate ADD COLUMN jev_degree_hard REAL",
     "ALTER TABLE scan_candidate ADD COLUMN jev_checked_at TEXT",
+    # 🚨 2026-09-21. job_comp AND job_remote_check SPENT MONEY AND RECORDED NOTHING. Both
+    # read their usage into `_u` and dropped it: 126 pay bands and 844 locations judged by
+    # the model with no token record anywhere. When the shared key hit its cap, the answer
+    # to "what spent it?" was assembled from the three jobs that DID record themselves and
+    # reported triage at 96%. The two silent ones were not a small slice of that total,
+    # they were absent from it.
+    # ⭐ Written by note_spend() inside _read_openai_compat, so the ledger sits where the
+    # spending happens and a caller that drops the usage is still counted.
+    # 📌 key_name records the VARIABLE that paid, never a key value.
+    """CREATE TABLE IF NOT EXISTS ai_spend (
+         id            INTEGER PRIMARY KEY,
+         at            TEXT NOT NULL,
+         purpose       TEXT NOT NULL,      -- TRIAGE | MAIL | MATCH | COMP | REMOTE | GATE_AUDIT | SHARED
+         key_name      TEXT NOT NULL,      -- the VARIABLE that paid, never the key itself
+         model         TEXT,
+         input_tokens  INTEGER NOT NULL DEFAULT 0,
+         output_tokens INTEGER NOT NULL DEFAULT 0,
+         cache_read    INTEGER NOT NULL DEFAULT 0
+       )""",
+    "CREATE INDEX IF NOT EXISTS idx_ai_spend_purpose ON ai_spend(purpose, at DESC)",
     # ⭐ 2026-08-23. WHO SAID THE STATUS IS WHAT IT IS. job_track moves a row on a real
     # confirmation at the per-company alias, which is strong evidence. A human saying "I clicked
     # submit" is weaker but it is the only evidence available when an employer sends no
@@ -1741,6 +1761,40 @@ def _read_anthropic(user: str, cache_system: bool,
 _AI_KEY_FALLBACKS = ("AI_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY")
 
 
+def note_spend(purpose: str, usage: dict) -> None:
+    """Record one paid call in the ai_spend ledger. Never raises.
+
+    🚨 TWO JOBS SPENT MONEY AND RECORDED NOTHING, FOR MONTHS. `job_comp` and
+    `job_remote_check` both read their usage into a variable named `_u` and dropped it.
+    Measured 2026-09-21: 126 pay bands and 844 locations had been judged by the model with
+    no token record anywhere. When the shared key hit its cap and the question became "what
+    spent it?", the answer assembled from the database said triage 96%, mail 2.5%, audits
+    1.0%. That was not the truth. It was a census of the three jobs that happened to record
+    themselves, and the two that did not were absent from the total rather than small in it.
+
+    ⭐ SO THE LEDGER LIVES WHERE THE SPENDING HAPPENS, NOT AT THE CALL SITES. Every paid
+    call goes through _read_openai_compat, so recording here means a new caller cannot
+    forget, and a caller that drops the returned usage is still counted.
+
+    ⚠️ IT MUST NEVER BREAK A CALL THAT ALREADY SUCCEEDED. The money is spent by the time
+    this runs. A failed bookkeeping write is worth a silent skip, never an exception that
+    discards a paid answer.
+
+    📌 The vendor is still the authority on the bill. This exists so the two disagree
+    loudly rather than leaving the database as the only, and wrong, account.
+    """
+    try:
+        with db() as con:
+            con.execute(
+                "INSERT INTO ai_spend(at, purpose, key_name, model, input_tokens, "
+                "output_tokens, cache_read) VALUES (?,?,?,?,?,?,?)",
+                (now(), (purpose or "SHARED").upper(), ai_key_name(purpose) or "NONE",
+                 usage.get("model") or AI_MODEL, int(usage.get("input_tokens") or 0),
+                 int(usage.get("output_tokens") or 0), int(usage.get("cache_read") or 0)))
+    except Exception:                                         # noqa: BLE001
+        pass
+
+
 def ai_key_name(purpose: str = "") -> str:
     """Which environment variable supplies the key for this purpose. Never the value.
 
@@ -1812,10 +1866,12 @@ def _read_openai_compat(user: str, system: str = "", schema: dict | None = None,
         raise RuntimeError(f"empty reply (finish_reason={choice.get('finish_reason')})")
     u = data.get("usage") or {}
     cached = ((u.get("prompt_tokens_details") or {}).get("cached_tokens")) or 0
-    return text, {"input_tokens": u.get("prompt_tokens", 0),
-                  "output_tokens": u.get("completion_tokens", 0),
-                  "cache_write": 0, "cache_read": cached,
-                  "model": data.get("model") or AI_MODEL}
+    usage = {"input_tokens": u.get("prompt_tokens", 0),
+             "output_tokens": u.get("completion_tokens", 0),
+             "cache_write": 0, "cache_read": cached,
+             "model": data.get("model") or AI_MODEL}
+    note_spend(purpose, usage)
+    return text, usage
 
 
 def reading_input_hash(subject: str, body: str) -> str:
