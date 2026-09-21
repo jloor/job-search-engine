@@ -3938,8 +3938,13 @@ On Wed, Aug 12, 2026 the candidate wrote:
         return ('{"results":[]}', {"input_tokens": 1, "output_tokens": 1,
                                    "cache_read": 0, "cache_write": 0, "model": "m"})
 
-    def _cap_openai(user, system="", schema=None, schema_name=""):
-        _sent.clear(); _sent.update(kind="openai", user=user, system=system)
+    # ⚠️ `purpose` IS CAPTURED, NOT JUST ACCEPTED. A stub that swallowed it with **kw would
+    # keep the suite green while every call site silently paid from the wrong key, which is
+    # the exact failure per-purpose keys exist to prevent. Recording it means a later test
+    # can assert which key a job bills.
+    def _cap_openai(user, system="", schema=None, schema_name="", purpose=""):
+        _sent.clear(); _sent.update(kind="openai", user=user, system=system,
+                                    purpose=purpose)
         return ('{"results":[]}', {"input_tokens": 1, "output_tokens": 1,
                                    "cache_read": 0, "cache_write": 0, "model": "m"})
 

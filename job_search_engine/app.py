@@ -1720,8 +1720,57 @@ def _read_anthropic(user: str, cache_system: bool,
                   "model": resp.model}
 
 
+# 🚨 ONE KEY PAID FOR EVERY JOB, AND THAT MADE THE BILL UNREADABLE. Measured 2026-09-21:
+# the single production key had spent its whole $5 cap, and answering "what spent it?"
+# needed a token count out of three different tables. The answer was triage at 96%
+# (16,067,581 input tokens), mail reading at 2.5% and form audits at 1.0%. The dashboard
+# could not say that, because every call arrived under the same key.
+#
+# ⚠️ WORSE, A SHARED CAP IS A SHARED OUTAGE. Triage exhausted the key, and mail reading
+# stopped with it, though mail had spent forty times less. 1,996 refused calls over six
+# days, during which the regex classifier ran alone. That classifier is already on record
+# for missing three real interview confirmations on wording.
+#
+# ⭐ PER-PURPOSE KEYS MAKE THE VENDOR DO THE ACCOUNTING. Set AI_API_KEY_TRIAGE and the
+# OpenRouter dashboard answers the cost question directly, with its own cap per function,
+# so an expensive job cannot starve a cheap one.
+#
+# 📌 THE FALLBACK IS THE WHOLE DESIGN. An unset per-purpose key resolves to the shared one,
+# so this changes nothing until a key is actually split out. No migration, no coordinated
+# deploy, and a purpose nobody has provisioned behaves exactly as it does today.
+_AI_KEY_FALLBACKS = ("AI_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY")
+
+
+def ai_key_name(purpose: str = "") -> str:
+    """Which environment variable supplies the key for this purpose. Never the value.
+
+    Returned so /diag/ai can report the mapping without exposing a secret, which is the
+    question that could not be answered when the two keys turned out to differ.
+    """
+    if purpose:
+        cand = f"AI_API_KEY_{purpose.strip().upper()}"
+        if os.environ.get(cand, "").strip():
+            return cand
+    for n in _AI_KEY_FALLBACKS:
+        if os.environ.get(n, "").strip():
+            return n
+    return ""
+
+
+def ai_key(purpose: str = "") -> str:
+    """The key for this purpose, falling back to the shared key when none is split out."""
+    name = ai_key_name(purpose)
+    if not name:
+        raise RuntimeError(
+            f"no API key set. Looked for AI_API_KEY_{purpose.strip().upper()} "
+            f"then {' / '.join(_AI_KEY_FALLBACKS)}" if purpose else
+            f"no API key set. Looked for {' / '.join(_AI_KEY_FALLBACKS)}")
+    return os.environ[name].strip()
+
+
 def _read_openai_compat(user: str, system: str = "", schema: dict | None = None,
-                        schema_name: str = "email_reading") -> tuple[str, dict]:
+                        schema_name: str = "email_reading",
+                        purpose: str = "") -> tuple[str, dict]:
     """
     Any /chat/completions endpoint: OpenAI direct, OpenRouter, or anything else that
     speaks the shape. Raw HTTP on purpose. The relay already talks Hrana and Bunny
@@ -1733,11 +1782,7 @@ def _read_openai_compat(user: str, system: str = "", schema: dict | None = None,
     """
     import urllib.error, urllib.request
 
-    key = (os.environ.get("AI_API_KEY")
-           or os.environ.get("OPENAI_API_KEY")
-           or os.environ.get("OPENROUTER_API_KEY") or "").strip()
-    if not key:
-        raise RuntimeError("no AI_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY set")
+    key = ai_key(purpose)
 
     payload = {
         "model": AI_MODEL,
@@ -1810,7 +1855,7 @@ def ai_read_message(subject: str, body: str, to_alias: str = "",
     if AI_PROVIDER == "anthropic":
         text, usage = _read_anthropic(user, cache_system)
     elif AI_PROVIDER == "openai_compat":
-        text, usage = _read_openai_compat(user)
+        text, usage = _read_openai_compat(user, purpose="MAIL")
     else:
         raise RuntimeError(f"unknown AI_PROVIDER {AI_PROVIDER!r}")
 
@@ -1908,7 +1953,8 @@ def ai_match_application(msg, candidates) -> dict:
     if AI_PROVIDER == "anthropic":
         text, usage = _read_anthropic(user, False, MATCH_SYSTEM, MATCH_SCHEMA)
     elif AI_PROVIDER == "openai_compat":
-        text, usage = _read_openai_compat(user, MATCH_SYSTEM, MATCH_SCHEMA)
+        text, usage = _read_openai_compat(user, MATCH_SYSTEM, MATCH_SCHEMA,
+                                          purpose="MATCH")
     else:
         raise RuntimeError(f"unknown AI_PROVIDER {AI_PROVIDER!r}")
     t = text.strip()
@@ -4524,7 +4570,8 @@ def ai_triage_batch(cands: list, profile: str, vocab: list) -> list:
         # 302-token average above. If it has not moved, the prefix is not being reused and
         # the answer is the pacing of the triage job, not another prompt edit.
         text, usage = _read_openai_compat(user, TRIAGE_SYSTEM + "\n\n" + reference,
-                                          triage_schema_for("openai_compat"), "job_triage")
+                                          triage_schema_for("openai_compat"), "job_triage",
+                                          purpose="TRIAGE")
     else:
         raise RuntimeError(f"unknown AI_PROVIDER {AI_PROVIDER!r}")
 
@@ -5054,7 +5101,8 @@ def job_remote_check() -> str:
         _pace(_rpm())
         try:
             text, _u = _read_openai_compat(json.dumps(payload), sysmsg,
-                                           REMOTE_SCHEMA, "remote")
+                                           REMOTE_SCHEMA, "remote",
+                                           purpose="REMOTE")
             got = json.JSONDecoder().raw_decode(text[text.index("{"):])[0]["results"]
         except Exception as e:                                # noqa: BLE001
             audit("remote_check_error", detail=f"{type(e).__name__}: {e}"[:200])
@@ -5299,7 +5347,8 @@ def job_comp() -> str:
         _pace(_rpm())
         try:
             text, _u = _read_openai_compat(json.dumps(payload), COMP_SYSTEM,
-                                           COMP_SCHEMA, "comp")
+                                           COMP_SCHEMA, "comp",
+                                           purpose="COMP")
             got = json.JSONDecoder().raw_decode(text[text.index("{"):])[0]["results"]
         except Exception as e:                                # noqa: BLE001
             audit("comp_error", detail=f"{type(e).__name__}: {e}"[:200])
@@ -7414,7 +7463,8 @@ def job_gate_audit() -> str:
                 # the model would have been asked to audit with NO instructions.
                 text, usage = _read_openai_compat(user, system=_GATE_AUDIT_SYSTEM,
                                                   schema=_GATE_AUDIT_SCHEMA,
-                                                  schema_name="gate_audit")
+                                                  schema_name="gate_audit",
+                                                  purpose="GATE_AUDIT")
             s = text.strip()
             if s.startswith("```"):
                 s = s.split("\n", 1)[-1].rsplit("```", 1)[0]
@@ -9015,6 +9065,15 @@ def diag_ai(request: Request, authorization: str | None = Header(None), live: bo
                  "read_enabled": AI_READ_ENABLED,
                  "key_names_checked": list(need), "key_present": bool(have),
                  "live_called": False}
+    # ⭐ WHICH KEY PAYS FOR WHAT, BY NAME AND NEVER BY VALUE. On 2026-09-21 the container
+    # and the laptop turned out to hold two DIFFERENT OpenRouter keys with different caps,
+    # and nothing could say so: the e2e secret check compares by variable NAME, and these
+    # were named AI_API_KEY and OPENROUTER_API_KEY. It reported an agreement it had never
+    # verified. This answers "which key does triage spend?" without exposing one.
+    if AI_PROVIDER == "openai_compat":
+        out["key_by_purpose"] = {
+            p: (ai_key_name(p) or "NONE")
+            for p in ("TRIAGE", "MAIL", "MATCH", "COMP", "REMOTE", "GATE_AUDIT")}
     if not have:
         out["result"] = "NO KEY CONFIGURED — every AI job will decline and report 'skipped'"
         return out

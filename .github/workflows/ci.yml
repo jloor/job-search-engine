@@ -51,6 +51,11 @@ jobs:
       # criteria shapes, which are not interchangeable and return 422 when
       # swapped, and guards that the API key never reaches an error message.
       - run: python3 tests/test_jev.py
+      # Added 2026-09-21: one key paid for every job, so a $5 cap exhausted by
+      # triage (96% of spend) also stopped mail reading (2.5%) for six days,
+      # and the container and the laptop held two different keys while the
+      # secret-agreement check reported agreement it had never verified.
+      - run: python3 tests/test_ai_key_purpose.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #
