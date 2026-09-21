@@ -210,6 +210,17 @@ CREATE TABLE IF NOT EXISTS scan_candidate (
   jev_min_years     INTEGER,                    -- 0:none/0-2  1:3-5  2:5-8  3:8+
   jev_degree_hard   REAL,                       -- 0..1, degree required with no equivalence
   jev_checked_at    TEXT,
+  -- 🚨 HOW THE WORK IS ARRANGED, KEPT APART FROM WHETHER HE CAN REACH IT. remote_verdict
+  -- carries both: the model writes the arrangement and the commute router overwrites it
+  -- with reachability, spending 'onsite' to mean "145 minutes away". Two Collingswood NJ
+  -- postings that say "This is a hybrid role" and carry #LI-HYBRID read as 'onsite' there.
+  -- ⚠️ Written by job_jev_remote, which NEVER touches remote_verdict. The router stays
+  -- authoritative on reachability, because a measured 145 minutes beats any model.
+  -- 📌 Nothing gates on these. A readable second opinion beside the verdict.
+  work_arrangement      TEXT,     -- fully_remote|remote_in_metro|remote_with_residency|
+                                  -- hybrid|onsite|unclear
+  work_arrangement_conf REAL,     -- 0..1, calibrated across groups
+  work_arrangement_at   TEXT,
   date_modified     TEXT,
   modified_fields   TEXT                       -- JSON array, verbatim from the feed
 );

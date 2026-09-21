@@ -218,3 +218,80 @@ def read_posting(description: str) -> dict:
     deg, _ = answer(res, "degree_hard")
     return {"level": lvl, "level_conf": conf, "min_years": yrs,
             "degree_hard": deg, "tokens": input_tokens(res)}
+
+
+# ---------------------------------------------------------------- work arrangement
+# 🚨 THIS DOES NOT WRITE remote_verdict, AND THAT IS THE WHOLE DESIGN. Measured 2026-09-21
+# over 94 rows the model had decided: `remote_verdict` carries TWO different meanings in one
+# column. The model writes "how is the work arranged" (hybrid, onsite, remote) and the
+# commute router OVERWRITES it with "can he reach it" (too far = onsite). Two postings in
+# Collingswood NJ say "This is a hybrid role" in their own words and carry #LI-HYBRID, and
+# the column reads `onsite`, because the router measured 145 minutes against a 90 minute
+# ceiling and said so in the only field it had.
+#
+# ⚠️ SO A MODEL THAT ANSWERS THE ARRANGEMENT QUESTION WILL LOOK WRONG ON THOSE ROWS, AND IT
+# IS NOT. Jev called all three of them hybrid and was marked as disagreeing. It was right.
+# The comparison was wrong because the column is overloaded.
+#
+# ⭐ Same rule the `place` table already enforces by keeping judged, address and measured in
+# separate columns: collapsing a guess and a measurement into one field makes the guess
+# indistinguishable from the fact, and the guess is the one that gets quoted later.
+#
+# 📌 THE CRITERIA BELOW ARE THE MEASURED ONES, NOT A FIRST DRAFT. An earlier wording defined
+# fully_remote as "anywhere in the country" and remote_with_residency as "residents of a
+# named country", so every "Remote - US" posting satisfied BOTH and the model correctly
+# chose the narrower one: 14 of 20 disagreed for that reason alone. Stating that a US-only
+# rule is not a restriction for a US citizen took that group from 6/20 to 20/20.
+
+ARRANGEMENT_CRITERIA = {
+    "fully_remote":
+        "Remote with no office attendance required, AND no location requirement that "
+        "excludes a US citizen living at the candidate's address. THIS INCLUDES nationwide "
+        "and US-only remote roles ('Remote - US', 'Remote, United States', 'US Remote'), and "
+        "roles open to anywhere in the world. A US-only rule is NOT a restriction here.",
+    "remote_in_metro":
+        "Remote, but the worker must live in or near ONE NAMED METRO AREA or city, for "
+        "example 'Remote - must be in the NYC area' or 'Boston-based, remote'.",
+    "remote_with_residency":
+        "Remote, but restricted to a SPECIFIC STATE, a MULTI-STATE REGION, or a country "
+        "OTHER THAN the United States. Examples: 'Remote, Michigan', 'US East Coast only', "
+        "'Remote within Canada', 'Remote - European Union'. Do NOT use this for a plain "
+        "US-wide remote role.",
+    "hybrid":
+        "Requires attending an office on a regular schedule while working from home the "
+        "rest of the time.",
+    "onsite":
+        "Requires working at an office, a lab, or customer sites, with no meaningful remote "
+        "arrangement.",
+    "unclear":
+        "The posting genuinely does not say enough to place it in any of the above.",
+}
+
+
+def arrangement_questions(origin: str) -> dict:
+    """The location question, with the candidate's own address in it.
+
+    ⚠️ "US CITIZEN" IS LOAD-BEARING AND WAS MISSING FROM THE FIRST VERSION. Without it,
+    "Remote - US" reads as a residency restriction. With it, the restriction excludes
+    nobody relevant and the row is simply remote.
+    """
+    return {
+        "arrangement": choice(
+            f"The candidate is a US CITIZEN living at {origin}. He will only take work he "
+            "can do from that address. Classify how this job's work location is arranged. "
+            "Judge what the posting REQUIRES, not what it prefers.",
+            ARRANGEMENT_CRITERIA),
+    }
+
+
+def read_arrangement(title: str, location: str, description: str, origin: str) -> dict:
+    """Ask how one posting's work is arranged. Returns a dict ready for the columns.
+
+    The state is the same shape the previous model was given: title, location, description.
+    A comparison against a differently-shaped input would measure the input, not the model.
+    """
+    state = json.dumps({"title": title or "", "location": location or "",
+                        "description": (description or "")[:9000]})
+    res = ask(state, arrangement_questions(origin))
+    val, conf = answer(res, "arrangement")
+    return {"arrangement": val, "conf": conf, "tokens": input_tokens(res)}

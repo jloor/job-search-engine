@@ -61,6 +61,12 @@ jobs:
       # had no token record and the database's account of spend was a census
       # of the jobs that happened to record themselves.
       - run: python3 tests/test_ai_spend.py
+      # Added 2026-09-21: remote_verdict answers two questions at once. The
+      # model writes how work is arranged, the commute router overwrites it
+      # with reachability, so two postings that say "This is a hybrid role"
+      # read as 'onsite'. Guards that the arrangement reader never writes
+      # that column, and that the criteria keep their measured wording.
+      - run: python3 tests/test_jev_remote.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #

@@ -507,6 +507,23 @@ MIGRATIONS = [
     "ALTER TABLE scan_candidate ADD COLUMN jev_min_years INTEGER",
     "ALTER TABLE scan_candidate ADD COLUMN jev_degree_hard REAL",
     "ALTER TABLE scan_candidate ADD COLUMN jev_checked_at TEXT",
+    # 🚨 2026-09-21. `remote_verdict` CARRIES TWO DIFFERENT MEANINGS AND THAT MADE IT
+    # UNTESTABLE. The model writes "how is the work arranged" and the commute router then
+    # OVERWRITES it with "can he reach it": too far becomes `onsite`. Two Collingswood NJ
+    # postings say "This is a hybrid role" in their own words, carry #LI-HYBRID, and the
+    # column reads `onsite`, because the router measured 145 minutes against a 90 minute
+    # ceiling and had nowhere else to put that fact.
+    # ⚠️ MEASURED CONSEQUENCE: a model asked the arrangement question is marked WRONG on
+    # those rows while being right. Across 94 rows, every residual disagreement that could
+    # be adjudicated from the posting text went the same way, and the overloaded column was
+    # the reason three of them looked like errors.
+    # ⭐ So the arrangement gets its own columns and the router keeps `remote_verdict`
+    # untouched. Same separation the `place` table already enforces between judged, address
+    # and measured: collapse a guess into a measurement and the guess is what gets quoted.
+    # 📌 NOTHING GATES ON THESE YET. They are a second opinion, readable beside the verdict.
+    "ALTER TABLE scan_candidate ADD COLUMN work_arrangement TEXT",
+    "ALTER TABLE scan_candidate ADD COLUMN work_arrangement_conf REAL",
+    "ALTER TABLE scan_candidate ADD COLUMN work_arrangement_at TEXT",
     # 🚨 2026-09-21. job_comp AND job_remote_check SPENT MONEY AND RECORDED NOTHING. Both
     # read their usage into `_u` and dropped it: 126 pay bands and 844 locations judged by
     # the model with no token record anywhere. When the shared key hit its cap, the answer
@@ -6047,6 +6064,11 @@ JEV_STALE_DAYS = int(os.environ.get("JEV_STALE_DAYS", "90"))
 # columns is safe and reversible. Acting on them changes what the operator is shown, so it is a
 # second, separate decision made after the numbers have been read against real outcomes.
 JEV_GATE_LEVELS = [s for s in os.environ.get("JEV_GATE_LEVELS", "").split(",") if s.strip()]
+# The arrangement reader runs on its own prime interval so it never lands beside the level
+# reader. Both are cheap; what they must not do is share a minute with each other or scan.
+JEV_REMOTE_EVERY_MIN = int(os.environ.get("JEV_REMOTE_EVERY_MIN", "37"))
+JEV_REMOTE_BATCH     = int(os.environ.get("JEV_REMOTE_BATCH", "60"))
+JEV_REMOTE_STALE_DAYS = int(os.environ.get("JEV_REMOTE_STALE_DAYS", "90"))
 # Longer than VERIFY_STALE_HRS on purpose. A queue row carries no package and no application,
 # so a day-old reading is enough to stop a wasted hour, and three days keeps the request count
 # honest against boards that owe this system nothing.
@@ -6547,6 +6569,88 @@ def job_jev_level() -> str:
 
     spread = " ".join(f"{k}={v}" for k, v in sorted(tally.items()))
     return (f"jev level: read {len(rows) - failed} of {len(rows)} | {spread or 'none'} | "
+            f"{tokens:,} tokens ${_JEV.cost_usd(tokens):.4f}"
+            + (f" | {failed} failed" if failed else ""))
+
+
+def job_jev_remote() -> str:
+    """Ask Jev how each queue posting's work is arranged, and keep it OUT of remote_verdict.
+
+    🚨 WHY A SECOND COLUMN RATHER THAN A BETTER MODEL IN THE OLD ONE. `remote_verdict`
+    answers two questions at once. The model writes how the work is arranged; the commute
+    router overwrites it with whether the operator can reach it, spending `onsite` to mean
+    "145 minutes away". Measured 2026-09-21 on two Collingswood NJ postings that say "This
+    is a hybrid role" in their own words and carry #LI-HYBRID: the column reads `onsite`.
+    Any model asked the arrangement question is marked wrong on those rows while being right.
+
+    ⭐ WHAT THE MEASUREMENT ACTUALLY SHOWED, over 94 rows the old model had decided. Once
+    the criteria stated the engine's intent rather than a dictionary definition, agreement
+    was 76%, and every residual disagreement that could be adjudicated from the posting text
+    went Jev's way: it separates a CITY (Nashville, Salt Lake City) from a REGION (East
+    Coast) in both directions at 0.94 to 1.00 confidence, where the old model had them
+    backwards. Zero cases were found where the old model was right and Jev was wrong.
+
+    ⚠️ IT WRITES THREE COLUMNS AND NEVER remote_verdict. The router stays authoritative on
+    reachability, because a measured 145 minutes beats any model and always should.
+
+    📌 NOTHING GATES ON THIS YET. It is a readable second opinion. Acting on it is a later
+    decision, made after the two columns have disagreed in public for a while.
+    """
+    import jev as _JEV
+
+    if not _JEV.enabled():
+        return "jev disabled (set JEV_ENABLED=1 and JEV_API_KEY)"
+    # Same source job_remote_check uses, so both ask about the same address.
+    try:
+        import candidate as _C
+        origin = ((_C.load() or {}).get("commute") or {}).get("origin", "")
+    except Exception:                                         # noqa: BLE001
+        origin = ""
+    if not origin:
+        # ⚠️ NO ORIGIN MEANS NO QUESTION. "Can a US citizen at <blank> do this" is not the
+        # question that was measured, and asking it anyway would bill for an answer to
+        # something else.
+        return "jev remote: no commute origin configured; refusing to ask"
+
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(days=JEV_REMOTE_STALE_DAYS)).isoformat(timespec="seconds")
+    with db() as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT c.id, c.title, c.location, c.description "
+            "  FROM scan_candidate c "
+            " WHERE c.triaged = 1 AND cast(c.score as int) >= ? "
+            "   AND c.verdict NOT IN ('out_of_scope','duplicate','error') "
+            "   AND COALESCE(c.live_status,'') <> 'dead' "
+            "   AND c.description IS NOT NULL AND length(c.description) > 200 "
+            "   AND NOT EXISTS (SELECT 1 FROM posting p WHERE p.canonical_url = c.url) "
+            "   AND NOT EXISTS (SELECT 1 FROM role_passed rp WHERE rp.url = c.url) "
+            "   AND (c.work_arrangement_at IS NULL OR c.work_arrangement_at < ?) "
+            " ORDER BY c.work_arrangement_at IS NOT NULL, cast(c.score as int) DESC "
+            " LIMIT ?",
+            (JEV_MIN_SCORE, cutoff, JEV_REMOTE_BATCH))]
+
+    if not rows:
+        return "jev remote: nothing to read"
+
+    stamp = now()
+    tally, tokens, failed = {}, 0, 0
+    for r in rows:
+        try:
+            got = _JEV.read_arrangement(r["title"], r["location"], r["description"], origin)
+        except _JEV.JevError as e:                            # noqa: PERF203
+            failed += 1
+            log(f"jev remote id={r['id']}: {e}")
+            continue
+        tokens += got["tokens"]
+        tally[got["arrangement"]] = tally.get(got["arrangement"], 0) + 1
+        with db() as con:
+            con.execute(
+                "UPDATE scan_candidate SET work_arrangement=?, work_arrangement_conf=?, "
+                "work_arrangement_at=? WHERE id=?",
+                (got["arrangement"], got["conf"], stamp, r["id"]))
+
+    spread = " ".join(f"{k}={v}" for k, v in sorted(tally.items()))
+    return (f"jev remote: read {len(rows) - failed} of {len(rows)} | {spread or 'none'} | "
             f"{tokens:,} tokens ${_JEV.cost_usd(tokens):.4f}"
             + (f" | {failed} failed" if failed else ""))
 
@@ -8739,6 +8843,10 @@ def job_table() -> list:
             # known dead, so asking a paid question about a vanished requisition never happens.
             # Its own interval is prime and unshared so it does not land beside them.
             ("jev_level", JEV_EVERY_MIN * 60, job_jev_level),
+            # ⭐ Its own prime interval so the two Jev jobs never share a minute. It writes
+            # work_arrangement and NEVER remote_verdict: the commute router owns
+            # reachability, because a measured 145 minutes beats any model.
+            ("jev_remote", JEV_REMOTE_EVERY_MIN * 60, job_jev_remote),
             # Cheap and database-only. It reads resolved mail and writes timeline rows; it
             # makes no network call and cannot see outbound mail, which arrives by hand.
             ("interactions", INTERACTIONS_EVERY_MIN * 60, job_interactions),
