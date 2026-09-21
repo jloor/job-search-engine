@@ -8889,17 +8889,17 @@ def job_fantastic_jb() -> str:
                   got = _fantastic_store(fresh, known)
                   for k, v in got.items():
                       tally[k] = tally.get(k, 0) + v
-              _fantastic_close(run_id, "ok", returned=rows_seen,
+              _fantastic_close(run_id, status="ok", returned=rows_seen,
                                inserted=tally.get("inserted", 0),
                                duplicate=tally.get("duplicate", 0),
                                gated=tally.get("gated", 0), jobs_spent=spent,
                                jobs_remaining=remaining)
               notes.append(f"{label}: {rows_seen} returned, {tally.get('inserted', 0)} new")
           except _F.Denied as e:
-              _fantastic_close(run_id, "denied", note=str(e)[:200])
+              _fantastic_close(run_id, status="denied", note=str(e)[:200])
               return f"fantastic_jb: DENIED, {e}"
           except Exception as e:                                # noqa: BLE001
-              _fantastic_close(run_id, "error", note=f"{type(e).__name__}: {e}"[:200])
+              _fantastic_close(run_id, status="error", note=f"{type(e).__name__}: {e}"[:200])
               notes.append(f"{label}: FAILED {type(e).__name__}")
               continue
           total["returned"] += rows_seen

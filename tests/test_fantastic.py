@@ -322,3 +322,20 @@ check("the national pass is still remote-filtered",
       bool('("national", {**base, "ai_work_arrangement": FANTASTIC_JB_ARRANGEMENT})' in JBSRC), True)
 check("each pass is labelled, so a run is attributable",
       bool('f"{pass_name}/' in JBSRC), True)
+
+# 🚨 A SOURCE-LEVEL STRING CHECK CANNOT SEE A WRONG CALL SIGNATURE. The first run of
+# job_fantastic_jb died on TypeError: _fantastic_close() takes 1 positional argument but 2
+# were given, after twelve source checks had passed. The shape was copied from job_fantastic
+# and the keyword was dropped. This inspects the real signature instead of the text.
+print("\nthe run-bookkeeping helpers are called correctly:")
+import inspect as _insp                                       # noqa: E402
+sys.path.insert(0, str(SRC_DIR))
+import test_parse as _tp                                      # noqa: E402
+_relay = _tp.load_app()
+_sig = _insp.signature(_relay._fantastic_close)
+check("_fantastic_close takes run_id then KEYWORDS only",
+      bool([p.kind for p in _sig.parameters.values()].count(_insp.Parameter.VAR_KEYWORD) == 1
+           and len([p for p in _sig.parameters.values()
+                    if p.kind == _insp.Parameter.POSITIONAL_OR_KEYWORD]) == 1), True)
+check("no call site passes status positionally",
+      bool('_fantastic_close(run_id, "' not in APP_SRC), True)
