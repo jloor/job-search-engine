@@ -271,3 +271,54 @@ if fails:
         print("  " + f)
     raise SystemExit(f"{len(fails)} failure(s)")
 print("all passed")
+
+
+# ---------------------------------------------------------------------------------------
+# 🚨 THE LINKEDIN FEED IS A SECOND ENDPOINT, AND THE ENGINE ONLY EVER CALLED THE FIRST.
+# Measured 2026-09-21 across eleven queries over 7 days: 2,043 rows on /v1/active-ats and
+# 4,823 on /v1/active-jb, with ZERO linkedin.com URLs anywhere in the queue.
+# ⚠️ It is LinkedIn ONLY. Probed by source: linkedin 1,296 of 1,303; indeed, ziprecruiter,
+# monster, glassdoor, dice and builtin all return 0.
+print("\nthe LinkedIn feed is separate, remote-filtered, and marked as an aggregator:")
+JBSRC = APP_SRC.split("def job_fantastic_jb", 1)[1].split("\ndef ", 1)[0] if "def job_fantastic_jb" in APP_SRC else ""
+check("job_fantastic_jb exists", bool(bool(JBSRC)), True)
+check("it calls the active-jb endpoint, not active-ats", bool('"active-jb"' in JBSRC), True)
+check("it never calls active-ats", bool('"active-ats"' not in JBSRC), True)
+# 🚨 THE FILTER THAT MAKES IT AFFORDABLE. 1,279 rows unfiltered vs 173 remote on one query.
+# A config that forgets it costs 7x per run and the failure is invisible: more rows look
+# like more value.
+check("the remote filter is FORCED in code, not left to config", bool('"ai_work_arrangement": FANTASTIC_JB_ARRANGEMENT' in JBSRC), True)
+check("...and it includes Remote OK, because their arrangement field is 21% wrong", bool("Remote OK" in APP_SRC.split("FANTASTIC_JB_ARRANGEMENT", 1)[1][:400]), True)
+# ⚠️ 35% of rows are already reachable through the ATS endpoint. Dropping them before the
+# store saves triage, which bills ~7,313 input tokens per row that lands.
+check("ats_duplicate rows are dropped BEFORE the shared ingest", bool("if not r.get(\"ats_duplicate\")" in JBSRC
+      and JBSRC.index("ats_duplicate") < JBSRC.index("_fantastic_store")), True)
+check("every landed row is marked url_kind='aggregator'", bool("SET url_kind='aggregator'" in JBSRC), True)
+check("schema.sql declares url_kind", bool("url_kind" in SCHEMA), True)
+check("a migration adds url_kind", bool('ALTER TABLE scan_candidate ADD COLUMN url_kind TEXT' in APP_SRC), True)
+# 📌 A new PAID feed must not switch itself on during a deploy.
+check("it is scheduled OFF by default", bool('FANTASTIC_JB_EVERY_MIN", "0"' in APP_SRC), True)
+check("it is registered so it can be run by hand", bool('("fantastic_jb", FANTASTIC_JB_EVERY_MIN * 60, job_fantastic_jb)' in APP_SRC), True)
+check("it has its own budget cap", bool("FANTASTIC_JB_MAX_ROWS" in JBSRC), True)
+
+# ⭐ THE LOCAL PASS IS THE INVERSE OF THE NATIONAL ONE, and it does NOT contradict the
+# "United States is the only correct location" rule. That rule exists because a remote
+# posting derives its location from the employer's OFFICE, so a state filter deletes the
+# remote roles he wants. Re-measured 2026-09-21, title=integration, 7 days:
+#     New York + Remote Solely   ATS 0    LinkedIn 4     <- the rule holds
+#     New York + On-site         ATS 27   LinkedIn 27
+#     New York + Hybrid          ATS 8    LinkedIn 21
+# A location filter is wrong for REMOTE and right for ON-SITE, because an on-site role's
+# derived office is where the work actually happens.
+print("\nthe local commutable pass:")
+check("a local arrangement knob exists", bool("FANTASTIC_JB_LOCAL_ARRANGEMENT" in APP_SRC), True)
+check("it asks for On-site and Hybrid, the inverse of the national pass",
+      bool("On-site,Hybrid" in APP_SRC), True)
+check("the states come from candidate.toml near_states, never hardcoded",
+      bool('"near_states"' in JBSRC or "near_states" in JBSRC), True)
+check("one pass per state, because the filter takes one place",
+      bool("for st in near" in JBSRC), True)
+check("the national pass is still remote-filtered",
+      bool('("national", {**base, "ai_work_arrangement": FANTASTIC_JB_ARRANGEMENT})' in JBSRC), True)
+check("each pass is labelled, so a run is attributable",
+      bool('f"{pass_name}/' in JBSRC), True)

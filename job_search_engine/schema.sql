@@ -221,6 +221,13 @@ CREATE TABLE IF NOT EXISTS scan_candidate (
                                   -- hybrid|onsite|unclear
   work_arrangement_conf REAL,     -- 0..1, calibrated across groups
   work_arrangement_at   TEXT,
+  -- 🚨 A LINKEDIN URL IS NOT A CANONICAL URL. The posting-hygiene rule requires the direct
+  -- requisition on the employer's own ATS, because aggregators carry wrong comp: a DDC role
+  -- showed a ZipRecruiter estimate of $19-$30/hr the employer never published.
+  -- ⭐ Job-board rows are scored and read like any other, but owe a resolution step to find
+  -- the real URL before an application can be packaged against one.
+  -- 📌 NULL means canonical or legacy. Only the job-board feed writes 'aggregator'.
+  url_kind              TEXT,     -- NULL | aggregator
   date_modified     TEXT,
   modified_fields   TEXT                       -- JSON array, verbatim from the feed
 );

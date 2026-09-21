@@ -524,6 +524,16 @@ MIGRATIONS = [
     "ALTER TABLE scan_candidate ADD COLUMN work_arrangement TEXT",
     "ALTER TABLE scan_candidate ADD COLUMN work_arrangement_conf REAL",
     "ALTER TABLE scan_candidate ADD COLUMN work_arrangement_at TEXT",
+    # 🚨 2026-09-21. A LINKEDIN URL IS NOT A CANONICAL URL, AND THE RULE ALREADY SAYS SO.
+    # CLAUDE.md: the Link column must be the direct requisition on the employer's own ATS,
+    # never an aggregator, because aggregators carry wrong comp. The DDC role showed a
+    # ZipRecruiter estimate of $19-$30/hr the employer never published.
+    # ⭐ So rows from the job-board feed land in the SAME queue and get scored, gated and
+    # read like everything else, but carry url_kind='aggregator' so nothing can package an
+    # application against a LinkedIn link. The resolution step to find the real ATS URL is
+    # owed before that row can be applied to.
+    # 📌 NULL means canonical-or-legacy. Only the job-board path writes 'aggregator'.
+    "ALTER TABLE scan_candidate ADD COLUMN url_kind TEXT",
     # ⚠️ TOKENS FROM TWO VENDORS ARE NOT COMPARABLE, and a ledger with no vendor column
     # invites exactly that arithmetic. Jev bills $0.042 per million input tokens and the
     # OpenRouter model bills a different rate, so summing the column without splitting by
@@ -8362,6 +8372,48 @@ FANTASTIC_GAP_HRS = int(os.environ.get("FANTASTIC_GAP_HRS", "3"))
 # The expired feed costs no job credits, so it may page much further than a paid feed.
 FANTASTIC_EXPIRED_PAGES = int(os.environ.get("FANTASTIC_EXPIRED_PAGES", "120"))
 
+# ---- the LinkedIn feed. A SECOND endpoint, not a widening of the first. ----------------
+# 🚨 MEASURED 2026-09-21 BEFORE ANY OF THIS WAS BUILT. /v1/active-jb exists beside
+# /v1/active-ats and the engine had only ever called the second. Across the eleven
+# configured queries in a 7-day window: 2,043 rows on the ATS endpoint and 4,823 on the job
+# board one. Zero rows in the whole queue carried a linkedin.com URL.
+# ⚠️ IT IS LINKEDIN, AND ONLY LINKEDIN. Probed by source: linkedin 1,296 of 1,303; indeed,
+# ziprecruiter, monster, glassdoor, dice and builtin all return 0. Those boards are not
+# reachable through this vendor and adding them is a different problem.
+# ⭐ THE REMOTE FILTER IS WHY THIS IS AFFORDABLE, and it is applied at QUERY time so the
+# 85% that is on-site is never billed. title=integration over 7 days: 1,279 rows
+# unfiltered, 173 with ai_work_arrangement="Remote Solely,Remote OK". A 7x reduction before
+# a credit is spent.
+# ⚠️ A THIRD OF IT IS ALREADY REACHABLE. Measured on a 100-row sample: 35% carry
+# ats_duplicate, meaning the same requisition sits on an ATS the other endpoint can see.
+# Those are dropped on ingest rather than paid for twice in triage.
+# 📌 DEFAULT 0 = MANUAL ONLY, the same shape as workday_enrich. A new paid feed that turns
+# itself on during a deploy is how a budget disappears without anyone deciding.
+FANTASTIC_JB_EVERY_MIN = int(os.environ.get("FANTASTIC_JB_EVERY_MIN", "0"))
+FANTASTIC_JB_MAX_ROWS  = int(os.environ.get("FANTASTIC_JB_MAX_ROWS", "200"))
+# The arrangement values the vendor derives. "Remote OK" is included because their own
+# ai_work_arrangement was measured at a 21% error rate on the ATS side, so asking only for
+# "Remote Solely" would inherit that error as a silent exclusion.
+FANTASTIC_JB_ARRANGEMENT = os.environ.get(
+    "FANTASTIC_JB_ARRANGEMENT", "Remote Solely,Remote OK")
+# ⭐ THE LOCAL PASS, AND IT IS THE INVERSE OF THE NATIONAL ONE. The national pass throws away
+# ~85% of rows for being on-site. Inside the commute ceiling that 85% is the whole point.
+# 🚨 IT DOES NOT CONTRADICT THE "United States IS THE ONLY CORRECT FORM" RULE, and the
+# measurement says why. That rule was established because a New York location filter finds
+# ZERO fully remote roles: a remote posting derives its location from the employer's OFFICE,
+# so narrowing to his states deletes exactly the remote roles he wants. Re-measured
+# 2026-09-21 on both endpoints, title=integration, 7 days:
+#     New York + Remote Solely     ATS 0    LinkedIn 4      <- the rule still holds
+#     New York + On-site           ATS 27   LinkedIn 27
+#     New York + Hybrid            ATS 8    LinkedIn 21
+#     New Jersey + On-site         ATS 7    LinkedIn 17
+# A location filter is wrong for REMOTE and right for ON-SITE, because an on-site role's
+# derived office IS where the work happens. Two passes, two shapes, one endpoint.
+# ⚠️ The states come from candidate.toml near_states, never hardcoded: they are a fact about
+# one person's commute, and a different origin needs a different list.
+FANTASTIC_JB_LOCAL_ARRANGEMENT = os.environ.get(
+    "FANTASTIC_JB_LOCAL_ARRANGEMENT", "On-site,Hybrid")
+
 
 def _fantastic_cfg() -> dict:
     """The query set, which is PERSONAL and therefore lives in the candidate profile.
@@ -8754,6 +8806,128 @@ def job_fantastic() -> str:
     return head + ("; " + "; ".join(notes) if notes else "")
 
 
+def job_fantastic_jb() -> str:
+    """Poll the LINKEDIN feed, remote-filtered, and land only what no ATS already carries.
+
+    🚨 WHY A SECOND JOB AND NOT A WIDER QUERY SET. /v1/active-jb is a different endpoint
+    from /v1/active-ats, it indexes job boards rather than applicant tracking systems, and
+    the engine had only ever called the second. Measured 2026-09-21 across the eleven
+    configured queries over 7 days: 2,043 rows on the ATS endpoint, 4,823 on this one, and
+    ZERO rows in the entire queue carried a linkedin.com URL.
+
+    ⚠️ IT IS LINKEDIN ONLY. Probed by source: linkedin 1,296 of 1,303. indeed, ziprecruiter,
+    monster, glassdoor, dice and builtin all return 0 rows. Those boards are not reachable
+    through this vendor, and the name of the endpoint oversells what it holds.
+
+    ⭐ THREE FILTERS, IN THE ORDER THAT SAVES THE MOST MONEY FIRST.
+    1. ai_work_arrangement at QUERY time, so the ~85% that is on-site is never billed. On
+       title=integration over 7 days: 1,279 unfiltered against 173 remote. 7x.
+    2. ats_duplicate on INGEST, dropping the ~35% whose requisition the other endpoint can
+       already see. Paid for once, but never triaged twice.
+    3. The existing gates and dedupe in _fantastic_store, unchanged.
+
+    🚨 EVERY ROW IS MARKED url_kind='aggregator'. CLAUDE.md requires the canonical URL to be
+    the employer's own ATS, never an aggregator, because aggregators carry wrong comp. These
+    rows are LEADS: scored and read like any other, but owing a resolution step to find the
+    real requisition URL before an application can be packaged against one.
+
+    ⚠️ QUALITY IS WORSE HERE AND THE SAMPLE SAID SO. Of six unique remote rows in a 100-row
+    sample, five were staffing agencies: Tekgence, Fast Dolphin, TalentHop, Feuji, Quantum
+    Integrators. exclude_companies already exists for this and will matter more on this feed
+    than on the ATS one.
+    """
+    import fantastic as _F
+    why = _fantastic_ready()
+    if why:
+        return f"fantastic_jb: SKIPPED, {why}"
+    cfg = _fantastic_cfg()
+    queries = cfg.get("jobboard") or cfg.get("queries") or []
+    if not queries:
+        return "fantastic_jb: no queries configured"
+    # 🚨 THE REMOTE FILTER IS FORCED HERE, not left to the config. A config that forgets it
+    # costs 7x on every run, and the failure is invisible: more rows look like more value.
+    base = dict(cfg.get("shared") or {})
+    # 🚨 THE REMOTE FILTER IS FORCED HERE, not left to the config. A config that forgets it
+    # costs 7x on every run, and the failure is invisible: more rows look like more value.
+    passes = [("national", {**base, "ai_work_arrangement": FANTASTIC_JB_ARRANGEMENT})]
+    # ⭐ One local pass PER STATE, because the vendor's location filter takes one place.
+    try:
+        import candidate as _C
+        near = [str(x).strip() for x in
+                ((_C.load() or {}).get("commute") or {}).get("near_states") or []]
+    except Exception:                                         # noqa: BLE001
+        near = []
+    for st in near:
+        passes.append((f"local:{st}", {**base, "location": f'"{st}"',
+                                       "ai_work_arrangement": FANTASTIC_JB_LOCAL_ARRANGEMENT}))
+    total = {"returned": 0, "inserted": 0, "duplicate": 0, "gated": 0,
+             "ats_dup": 0, "spent": 0}
+    notes, remaining, new_ids = [], None, []
+    known = _fantastic_known()
+
+    for pass_name, shared in passes:
+        for q in queries:
+          q = dict(q)
+          label = f"{pass_name}/{str(q.pop('label', '') or 'unlabelled')}"
+          recent = _fantastic_too_soon(f"jb:{label}", FANTASTIC_JB_EVERY_MIN)
+          if recent:
+              continue
+          since = _fantastic_gap("active-jb", label)
+          run_id = _fantastic_open("active-jb", label, since)
+          rows_seen, spent, tally = 0, 0, {}
+          try:
+              for page, quota in _F.pages("active-jb", _F.params(q, shared, since),
+                                          FANTASTIC_KEY, budget=FANTASTIC_JB_MAX_ROWS):
+                  rows_seen += len(page)
+                  spent += quota.get("jobs_spent") or 0
+                  remaining = quota.get("jobs_remaining", remaining)
+                  # ⭐ Dropped BEFORE _fantastic_store, so a row the other endpoint already
+                  # covers never reaches triage. It is paid for either way; this saves the
+                  # 7,313 input tokens triage bills per row, not the credit.
+                  fresh = [r for r in page if not r.get("ats_duplicate")]
+                  total["ats_dup"] += len(page) - len(fresh)
+                  got = _fantastic_store(fresh, known)
+                  for k, v in got.items():
+                      tally[k] = tally.get(k, 0) + v
+              _fantastic_close(run_id, "ok", returned=rows_seen,
+                               inserted=tally.get("inserted", 0),
+                               duplicate=tally.get("duplicate", 0),
+                               gated=tally.get("gated", 0), jobs_spent=spent,
+                               jobs_remaining=remaining)
+              notes.append(f"{label}: {rows_seen} returned, {tally.get('inserted', 0)} new")
+          except _F.Denied as e:
+              _fantastic_close(run_id, "denied", note=str(e)[:200])
+              return f"fantastic_jb: DENIED, {e}"
+          except Exception as e:                                # noqa: BLE001
+              _fantastic_close(run_id, "error", note=f"{type(e).__name__}: {e}"[:200])
+              notes.append(f"{label}: FAILED {type(e).__name__}")
+              continue
+          total["returned"] += rows_seen
+          total["spent"] += spent
+          for k in ("inserted", "duplicate", "gated"):
+              total[k] += tally.get(k, 0)
+
+    # 🚨 MARK THE URL AS AN AGGREGATOR LINK. Done as a set update rather than inside the
+    # shared ingest, because _fantastic_store is the ATS path's code too and must keep
+    # writing canonical URLs for it.
+    marked = 0
+    if total["inserted"]:
+        with db() as con:
+            con.execute(
+                "UPDATE scan_candidate SET url_kind='aggregator' "
+                " WHERE url_kind IS NULL AND lower(url) LIKE '%linkedin.com%'")
+            marked = con.execute(
+                "SELECT count(*) n FROM scan_candidate WHERE url_kind='aggregator'"
+            ).fetchone()["n"]
+
+    head = (f"fantastic_jb: {total['returned']} returned, {total['inserted']} new lead(s), "
+            f"{total['ats_dup']} already on an ATS, {total['duplicate']} dup, "
+            f"{total['gated']} gated; {total['spent']} credit(s) spent"
+            + (f", {remaining} left" if remaining is not None else "")
+            + f"; {marked} row(s) carry url_kind=aggregator")
+    return head + ("; " + "; ".join(notes) if notes else "")
+
+
 def job_fantastic_expired() -> str:
     """Mark the requisitions this API says have gone. Complimentary: no job credits.
 
@@ -8983,6 +9157,10 @@ def job_table() -> list:
             # each day. Default 0 = manual only, until a query has been sized against the
             # plan. See job_fantastic.
             ("fantastic", FANTASTIC_EVERY_MIN * 60, job_fantastic),
+            # ⭐ The LinkedIn half of the same vendor, on its own knob and DEFAULT OFF.
+            # A second paid feed that turns itself on during a deploy is how a budget
+            # disappears without anyone deciding. See job_fantastic_jb.
+            ("fantastic_jb", FANTASTIC_JB_EVERY_MIN * 60, job_fantastic_jb),
             # ⭐ Complimentary, and the cheapest real win here: it turns the ghosting rule's
             # "is the requisition gone" from a hand-rolled probe into a feed. Daily, and
             # AFTER 01:00 UTC, because the 1d window is a stable snapshot of the previous
