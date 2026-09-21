@@ -123,10 +123,53 @@ for job in ("job_comp", "job_remote_check"):
     check(f"{job} still calls through _read_openai_compat",
           "_read_openai_compat(" in body)
 
+# 🚨 THE LEDGER MUST COVER EVERY VENDOR, NOT THE FIRST ONE. ai_spend was built to fix two
+# jobs that spent money and recorded nothing. Jev then shipped the SAME DAY as a second paid
+# vendor that does not go through _read_openai_compat, and made 480 calls the table could not
+# see. The same failure, reproduced against a new vendor, hours after fixing it.
+print("\nthe ledger reaches the SECOND vendor too:")
+sys.path.insert(0, str(HERE.parent / "job_search_engine"))
+import jev as _jev                                            # noqa: E402
+
+JEVSRC = (HERE.parent / "job_search_engine" / "jev.py").read_text()
+check("jev.py exposes a spend hook", hasattr(_jev, "SPEND_HOOK"))
+check("it is unset by default, so the module stands alone", _jev.SPEND_HOOK is None)
+check("an unset hook records nothing and raises nothing",
+      _jev._record("X", {"usage": {"input_tokens": 1}}) is None)
+
+seen = []
+_old_hook = _jev.SPEND_HOOK
+try:
+    _jev.SPEND_HOOK = lambda pu, u: seen.append((pu, u["input_tokens"]))
+    _jev._PURPOSE["name"] = "JEV_LEVEL"
+    _jev._record(_jev._PURPOSE["name"], {"usage": {"input_tokens": 1417, "output_tokens": 9}})
+    check("a call is reported to the hook with its purpose", seen == [("JEV_LEVEL", 1417)])
+
+    def _hook_boom(pu, u):
+        raise RuntimeError("ledger down")
+
+    _jev.SPEND_HOOK = _hook_boom
+    _jev._record("JEV_REMOTE", {"usage": {"input_tokens": 1}})
+    check("a broken hook cannot discard a paid answer", True)
+except Exception:                                             # noqa: BLE001
+    check("a broken hook cannot discard a paid answer", False)
+finally:
+    _jev.SPEND_HOOK = _old_hook
+    _jev._PURPOSE["name"] = ""
+
+check("ask() records where the spending happens, not at the call sites",
+      "_record(_PURPOSE" in JEVSRC)
+check("both readers name their purpose",
+      '_PURPOSE["name"] = "JEV_LEVEL"' in JEVSRC
+      and '_PURPOSE["name"] = "JEV_REMOTE"' in JEVSRC)
+check("both jev jobs wire the hook to note_spend",
+      SRC.count("_JEV.SPEND_HOOK = note_spend") == 2)
+check("jev.py never imports app, which would be a cycle", "import app" not in JEVSRC)
+
 print()
 if fails:
     print(f"FAILED: {len(fails)}")
     for f in fails:
         print("  -", f)
     sys.exit(1)
-print("all checks passed")
+print("all checks passed (including the second vendor)")

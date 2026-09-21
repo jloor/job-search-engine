@@ -85,6 +85,42 @@ def noul(instructions: str) -> dict:
     return {"type": "noul", "instructions": instructions}
 
 
+
+# ---------------------------------------------------------------- spend hook
+# 🚨 A LEDGER THAT COVERS ONE VENDOR IS NOT A LEDGER. `ai_spend` was built hours before this
+# hook, to fix two jobs that spent money and recorded nothing. Then Jev shipped as a SECOND
+# paid vendor that did not go through _read_openai_compat, and within the same day it had
+# made 480 calls that the "every paid call" table could not see. The same failure, reproduced
+# against a new vendor, by the person who had just fixed it.
+#
+# ⚠️ jev.py CANNOT IMPORT app.py. The engine's modules import each other by bare name and
+# app.py imports this one, so a direct import is a cycle. A hook keeps the dependency
+# pointing one way while still recording at the point of spending rather than at the call
+# sites, which is the property that made the OpenRouter ledger trustworthy.
+#
+# 📌 Unset means no recording and no error. This module must stay importable and usable with
+# nothing else present, including its own suite.
+SPEND_HOOK = None
+
+# Which reader is running, so the ledger can attribute a call without every caller
+# threading a purpose argument through. Set by read_posting / read_arrangement.
+_PURPOSE = {"name": ""}
+
+
+def _record(purpose: str, res: dict) -> None:
+    """Report one paid call to whatever set SPEND_HOOK. Never raises."""
+    if SPEND_HOOK is None:
+        return
+    try:
+        SPEND_HOOK(purpose, {"input_tokens": input_tokens(res),
+                             "output_tokens": int(((res or {}).get("usage") or {})
+                                                  .get("output_tokens") or 0),
+                             "cache_read": 0,
+                             "model": (res or {}).get("model") or MODEL})
+    except Exception:                                         # noqa: BLE001
+        pass
+
+
 # ---------------------------------------------------------------- the call
 
 
@@ -117,7 +153,11 @@ def ask(state: str, questions: dict, *, retries: int = 3) -> dict:
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
-                return json.loads(resp.read().decode())
+                res = json.loads(resp.read().decode())
+            # Recorded HERE, not at the call sites, for the same reason the OpenRouter
+            # ledger is: a caller that forgets is the failure this replaces.
+            _record(_PURPOSE.get("name", ""), res)
+            return res
         except urllib.error.HTTPError as e:
             detail = ""
             try:
@@ -212,6 +252,7 @@ def posting_questions() -> dict:
 
 def read_posting(description: str) -> dict:
     """Ask the three questions about one posting. Returns a dict ready for the columns."""
+    _PURPOSE["name"] = "JEV_LEVEL"
     res = ask(description, posting_questions())
     lvl, conf = answer(res, "level")
     yrs, _ = answer(res, "min_years")
@@ -292,6 +333,7 @@ def read_arrangement(title: str, location: str, description: str, origin: str) -
     """
     state = json.dumps({"title": title or "", "location": location or "",
                         "description": (description or "")[:9000]})
+    _PURPOSE["name"] = "JEV_REMOTE"
     res = ask(state, arrangement_questions(origin))
     val, conf = answer(res, "arrangement")
     return {"arrangement": val, "conf": conf, "tokens": input_tokens(res)}

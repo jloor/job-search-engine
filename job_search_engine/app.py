@@ -6520,6 +6520,12 @@ def job_jev_level() -> str:
     # by bare name off sys.path and every other sibling in this file does the same.
     import jev as _JEV
 
+    # 🚨 A SECOND VENDOR MUST NOT SPEND INVISIBLY. ai_spend was built to fix two jobs that
+    # recorded nothing, and Jev then made 480 calls the same table could not see, because it
+    # does not go through _read_openai_compat. The hook points the recording back here
+    # without jev.py importing app.py, which would be a cycle.
+    _JEV.SPEND_HOOK = note_spend
+
     if not _JEV.enabled():
         return "jev disabled (set JEV_ENABLED=1 and JEV_API_KEY)"
 
@@ -6597,6 +6603,12 @@ def job_jev_remote() -> str:
     decision, made after the two columns have disagreed in public for a while.
     """
     import jev as _JEV
+
+    # 🚨 A SECOND VENDOR MUST NOT SPEND INVISIBLY. ai_spend was built to fix two jobs that
+    # recorded nothing, and Jev then made 480 calls the same table could not see, because it
+    # does not go through _read_openai_compat. The hook points the recording back here
+    # without jev.py importing app.py, which would be a cycle.
+    _JEV.SPEND_HOOK = note_spend
 
     if not _JEV.enabled():
         return "jev disabled (set JEV_ENABLED=1 and JEV_API_KEY)"
