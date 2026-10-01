@@ -183,5 +183,14 @@ check("the sweep is registered with the scheduler", '("notify", NOTIFY_EVERY_MIN
 check("🚨 the secret topic URL is never interpolated into a log line",
       "{NTFY_URL" not in SRC and "{NTFY_TOKEN" not in SRC)
 
+print("\nthe Bunny result shape:")
+# 🚨 The suite runs on sqlite, whose cursor has rowcount. The Bunny result object did not, so
+# the claim passed every test above and raised AttributeError in production on 2026-10-01.
+rs = app._RS({"cols": [], "rows": [], "affected_row_count": 1, "last_insert_rowid": None},
+             lambda v: v)
+check("a Bunny result reports rows changed, like sqlite3.Cursor", rs.rowcount == 1)
+check("…and zero when the claim lost the race",
+      app._RS({"cols": [], "rows": []}, lambda v: v).rowcount == 0)
+
 print(f"\n{'ALL PASS' if not fails else f'{len(fails)} FAILED'}")
 sys.exit(1 if fails else 0)

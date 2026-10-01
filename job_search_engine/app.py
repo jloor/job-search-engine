@@ -383,6 +383,10 @@ class _RS:
         self._rows = [dict(zip(cols, (cell(v) for v in row))) for row in result.get("rows", [])]
         lr = result.get("last_insert_rowid")
         self.lastrowid = int(lr) if lr not in (None, "") else None
+        # 🚨 sqlite3.Cursor has rowcount and this shape did not, so any code that read it
+        # passed every local test and raised AttributeError on Bunny. Found 2026-10-01 when
+        # the notify claim failed in production; job_fantastic_expired had the same latent bug.
+        self.rowcount = int(result.get("affected_row_count") or 0)
 
     def fetchone(self):
         return self._rows[0] if self._rows else None
