@@ -77,6 +77,12 @@ APPROVAL_TTL    = int(os.environ.get("APPROVAL_TTL", "900"))          # 15 minut
 # Replies may only go to an address that has already written to that alias, so a
 # compromised relay cannot become a mailer to strangers.
 REQUIRE_KNOWN_RECIPIENT = os.environ.get("REQUIRE_KNOWN_RECIPIENT", "1") == "1"
+# 🔑 2026-10-01: a SECURITY-KEY approval may reach a new address; nothing else may. The
+# signature covers the exact To address, so a touched approval is a human choosing that
+# recipient in a window that showed it. File-key approvals stay limited to known
+# correspondents, because that key can be read off the laptop. Applied by Jonathan.
+# SK_ALLOWS_COLD=0 restores the old rule for every approval.
+SK_ALLOWS_COLD          = os.environ.get("SK_ALLOWS_COLD", "1") == "1"
 SEND_RATE_PER_HOUR      = int(os.environ.get("SEND_RATE_PER_HOUR", "10"))
 
 # Outbound transports, tried in order until one succeeds.
@@ -10317,9 +10323,16 @@ async def send(request: Request,
     with db() as con:
         check_send_rate(con, ip)
         if REQUIRE_KNOWN_RECIPIENT and not known_correspondent(con, from_alias, to_addr):
-            audit("send_refused", f"{to_addr} has never written to {from_alias}", ip)
-            raise HTTPException(403, f"refused: {to_addr} is not a known correspondent on {from_alias}. "
-                                     "Set REQUIRE_KNOWN_RECIPIENT=0 to allow cold mail.")
+            # verify_approval has already proved an sk1. token, so the prefix is safe to read.
+            if SK_ALLOWS_COLD and (x_approval or "").startswith("sk1."):
+                log_event(con, "send_cold_sk",
+                          f"{to_addr} has never written to {from_alias}; allowed by a "
+                          f"security-key approval of this exact recipient", ip)
+            else:
+                audit("send_refused", f"{to_addr} has never written to {from_alias}", ip)
+                raise HTTPException(403, f"refused: {to_addr} is not a known correspondent on "
+                                         f"{from_alias}. A YubiKey-approved send may reach a new "
+                                         f"address; a file-key approval may not.")
         if p.get("in_reply_to_id"):
             parent = con.execute("SELECT * FROM message WHERE id=?", (p["in_reply_to_id"],)).fetchone()
 

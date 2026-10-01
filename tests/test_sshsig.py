@@ -151,6 +151,78 @@ except app.HTTPException as e:
     check("🚨 APPROVAL_SK_ONLY refuses the old file-key approval", e.code == 403)
 app.APPROVAL_SK_ONLY = False
 
+print("\n/send to an address that has never written (the real route, transport stubbed):")
+# ⭐ WHY, 2026-10-01. The known-recipient rule refused Turnkey's own application address. A
+# security-key approval now may reach a new address; a file-key approval may not, because that
+# key can be read off the laptop. Jonathan applied the change himself; these pin it down.
+import asyncio                                                  # noqa: E402
+import secrets as _sec                                          # noqa: E402
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as _EdK  # noqa: E402
+
+FROM = f"turnkey@{app.MAIL_DOMAIN}"
+COLD = "jobs@turnkey.example"
+app.ADMIN_TOKEN, app.SMTP_USER, app.SMTP_PASS = "adm", "u", "p"
+app.TRANSPORT_ORDER, app.REQUIRE_KNOWN_RECIPIENT = ["resend"], True
+app.APPROVAL_SK_KEYS = line
+_fk = _EdK.generate()                                           # the file key, for the legacy path
+app.APPROVAL_PUBKEY = _fk.public_key().public_bytes(ser.Encoding.Raw, ser.PublicFormat.Raw).hex()
+delivered = []
+app._send_via_resend = lambda f, t, s, b, parent, bcc=None: delivered.append(t) or "<stub@x>"
+
+
+class _H(dict):
+    def get(self, k, d=None): return dict.get(self, k, d)
+
+
+class _Req:
+    client = None
+    def __init__(self, payload): self._p, self.headers = payload, _H()
+    async def json(self): return self._p
+
+
+def _payload(body):
+    return {"from_alias": FROM, "to": COLD, "subject": "Application", "body": body, "approved": True}
+
+
+def _sk_token(body):
+    fp_ = app.fingerprint(FROM, COLD, "Application", body)
+    n = _sec.token_urlsafe(8)
+    return f"sk1.{n}.{exp}.{base64.urlsafe_b64encode(sign(k, pub, b'ssh:job-search-send', f'{n}.{exp}.{fp_}'.encode())).decode().rstrip('=')}"
+
+
+def _file_token(body):
+    fp_ = app.fingerprint(FROM, COLD, "Application", body)
+    n = _sec.token_urlsafe(8)
+    return f"{n}.{exp}.{base64.urlsafe_b64encode(_fk.sign(f'{n}.{exp}.{fp_}'.encode())).decode().rstrip('=')}"
+
+
+def _send(body, token):
+    try:
+        r = asyncio.run(app.send(_Req(_payload(body)), authorization="Bearer adm", x_approval=token))
+        return r.get("ok") and "sent"
+    except app.HTTPException as e:
+        return e.code
+
+
+check("⭐ a YubiKey-approved send reaches a new address", _send("one", _sk_token("one")) == "sent"
+      and delivered == [COLD])
+with app.db() as _c:
+    check("…and the event log says why it was allowed",
+          _c.execute("SELECT count(*) n FROM event WHERE kind='send_cold_sk'").fetchone()["n"] == 1)
+check("🚨 a file-key approval to a new address is still refused", _send("two", _file_token("two")) == 403)
+check("…and nothing was delivered for it", delivered == [COLD])
+app.SK_ALLOWS_COLD = False
+check("🚨 SK_ALLOWS_COLD=0 refuses even a YubiKey approval", _send("three", _sk_token("three")) == 403)
+app.SK_ALLOWS_COLD = True
+with app.db() as _c:
+    _c.execute("INSERT INTO message(received_at,to_alias,raw_payload,from_addr,application_ref) "
+               "VALUES (?,?,?,?,?)", (app.now(), FROM, "{}", COLD, "turnkey"))
+check("once they have written, a file-key approval reaches them as before",
+      _send("four", _file_token("four")) == "sent")
+_tok = _sk_token("five")
+_send("five", _tok)
+check("🚨 a used YubiKey approval cannot be replayed", _send("five", _tok) != "sent")
+
 print("\nthe real YubiKey:")
 fx = HERE / "fixtures" / "sshsig_yubikey.json"
 if fx.exists():

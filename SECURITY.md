@@ -83,6 +83,11 @@ Residual risks, stated plainly:
 - 🚨 **The container holds `RESEND_API_KEY`.** Someone who compromises the container can send
   mail without any approval. The gate protects against agents and stolen tokens, not against
   a compromised host, and no approval scheme on this side can change that.
+- **A security-key approval may reach an address that has never written; a file-key approval
+  may not** (added 2026-10-01, applied by the operator himself). The signature covers the exact
+  To address, so a touch approves that recipient, shown in the window. The rule that replies go
+  only to known correspondents still binds every other approval. `SK_ALLOWS_COLD=0` restores it
+  for all. Each such send writes a `send_cold_sk` event naming the recipient.
 - `APPROVAL_SK_ONLY=1` turns the file-key path off. Leave it off only until the touch path has
   sent real mail; the file key is the fallback for a lost YubiKey.
 
