@@ -87,6 +87,11 @@ SEND_RATE_PER_HOUR      = int(os.environ.get("SEND_RATE_PER_HOUR", "10"))
 # 2026-08-12 and that is a policy, not a guarantee. SMTP stays as a second path so a
 # Resend outage or quota does not take sending down with it.
 RESEND_API_KEY  = os.environ.get("RESEND_API_KEY", "")
+# 📤 A copy of every approved send, BCC'd to the operator, 2026-10-01. Resend keeps no copy in
+# his mailbox, so a reply sent here existed nowhere he reads mail. The copy carries the same
+# In-Reply-To and References, so it files inside the employer's conversation; a rule on his
+# side moves it to Sent. Empty = no copy. Only /send uses it, never the relay's own notices.
+SENT_COPY_BCC   = os.environ.get("SENT_COPY_BCC", "").strip()
 TRANSPORT_ORDER = [t.strip() for t in
                    os.environ.get("TRANSPORT_ORDER", "resend,smtp").split(",") if t.strip()]
 
@@ -9708,7 +9713,7 @@ def diag_config(request: Request, authorization: str | None = Header(None)):
               "INBOUND_TOKEN", "APPROVAL_PUBKEY", "BACKUP_PUBKEY", "SMTP_PASS",
               "STORAGE_KEY", "GIT_DEPLOY_KEY_B64", "ANTHROPIC_API_KEY", "AI_API_KEY",
               "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GOOGLE_MAPS_API_KEY", "RESEND_API_KEY",
-              "APPROVAL_SK_KEYS", "NTFY_URL", "NTFY_TOKEN"]
+              "APPROVAL_SK_KEYS", "NTFY_URL", "NTFY_TOKEN", "SENT_COPY_BCC"]
     plain = ["APPROVAL_SK_ONLY", "MAIL_DOMAIN", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "STORAGE_ZONE",
              "STORAGE_HOST", "AI_PROVIDER", "AI_MODEL", "AI_BASE_URL", "AI_READ_ENABLED",
              "AI_READ_SCOPE", "TRUSTED_PROXY_HOPS", "GIT_REPO_SSH", "GIT_AUTHOR_EMAIL",
@@ -10353,9 +10358,10 @@ async def send(request: Request,
     for transport in TRANSPORT_ORDER:
         try:
             if transport == "resend":
-                mid_hdr = _send_via_resend(from_alias, to_addr, p["subject"], p["body"], parent)
+                mid_hdr = _send_via_resend(from_alias, to_addr, p["subject"], p["body"], parent,
+                                           bcc=_sent_copy_bcc())
             else:
-                mid_hdr = _send_via_smtp(msg)
+                mid_hdr = _send_via_smtp(msg, bcc=_sent_copy_bcc())
         except Exception as e:
             errors.append(f"{transport}: {type(e).__name__}: {e}")
             continue
@@ -10426,7 +10432,18 @@ async def send(request: Request,
     raise HTTPException(502, f"all transports failed: {detail}")
 
 
-def _send_via_smtp(msg) -> str:
+def _sent_copy_bcc() -> str | None:
+    """The BCC for the operator's copy, or None. A malformed value is refused loudly rather
+    than handed to a transport, where it would fail the SEND, not just the copy."""
+    if not SENT_COPY_BCC:
+        return None
+    if not re.fullmatch(r"[^@\s,<>]+@[^@\s,<>]+\.[^@\s,<>]+", SENT_COPY_BCC):
+        audit("sent_copy_config", "SENT_COPY_BCC is not a single address; no copy sent")
+        return None
+    return SENT_COPY_BCC
+
+
+def _send_via_smtp(msg, bcc: str | None = None) -> str:
     """ImprovMX submission. ⚠️ ImprovMX requires the From address to MATCH the
     authenticated user, so this path can only send as SMTP_USER. That limitation is the
     reason Resend exists here."""
@@ -10436,12 +10453,16 @@ def _send_via_smtp(msg) -> str:
     s.ehlo("relay." + MAIL_DOMAIN)
     s.starttls(context=ssl.create_default_context())
     s.login(SMTP_USER, SMTP_PASS)
-    s.send_message(msg)
+    # A BCC lives in the envelope only. It is never written as a header, so the employer
+    # cannot see it.
+    rcpts = [parseaddr(msg["To"])[1]] + ([bcc] if bcc else [])
+    s.send_message(msg, to_addrs=rcpts)
     s.quit()
     return msg["Message-ID"]
 
 
-def _send_via_resend(from_alias: str, to_addr: str, subject: str, body: str, parent) -> str:
+def _send_via_resend(from_alias: str, to_addr: str, subject: str, body: str, parent,
+                     bcc: str | None = None) -> str:
     """
     Resend's HTTPS API. Sends as ANY alias on the verified domain, which SMTP cannot do.
 
@@ -10453,6 +10474,8 @@ def _send_via_resend(from_alias: str, to_addr: str, subject: str, body: str, par
         raise RuntimeError("RESEND_API_KEY not configured")
     import urllib.request, urllib.error
     payload = {"from": from_alias, "to": [to_addr], "subject": subject, "text": body}
+    if bcc:
+        payload["bcc"] = [bcc]
     if parent and parent["message_id"]:
         # Threading has to be set explicitly here; there is no EmailMessage to carry it.
         payload["headers"] = {"In-Reply-To": parent["message_id"],

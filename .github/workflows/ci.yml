@@ -78,6 +78,9 @@ jobs:
       # Added 2026-10-01: send approvals by YubiKey touch. Guards every refusal a forged
       # approval could slip past, against OpenSSH's own format and one real device signature.
       - run: python3 tests/test_sshsig.py
+      # Added 2026-10-01: the operator's BCC copy of every approved send. Guards that the
+      # address never reaches a header the employer sees.
+      - run: python3 tests/test_sent_copy.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #

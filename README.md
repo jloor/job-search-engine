@@ -677,6 +677,14 @@ rule and the payload live in `notify.py`, and `SECURITY.md` says what leaves the
 | `NOTIFY_WINDOW_HRS` | `24` | How far back the sweep looks. Older mail never alerts. |
 | `NOTIFY_MAX_TRIES` | `5` | Sends per message before it stays `failed`. |
 
+### The sent copy (`SENT_COPY_BCC`)
+
+Resend keeps no copy in the operator's mailbox. When `SENT_COPY_BCC` is one address, every
+approved `/send` BCCs it, on both transports. The copy has the same `In-Reply-To` and
+`References`, so it files inside the employer's conversation; a mail rule moves it to Sent.
+The address is in the envelope only and never in a header. A malformed value sends no copy
+and writes `sent_copy_config` to the audit log; it never fails the send.
+
 ### Prompt caching, switched on by batch size
 
 The stable prefix is the system prompt **plus the output schema**, and the schema is the
