@@ -72,6 +72,9 @@ jobs:
       # application, which is stronger evidence. Nine were dark, including
       # Anthropic and Phreesia. Guards that it never lights an unrelated one.
       - run: python3 tests/test_board_enable.py
+      # Added 2026-10-01: the phone alert. Guards that a message alerts once, that the
+      # body never goes out with it, and that a failed send is loud.
+      - run: python3 tests/test_notify.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #

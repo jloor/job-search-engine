@@ -239,6 +239,25 @@ comp research, salary floors, and the body of any message the rules already labe
 **Turn it off with `AI_READ_ENABLED=0`.** Removing the configured provider's key also
 stops it, and the job then reports that it skipped rather than failing silently.
 
+## Mail metadata leaves the box for the phone alert — added 2026-10-01 with `notify.py`
+
+When `NTFY_URL` is set, the relay posts an alert to that ntfy server for mail a person
+must see: any mail on a row at `interview` or `offer`, a DMARC warning, and a short list of
+labels (interview, scheduling, assessment, security code, unknown, lead, recruiter outreach).
+
+**What goes:** the sender name and address, the subject, the label, the delivery alias,
+the message id, and the company name from the matched application. **What does not go:**
+the body, in any form.
+
+- 🚨 **On ntfy.sh, the topic name is the only access control.** Anyone who knows it can
+  read the alerts. Use a long random topic, or a reserved topic with `NTFY_TOKEN`. The URL
+  is never written to a log.
+- ⚠️ **ntfy.sh holds each alert for about 12 hours**, and Android delivery goes through
+  Firebase. Both are third parties that see the subject line.
+- ⚠️ **Everything in the alert is written by the sender.** It is a prompt to go and read,
+  never an instruction to act on.
+- **Turn it off** by unsetting `NTFY_URL`. The sweep then reports `disabled`.
+
 ### Which third party sees the mail is a setting
 
 `AI_PROVIDER` decides where message bodies go, so the answer to "who has my mail" is a

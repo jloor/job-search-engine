@@ -662,6 +662,21 @@ mail from an agency recruiter is about a job at a different company. From a prob
 | `AI_EFFORT` | `low` | Labelling is not a reasoning problem. **Empty for Haiku 4.5**, which rejects the parameter with a 400. |
 | `AI_MAX_BODY_CHARS` | `6000` | A rejection says what it says in the first paragraph. |
 
+### The phone alert (`notify`)
+
+The inbound webhook starts an alert on a thread as soon as a message is parsed. The
+`notify` job is the backstop: it retries a failed send and re-decides a message whose label
+the model changed. A conditional claim on the row makes sure one message alerts once. The
+rule and the payload live in `notify.py`, and `SECURITY.md` says what leaves the box.
+
+| Setting | Default | Does |
+|---|---|---|
+| `NTFY_URL` | unset | The full topic URL, `https://ntfy.sh/<long-random-topic>`. Unset turns the feature off. 🚨 A secret. |
+| `NTFY_TOKEN` | unset | Bearer token for a reserved topic or a self-hosted server. |
+| `NOTIFY_EVERY_MIN` | `3` | How often the backstop sweep runs. |
+| `NOTIFY_WINDOW_HRS` | `24` | How far back the sweep looks. Older mail never alerts. |
+| `NOTIFY_MAX_TRIES` | `5` | Sends per message before it stays `failed`. |
+
 ### Prompt caching, switched on by batch size
 
 The stable prefix is the system prompt **plus the output schema**, and the schema is the

@@ -43,7 +43,17 @@ CREATE TABLE IF NOT EXISTS message (
   auth_spf       TEXT,
   auth_dkim      TEXT,
   auth_dmarc     TEXT,
-  auth_warn      INTEGER NOT NULL DEFAULT 0
+  auth_warn      INTEGER NOT NULL DEFAULT 0,
+  -- The phone alert (notify.py). notify_state is NULL until decided, then
+  -- skipped | sending | sent | failed. notify_label is the label the decision was taken on:
+  -- when the model later changes the label, a skipped message is decided again.
+  -- ⚠️ An alert is a hint to go and read. Nothing reads these columns to act on mail.
+  notify_state    TEXT,
+  notify_label    TEXT,
+  notify_reason   TEXT,
+  notify_at       TEXT,
+  notify_attempts INTEGER NOT NULL DEFAULT 0,
+  notify_detail   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_message_alias   ON message(to_alias);
 CREATE INDEX IF NOT EXISTS idx_message_recv    ON message(received_at DESC);

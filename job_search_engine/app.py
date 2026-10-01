@@ -861,6 +861,13 @@ MIGRATIONS = [
      "finished_at TEXT, note TEXT)"),
     ("CREATE INDEX IF NOT EXISTS idx_fantastic_run_wm "
      "ON fantastic_run(endpoint, query_label, id DESC)"),
+    # 2026-10-01: the phone alert. Declared in schema.sql with the reasoning; see notify.py.
+    "ALTER TABLE message ADD COLUMN notify_state TEXT",
+    "ALTER TABLE message ADD COLUMN notify_label TEXT",
+    "ALTER TABLE message ADD COLUMN notify_reason TEXT",
+    "ALTER TABLE message ADD COLUMN notify_at TEXT",
+    "ALTER TABLE message ADD COLUMN notify_attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE message ADD COLUMN notify_detail TEXT",
 ]
 
 
@@ -6817,6 +6824,118 @@ def job_interactions() -> str:
     return f"recorded {made} inbound interaction(s) from {len(msgs)} resolved message(s)"
 
 
+# ── the phone alert ──────────────────────────────────────────────────────────────────────
+# ⭐ TWO PATHS TO ONE FUNCTION. The inbound webhook starts notify_message on a thread, so an
+# alert lands within seconds. job_notify sweeps on a timer as the backstop: a send that failed,
+# a process that died mid-send, and a message whose label the model changed after the first
+# decision. Both paths claim the row with a conditional UPDATE, so a message alerts once.
+# 🚨 NTFY_URL IS A SECRET. On ntfy.sh the topic name is the only thing that keeps the alerts
+# private, so it is never logged. An empty value turns the whole feature off.
+NTFY_URL           = os.environ.get("NTFY_URL", "").strip()
+NTFY_TOKEN         = os.environ.get("NTFY_TOKEN", "").strip()
+NOTIFY_EVERY_MIN   = int(os.environ.get("NOTIFY_EVERY_MIN", "3"))
+NOTIFY_WINDOW_HRS  = int(os.environ.get("NOTIFY_WINDOW_HRS", "24"))
+NOTIFY_MAX_TRIES   = int(os.environ.get("NOTIFY_MAX_TRIES", "5"))
+NOTIFY_STALE_MIN   = 10           # a 'sending' claim older than this belongs to a dead thread
+
+
+def _ago(**kw) -> str:
+    return (datetime.now(timezone.utc) - timedelta(**kw)).isoformat(timespec="seconds")
+
+
+def _notify_target(con, m) -> tuple[str | None, str | None]:
+    """(application status, company) for a message, or (None, None) when it is not exactly
+    one application. A human's resolution outranks the alias, the same order job_track uses."""
+    try:
+        if m["resolved_application_id"]:
+            row = con.execute("SELECT status, company_raw FROM application WHERE id=?",
+                              (m["resolved_application_id"],)).fetchone()
+        else:
+            row = _resolve_one(con, (m["application_ref"] or "").lower())
+    except Exception:                                   # no application table: no status
+        return None, None
+    if row is None:
+        return None, None
+    company = re.sub(r"[*_`]|\s*[⭐(].*$", "", row["company_raw"] or "").strip() or None
+    return row["status"], company
+
+
+def notify_message(mid: int) -> str:
+    """Decide and, when warranted, send the alert for one message. Never raises."""
+    if not NTFY_URL:
+        return "disabled"
+    try:
+        import notify as _N
+        with db() as con:
+            m = con.execute(
+                "SELECT id, to_alias, from_addr, from_name, subject, classification, auth_warn, "
+                "       application_ref, resolved_application_id, notify_state, notify_label "
+                "  FROM message WHERE id=?", (mid,)).fetchone()
+            if m is None:
+                return "missing"
+            status, company = _notify_target(con, m)
+        m = dict(m)
+        reason = _N.decide(m["classification"], bool(m["auth_warn"]), status)
+        if reason is None:
+            with db() as con:
+                con.execute("UPDATE message SET notify_state='skipped', notify_label=?, "
+                            "       notify_at=? "
+                            " WHERE id=? AND (notify_state IS NULL OR notify_state='skipped')",
+                            (m["classification"], now(), mid))
+            return "skipped"
+        # 🚨 THE CLAIM IS THE ONLY GUARD AGAINST A DOUBLE ALERT. The webhook thread and the
+        # sweep can reach the same row; the WHERE clause lets exactly one of them through.
+        with db() as con:
+            cur = con.execute(
+                "UPDATE message SET notify_state='sending', notify_at=?, notify_reason=? "
+                " WHERE id=? AND (notify_state IS NULL OR notify_state='skipped' "
+                "   OR (notify_state='failed' AND notify_attempts < ?) "
+                "   OR (notify_state='sending' AND notify_at < ?))",
+                (now(), reason, mid, NOTIFY_MAX_TRIES, _ago(minutes=NOTIFY_STALE_MIN)))
+            if not (cur.rowcount or 0):
+                return "claimed elsewhere"
+        ok, detail = _N.send(NTFY_URL, NTFY_TOKEN, _N.build(m, reason, company))
+        with db() as con:
+            con.execute("UPDATE message SET notify_state=?, notify_label=?, notify_at=?, "
+                        "       notify_detail=?, notify_attempts=notify_attempts+1 WHERE id=?",
+                        ("sent" if ok else "failed", m["classification"], now(), detail, mid))
+            log_event(con, "notify_sent" if ok else "notify_failed",
+                      f"message {mid} {reason}: {detail}")
+        return "sent" if ok else f"failed: {detail}"
+    except Exception as e:
+        audit("notify_error", f"message {mid}: {type(e).__name__}: {e}")
+        return f"error: {type(e).__name__}"
+
+
+def job_notify() -> str:
+    """Backstop sweep for the phone alert. See the block comment above notify_message."""
+    if not NTFY_URL:
+        return "disabled (NTFY_URL unset)"
+    # ⚠️ A minute's grace: a row younger than that may still be mid-ingest (raw saved, not
+    # parsed), and its webhook thread owns it. Deciding on a NULL label would alert 'unknown'.
+    with db() as con:
+        ids = [r["id"] for r in con.execute(
+            "SELECT id FROM message "
+            " WHERE received_at >= ? AND received_at <= ? AND ("
+            "       notify_state IS NULL "
+            "    OR (notify_state='failed' AND notify_attempts < ?) "
+            "    OR (notify_state='sending' AND notify_at < ?) "
+            "    OR (notify_state='skipped' AND COALESCE(notify_label,'') <> "
+            "                                   COALESCE(classification,''))) "
+            " ORDER BY id",
+            (_ago(hours=NOTIFY_WINDOW_HRS), _ago(minutes=1), NOTIFY_MAX_TRIES,
+             _ago(minutes=NOTIFY_STALE_MIN)))]
+    if not ids:
+        return "nothing to notify"
+    out = {}
+    for mid in ids:
+        r = notify_message(mid).split(":")[0]
+        out[r] = out.get(r, 0) + 1
+    # ⚠️ Failures are in the return string, so /diag/jobs shows them. A silent alert path is
+    # the problem this feature exists to fix.
+    return "; ".join(f"{k} {v}" for k, v in sorted(out.items()))
+
+
 
 # ── the ease tier ────────────────────────────────────────────────────────────────────────
 # 🚨 THE ENGINE OWNS THIS RULE NOW, AND ease-rank DEFERS TO IT. The letter used to be computed
@@ -9188,6 +9307,9 @@ def job_table() -> list:
             # Cheap and database-only. It reads resolved mail and writes timeline rows; it
             # makes no network call and cannot see outbound mail, which arrives by hand.
             ("interactions", INTERACTIONS_EVERY_MIN * 60, job_interactions),
+            # 📱 The backstop for the phone alert. The webhook sends first; this retries a
+            # failed send and re-decides a message whose label the model changed.
+            ("notify", NOTIFY_EVERY_MIN * 60, job_notify),
             # ⭐ AFTER triage and remote_check, never beside them. It only reads forms for rows
             # that already passed the cheap gates, so those must have run first, and it costs a
             # browser per row. Default interval 0 = MANUAL ONLY until the backfill is done and
@@ -10038,6 +10160,10 @@ async def inbound(token: str, request: Request):
             if auth_warn:
                 log_event(con, "inbound_auth_warning",
                           f"message {mid} from {addr}: spf={spf} dkim={dkim} dmarc={dmarc}", ip)
+        # 📱 The phone alert, OFF the request path. ImprovMX retries a slow answer, so a
+        # network call here would buy duplicate messages. job_notify catches a lost thread.
+        if NTFY_URL:
+            threading.Thread(target=notify_message, args=(mid,), daemon=True).start()
         return {"ok": True, "id": mid, "classification": label, "application": app_ref,
                 "auth": {"spf": spf, "dkim": dkim, "dmarc": dmarc, "suspect": bool(auth_warn)}}
 
