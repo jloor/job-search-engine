@@ -68,7 +68,11 @@ def mint(fp: str, key_hex: str, ttl: int) -> str:
 
 
 SK_NAMESPACE = "job-search-send"     # must equal APPROVAL_SK_NAMESPACE in app.py
-TOUCH_WINDOW_S = 60
+# ⭐ 240s, 2026-10-01: four minutes to read a full email before deciding, at his request.
+# ⚠️ The YubiKey itself stops waiting for a touch after about 30 seconds, so a long window
+# alone made a slow read fail. touch_sign re-arms the key while the window stays open.
+TOUCH_WINDOW_S = 240
+REARM_LIMIT = 40          # re-arms per window: a key that fails instantly must not spin forever
 
 
 def touch_sign(key: str, message: bytes, header: list[str], body: str) -> tuple[str | None, str]:
@@ -91,7 +95,7 @@ def touch_sign(key: str, message: bytes, header: list[str], body: str) -> tuple[
     from gi.repository import GLib, Gtk
 
     st = {"sig": None, "why": "cancelled: window closed", "proc": None, "over": False,
-          "left": TOUCH_WINDOW_S}
+          "left": TOUCH_WINDOW_S, "arms": 0}
 
     def finish(why=None):
         if st["over"]:
@@ -137,8 +141,10 @@ def touch_sign(key: str, message: bytes, header: list[str], body: str) -> tuple[
         if st["over"]:
             return False
         st["left"] -= 1
+        m, s = divmod(st["left"], 60)
         status.set_markup(f"<big><b>Read it. Then touch your YubiKey to send this exact email.</b></big>\n"
-                          f"Close this window to cancel. {st['left']}s left.")
+                          f"Touch any time while this window is open. Close it to cancel. "
+                          f"{m}:{s:02d} left.")
         if st["left"] <= 0:
             return finish("cancelled: no touch within the time limit")
         return True
@@ -146,6 +152,7 @@ def touch_sign(key: str, message: bytes, header: list[str], body: str) -> tuple[
     def start():
         if st["over"]:
             return False
+        st["arms"] += 1
         # ⚠️ SSH_ASKPASS_REQUIRE=never: there is no askpass here, and a PIN prompt it cannot
         # show would be sent EMPTY and burn a PIN attempt. A key that wants a PIN fails instead.
         env = {**os.environ, "SSH_ASKPASS_REQUIRE": "never"}
@@ -162,7 +169,16 @@ def touch_sign(key: str, message: bytes, header: list[str], body: str) -> tuple[
                 if p.returncode == 0 and out.startswith(b"-----BEGIN SSH SIGNATURE-----"):
                     st["sig"] = out.decode()
                     return finish("signed")
-                return finish("refused by the key: " + err.decode(errors="replace").strip()[-300:])
+                # The key timed out waiting for a touch (about 30s) while he was still
+                # reading. Ask it again, unless the window is nearly done or the key keeps
+                # failing at once, which means something other than a timeout is wrong.
+                if st["left"] > 3 and st["arms"] < REARM_LIMIT:
+                    GLib.timeout_add(500, start)
+                    return False
+                lines = [l for l in err.decode(errors="replace").splitlines()
+                         if l.strip() and "Signing data on standard input" not in l]
+                return finish("refused by the key: " + (" | ".join(lines)[-300:] or
+                                                        f"exit {p.returncode}"))
             GLib.idle_add(done)
         threading.Thread(target=run, daemon=True).start()
         return False
