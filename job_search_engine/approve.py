@@ -67,6 +67,140 @@ def mint(fp: str, key_hex: str, ttl: int) -> str:
     return f"{nonce}.{expires}.{base64.urlsafe_b64encode(sig).decode().rstrip('=')}"
 
 
+SK_NAMESPACE = "job-search-send"     # must equal APPROVAL_SK_NAMESPACE in app.py
+TOUCH_WINDOW_S = 60
+
+
+def touch_sign(key: str, message: bytes, header: list[str], body: str) -> tuple[str | None, str]:
+    """Show the exact email in a window, then ask the security key to sign. (armored, why).
+
+    ⭐ THE WINDOW IS THE GATE, NOT THE TOUCH. A touch proves someone was there, not what they
+    read. So the window opens FIRST, the key is only asked to sign a moment later, and closing
+    the window or letting it time out kills the request before anything is signed.
+
+    🚨 WHAT IT SHOWS IS WHAT IS SIGNED. `header` and `body` are the same strings the
+    fingerprint was computed from, and the relay re-computes the fingerprint from the bytes it
+    sends. A window that showed different text would produce a signature the relay refuses.
+
+    ⚠️ The agent that runs this can still call ssh-keygen directly, and then the key blinks
+    with no window. The rule for the human is simple: no window, no touch.
+    """
+    import subprocess, threading
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import GLib, Gtk
+
+    st = {"sig": None, "why": "cancelled: window closed", "proc": None, "over": False,
+          "left": TOUCH_WINDOW_S}
+
+    def finish(why=None):
+        if st["over"]:
+            return False
+        st["over"] = True
+        if why:
+            st["why"] = why
+        p = st["proc"]
+        if p and p.poll() is None:
+            p.kill()
+        Gtk.main_quit()
+        return False
+
+    win = Gtk.Window(title="Approve this email (job-search)")
+    win.set_default_size(780, 640)
+    win.set_keep_above(True)
+    win.set_urgency_hint(True)
+    win.connect("delete-event", lambda *a: finish("cancelled: window closed") or False)
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+    for side in ("top", "bottom", "start", "end"):
+        getattr(box, f"set_margin_{side}")(16)
+    win.add(box)
+
+    head = Gtk.Label(xalign=0)
+    head.set_selectable(True)
+    head.set_markup("\n".join(f"<b>{GLib.markup_escape_text(h.split(':', 1)[0])}:</b>"
+                              f"{GLib.markup_escape_text(h.split(':', 1)[1])}" for h in header))
+    box.pack_start(head, False, False, 0)
+
+    view = Gtk.TextView(editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.WORD)
+    view.get_buffer().set_text(body)
+    scroll = Gtk.ScrolledWindow(vexpand=True)
+    scroll.add(view)
+    box.pack_start(scroll, True, True, 0)
+
+    status = Gtk.Label(xalign=0)
+    box.pack_start(status, False, False, 0)
+    cancel = Gtk.Button(label="Cancel, do not send")
+    cancel.connect("clicked", lambda *a: finish("cancelled: button"))
+    box.pack_start(cancel, False, False, 0)
+
+    def tick():
+        if st["over"]:
+            return False
+        st["left"] -= 1
+        status.set_markup(f"<big><b>Read it. Then touch your YubiKey to send this exact email.</b></big>\n"
+                          f"Close this window to cancel. {st['left']}s left.")
+        if st["left"] <= 0:
+            return finish("cancelled: no touch within the time limit")
+        return True
+
+    def start():
+        if st["over"]:
+            return False
+        # ⚠️ SSH_ASKPASS_REQUIRE=never: there is no askpass here, and a PIN prompt it cannot
+        # show would be sent EMPTY and burn a PIN attempt. A key that wants a PIN fails instead.
+        env = {**os.environ, "SSH_ASKPASS_REQUIRE": "never"}
+        p = subprocess.Popen(["ssh-keygen", "-Y", "sign", "-f", key, "-n", SK_NAMESPACE],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, env=env)
+        st["proc"] = p
+
+        def run():
+            out, err = p.communicate(message)
+            def done():
+                if st["over"]:
+                    return False
+                if p.returncode == 0 and out.startswith(b"-----BEGIN SSH SIGNATURE-----"):
+                    st["sig"] = out.decode()
+                    return finish("signed")
+                return finish("refused by the key: " + err.decode(errors="replace").strip()[-300:])
+            GLib.idle_add(done)
+        threading.Thread(target=run, daemon=True).start()
+        return False
+
+    tick()
+    win.show_all()
+    win.present()
+    GLib.timeout_add(1000, tick)
+    GLib.timeout_add(1200, start)      # the window is on screen before the key ever blinks
+    Gtk.main()
+    win.destroy()
+    while Gtk.events_pending():
+        Gtk.main_iteration()
+    return st["sig"], st["why"]
+
+
+def mint_sk(fp: str, key: str, ttl: int, header: list[str], body: str) -> str | None:
+    """`sk1.<nonce>.<expires>.<base64url SSHSIG>`, or None when nothing was signed."""
+    import sshsig
+    nonce = secrets.token_urlsafe(12)
+    expires = int(time.time()) + ttl
+    msg = f"{nonce}.{expires}.{fp}".encode()
+    armored, why = touch_sign(key, msg, header, body)
+    if not armored:
+        print(f"nothing approved: {why}", file=sys.stderr)
+        return None
+    blob = sshsig.unarmor(armored)
+    # Check it here first, against the key's own public half. A refusal now names the reason;
+    # the relay deliberately answers every failure with the same words.
+    try:
+        allowed = [sshsig.parse_pubkey_line(open(key + ".pub").read())]
+        sshsig.verify(blob, msg, SK_NAMESPACE, allowed)
+    except Exception as e:
+        print(f"the signature does not verify locally: {e}", file=sys.stderr)
+        return None
+    return f"sk1.{nonce}.{expires}.{base64.urlsafe_b64encode(blob).decode().rstrip('=')}"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Approve one outgoing relay message.")
     ap.add_argument("--from", dest="from_alias", required=True)
@@ -81,7 +215,27 @@ def main() -> int:
     ap.add_argument("--send", action="store_true", help="POST to the relay after confirming")
     ap.add_argument("--print-token", action="store_true", help="print the token and exit")
     ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    ap.add_argument("--sk-key", default=None,
+                    help="security-key handle (~/.ssh/id_ed25519_sk_...). Approve with a touch, "
+                         "shown in a window; APPROVAL_KEY is not used")
     a = ap.parse_args()
+
+    if a.sk_key:
+        if a.yes:
+            # The window is the gate. There is nothing to skip.
+            print("--yes does not apply to a security-key approval", file=sys.stderr)
+            return 2
+        body = open(a.body_file, encoding="utf-8").read() if a.body_file else a.body
+        fp = fingerprint(a.from_alias, a.to, a.subject, body)
+        header = [f"From: {a.from_alias}", f"To: {a.to}", f"Subject: {a.subject}"]
+        if a.reply_to:
+            header.append(f"In reply to: message {a.reply_to}")
+        print(f"waiting for approval in the window: fingerprint {fp[:16]}…, {TOUCH_WINDOW_S}s",
+              file=sys.stderr)
+        token = mint_sk(fp, a.sk_key, a.ttl, header, body)
+        if not token:
+            return 1
+        return _deliver(a, body, token)
 
     secret = os.environ.get("APPROVAL_KEY", "")
     if not secret:
@@ -111,6 +265,11 @@ def main() -> int:
             return 1
 
     token = mint(fp, secret, a.ttl)
+    return _deliver(a, body, token)
+
+
+def _deliver(a, body: str, token: str) -> int:
+    """Print the token, or POST the approved message to the relay."""
     if a.print_token or not a.send:
         print(token)
         return 0

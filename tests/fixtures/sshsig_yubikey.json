@@ -1,0 +1,7 @@
+{
+  "_note": "A real signature made by a YubiKey 5C on 2026-10-01 with `ssh-keygen -Y sign`, and checked with `ssh-keygen -Y verify` before it was saved. Public data only: a public key and a signature over a fixed test string. It proves sshsig.py reads OpenSSH's format, not merely a format this repo built itself.",
+  "namespace": "job-search-send",
+  "message": "job-search-send fixture 2026-10-01: a real YubiKey signature over a fixed test string",
+  "public_key": "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIISdDEWTyRKm1z4+mKVh126Y9K6gkgz85ghoArmaxbCdAAAAE3NzaDpqb2Itc2VhcmNoLXNlbmQ= test-fixture",
+  "signature": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAAFkAAAAac2stc3NoLWVkMjU1MTlAb3BlbnNzaC5jb20AAAAghJ0MRZ\nPJEqbXPj6YpWHXbpj0rqCSDPzmCGgCuZrFsJ0AAAATc3NoOmpvYi1zZWFyY2gtc2VuZAAA\nAA9qb2Itc2VhcmNoLXNlbmQAAAAAAAAABnNoYTUxMgAAAGcAAAAac2stc3NoLWVkMjU1MT\nlAb3BlbnNzaC5jb20AAABAub0/Vc0XeTnWU9rhtv36ggSxzjE7T/guOresZIx9HAQKlPf3\ndfruvAoe0SPU/5TQ1qvpgkokW2lA9m4K3PVBCgEAAAAI\n-----END SSH SIGNATURE-----\n"
+}

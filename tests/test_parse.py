@@ -2157,6 +2157,13 @@ On Wed, Aug 12, 2026 the candidate wrote:
                 continue
             for _one in _namesm:
                 _top = _one.split(".")[0]
+                # 📌 LAPTOP-ONLY, NAMED AND NARROW, 2026-10-01. approve.py runs on the
+                # operator's machine, never in the container, and its approval window uses
+                # GTK through `gi` (PyGObject), which the desktop provides and pip cannot build
+                # without system libraries. Exempt ONLY in approve.py: if the relay ever
+                # imports it, this check fails again, which is the point.
+                if _top == "gi" and _srcm.name == "approve.py":
+                    continue
                 if _top and _top not in sys.stdlib_module_names and _top not in _localm:
                     _thirdparty.add(_top.replace("_", "-").lower())
 

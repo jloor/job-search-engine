@@ -1030,7 +1030,32 @@ def fingerprint(from_alias: str, to: str, subject: str, body: str) -> str:
 # container to verify, so anyone who compromised the host could also MINT approvals and
 # the human gate would be decoration. A public key verifies without being able to sign.
 # Host compromise now costs the mailbox, not the ability to send mail as him.
+# 🚨 CORRECTED 2026-10-01: NOT TRUE WHILE RESEND_API_KEY IS IN THIS CONTAINER. A compromised
+# host can call Resend directly and skip /send entirely. The gate stops agents and stolen
+# tokens; it cannot stop the host that holds the sending credential. See SECURITY.md.
 APPROVAL_PUBKEY = os.environ.get("APPROVAL_PUBKEY", "").strip()
+
+# 🔑 FIDO2 security keys, 2026-10-01. OpenSSH public key lines, `;`-separated, each an
+# sk-ssh-ed25519 key held on a YubiKey. A token starting `sk1.` is checked against these.
+# ⭐ WHY. APPROVAL_PUBKEY's private half was a file on the laptop that every agent there could
+# read, so the human gate held by convention. A security key's private half cannot leave the
+# device and each signature carries a touch flag; see sshsig.py.
+# APPROVAL_SK_ONLY=1 refuses every other kind of approval, once the touch path has proven itself.
+APPROVAL_SK_KEYS      = os.environ.get("APPROVAL_SK_KEYS", "").strip()
+APPROVAL_SK_ONLY      = os.environ.get("APPROVAL_SK_ONLY", "0").strip() in ("1", "true", "yes")
+APPROVAL_SK_NAMESPACE = "job-search-send"
+
+
+def _sk_allowed() -> list:
+    import sshsig as _S
+    out = []
+    for line in APPROVAL_SK_KEYS.split(";"):
+        if line.strip():
+            try:
+                out.append(_S.parse_pubkey_line(line))
+            except Exception as e:                          # a bad line is loud, not skipped
+                audit("approval_sk_config", f"unusable APPROVAL_SK_KEYS entry: {e}")
+    return out
 
 
 def mint_approval(fp: str, secret: str, ttl: int = APPROVAL_TTL) -> str:
@@ -1045,11 +1070,16 @@ def mint_approval(fp: str, secret: str, ttl: int = APPROVAL_TTL) -> str:
 
 def verify_approval(token: str | None, fp: str, ip: str) -> str:
     """Return the nonce if the approval is valid for exactly this content, else 403."""
-    if not (APPROVAL_PUBKEY or APPROVAL_SECRET):
+    if not (APPROVAL_PUBKEY or APPROVAL_SECRET or APPROVAL_SK_KEYS):
         raise HTTPException(500, "no approval key configured")
     if not token:
         audit("send_refused", "no approval token", ip)
         raise HTTPException(403, "refused: X-Approval required. Mint one with approve.py (SPEC P5)")
+    if token.startswith("sk1."):
+        return _verify_sk(token, fp, ip)
+    if APPROVAL_SK_ONLY:
+        audit("send_refused", "APPROVAL_SK_ONLY is set and this approval is not a security key's", ip)
+        raise HTTPException(403, "refused: only a security-key approval is accepted")
     try:
         nonce, expires_s, sig = token.split(".", 2)
         expires = int(expires_s)
@@ -1078,6 +1108,37 @@ def verify_approval(token: str | None, fp: str, ip: str) -> str:
     if time.time() > expires:
         audit("send_refused", f"approval expired at {expires}", ip)
         raise HTTPException(403, "refused: approval expired")
+    return nonce
+
+
+def _verify_sk(token: str, fp: str, ip: str) -> str:
+    """`sk1.<nonce>.<expires>.<base64url SSHSIG blob>`, signed over `<nonce>.<expires>.<fp>`.
+    The nonce is single-use exactly as for the other schemes: the caller burns it."""
+    import base64
+    import sshsig as _S
+    try:
+        _, nonce, expires_s, b64 = token.split(".", 3)
+        expires = int(expires_s)
+        blob = base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4))
+    except Exception:
+        audit("send_refused", "malformed security-key approval", ip)
+        raise HTTPException(403, "refused: malformed approval token")
+    allowed = _sk_allowed()
+    if not allowed:
+        audit("send_refused", "security-key approval sent, but no APPROVAL_SK_KEYS configured", ip)
+        raise HTTPException(403, "refused: approval does not match this message")
+    try:
+        got = _S.verify(blob, f"{nonce}.{expires}.{fp}".encode(), APPROVAL_SK_NAMESPACE, allowed)
+    except _S.Invalid as e:
+        # The specific reason goes to the audit log only. The caller gets the same answer for
+        # every failure, so the endpoint cannot be used to learn which check a forgery missed.
+        audit("send_refused", f"security-key approval refused: {e}", ip)
+        raise HTTPException(403, "refused: approval does not match this message")
+    if time.time() > expires:
+        audit("send_refused", f"approval expired at {expires}", ip)
+        raise HTTPException(403, "refused: approval expired")
+    audit("send_approved_sk", f"key {got['key_index']} counter {got['counter']} "
+                              f"flags {got['flags']:#04x} fp {fp[:16]}", ip)
     return nonce
 
 
@@ -9646,8 +9707,9 @@ def diag_config(request: Request, authorization: str | None = Header(None)):
     secret = ["BUNNY_DATABASE_AUTH_TOKEN", "ADMIN_TOKEN", "READ_TOKEN", "API_TOKEN",
               "INBOUND_TOKEN", "APPROVAL_PUBKEY", "BACKUP_PUBKEY", "SMTP_PASS",
               "STORAGE_KEY", "GIT_DEPLOY_KEY_B64", "ANTHROPIC_API_KEY", "AI_API_KEY",
-              "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GOOGLE_MAPS_API_KEY", "RESEND_API_KEY"]
-    plain = ["MAIL_DOMAIN", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "STORAGE_ZONE",
+              "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GOOGLE_MAPS_API_KEY", "RESEND_API_KEY",
+              "APPROVAL_SK_KEYS", "NTFY_URL", "NTFY_TOKEN"]
+    plain = ["APPROVAL_SK_ONLY", "MAIL_DOMAIN", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "STORAGE_ZONE",
              "STORAGE_HOST", "AI_PROVIDER", "AI_MODEL", "AI_BASE_URL", "AI_READ_ENABLED",
              "AI_READ_SCOPE", "TRUSTED_PROXY_HOPS", "GIT_REPO_SSH", "GIT_AUTHOR_EMAIL",
              "RESTART_MARKER", "ALLOW_INBOUND_IPS", "DATA_DIR", "APPLICATIONS_DIR"]

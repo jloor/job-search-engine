@@ -75,6 +75,9 @@ jobs:
       # Added 2026-10-01: the phone alert. Guards that a message alerts once, that the
       # body never goes out with it, and that a failed send is loud.
       - run: python3 tests/test_notify.py
+      # Added 2026-10-01: send approvals by YubiKey touch. Guards every refusal a forged
+      # approval could slip past, against OpenSSH's own format and one real device signature.
+      - run: python3 tests/test_sshsig.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #

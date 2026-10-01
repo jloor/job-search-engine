@@ -50,6 +50,42 @@ Consequences, all tested:
 - The nonce burns **before** the SMTP attempt, so a failed send does not hand back a
   reusable approval.
 
+### 🔑 Approval by security-key touch — added 2026-10-01 with `sshsig.py`
+
+⚠️ **The file key held by convention, not by mechanism.** The Ed25519 approval key lived in
+an env file on the operator's laptop, and any agent working there could read it and mint an
+approval. The gate stopped a stolen API token; it did not stop a local agent that chose to
+ignore the rule.
+
+**Now:** `approve.py --sk-key` signs with an `sk-ssh-ed25519` key on a YubiKey through
+`ssh-keygen -Y sign`. The private half cannot leave the device. The relay verifies the
+OpenSSH signature against `APPROVAL_SK_KEYS` and refuses it unless **all** of these hold:
+
+- the key is on the allowlist (any other YubiKey is refused)
+- the namespace is `job-search-send` (a git or funlab signature from the same device is refused)
+- the device's **user-presence flag** is set, inside the signed bytes (no touch, no send)
+- the signature covers `nonce.expiry.fingerprint` for these exact bytes, as before
+
+Token format: `sk1.<nonce>.<expiry>.<base64url SSHSIG>`. Nonce burning and expiry are unchanged.
+
+**The window is the gate, the touch is the proof.** A touch proves presence, not reading. So
+`approve.py` opens a window with the exact email first and asks the key to sign about a second
+later. Closing it, or 60 seconds without a touch, kills the request. The rule for the human:
+**the key blinks only after the window is on screen. No window, no touch.**
+
+Residual risks, stated plainly:
+
+- An agent with a shell on the laptop can call `ssh-keygen` itself. The key then blinks with
+  no window. It still cannot sign without the touch, which is why the rule above matters.
+- An agent that can edit `approve.py` could make the window show one thing and sign another.
+  The relay would refuse a mismatch with what it sends, but not a draft that the agent swapped
+  for both. Run `approve.py` from the pinned install, and keep agents' write access off it.
+- 🚨 **The container holds `RESEND_API_KEY`.** Someone who compromises the container can send
+  mail without any approval. The gate protects against agents and stolen tokens, not against
+  a compromised host, and no approval scheme on this side can change that.
+- `APPROVAL_SK_ONLY=1` turns the file-key path off. Leave it off only until the touch path has
+  sent real mail; the file key is the fallback for a lost YubiKey.
+
 ## X-Forwarded-For
 
 `ALLOW_INBOUND_IPS` is only as good as the IP it reads. XFF is caller-controlled on the
