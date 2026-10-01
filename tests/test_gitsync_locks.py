@@ -18,7 +18,9 @@ startup cannot have a live owner.
 Run:  python3 tests/test_gitsync_locks.py
 """
 import importlib.util, pathlib, subprocess, sys, tempfile
-SRC = pathlib.Path("/home/bullwinkle/job-search-engine/job_search_engine")
+# ⚠️ Relative to this file, never an absolute path. An absolute path to one laptop passed
+# there and failed on every CI runner, and the failed step hid every test after it.
+SRC = pathlib.Path(__file__).resolve().parent.parent / "job_search_engine"
 tmp = pathlib.Path(tempfile.mkdtemp())
 repo = tmp / "repo"
 repo.mkdir()
