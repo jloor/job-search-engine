@@ -91,6 +91,49 @@ Residual risks, stated plainly:
 - `APPROVAL_SK_ONLY=1` turns the file-key path off. Leave it off only until the touch path has
   sent real mail; the file key is the fallback for a lost YubiKey.
 
+### 📱 Approval by passkey (WebAuthn) — added 2026-10-07 with `passkey.py`
+
+**Why.** The operator's agents moved to a machine that holds the admin token, and the
+security-key path needs the laptop. A passkey lets him approve from a phone: a YubiKey over
+NFC, or a phone passkey. Set `PUBLIC_URL`; it is the origin, and its host is the RP ID.
+
+**Flow.** `POST /send/queue` (admin) stores the exact email and its fingerprint and sends an
+ntfy alert that opens `/approve/<token>`. **Nothing is sent by queueing.** The page shows the
+email. The challenge is 16 random bytes followed by the 32-byte fingerprint. The relay refuses
+the assertion unless **all** of these hold:
+
+- the credential is **active** (see enrollment below) and its signature verifies
+- origin, RP ID and challenge match; the challenge is single-use and five minutes old at most
+- the **user-verification flag** is set (a PIN or a biometric, not only a touch)
+- the sign count grew, or both values are 0 (many passkeys never count)
+- the fingerprint recomputed from the stored email equals the one stored at queue time AND the
+  one inside the signed challenge, so an email edited after queueing cannot be sent
+
+Then the same delivery code as `/send` runs: single-use nonce, rate limit, known-recipient
+rule, BCC copy. A passkey approval counts as hardware-backed for `SK_ALLOWS_COLD`.
+
+🚨 **Enrollment needs a hardware key, because software can make a passkey.** A WebAuthn
+credential is a key pair. If the admin token alone could register one, any agent holding that
+token could enroll a software "passkey" and approve its own mail. So:
+
+1. `POST /passkey/enroll` (admin) mints a one-time link. The phone registers on it. The
+   credential is stored **pending** and both sides show a short code.
+2. `approve.py passkey-activate --sk-key …` on the operator's machine shows that code in a
+   window and signs an activation with a key in `APPROVAL_SK_KEYS`, in the namespace
+   **`job-search-enroll`**, over the credential id and the SHA-256 of its public key. A send
+   approval cannot be replayed as an activation, or the other way round.
+
+Residual risks, stated plainly:
+
+- **A synced phone passkey is as strong as the account that syncs it.** A YubiKey over NFC
+  keeps the private key on the device.
+- The approval page is reachable by anyone with its link (192 random bits, sent only in the
+  ntfy alert). The link shows the email; it cannot send it.
+- `APPROVAL_SK_ONLY=1` does not affect this path: it governs `/send` tokens only.
+- Revocation needs only the admin token. An agent could revoke, which stops approvals loudly
+  and sends nothing.
+- 🚨 The `RESEND_API_KEY` limit above applies here unchanged.
+
 ## X-Forwarded-For
 
 `ALLOW_INBOUND_IPS` is only as good as the IP it reads. XFF is caller-controlled on the

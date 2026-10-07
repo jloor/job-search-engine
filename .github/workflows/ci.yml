@@ -86,6 +86,9 @@ jobs:
       # Added 2026-10-01: the operator's BCC copy of every approved send. Guards that the
       # address never reaches a header the employer sees.
       - run: python3 tests/test_sent_copy.py
+      # Added 2026-10-07: mail approval by passkey. Here only the pure helpers run; the
+      # ceremony needs webauthn and runs in the drift job with --strict.
+      - run: python3 tests/test_passkey.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #
@@ -122,6 +125,12 @@ jobs:
       # refusal a forged approval could slip past, against OpenSSH's own format and one real
       # device signature. It needs `cryptography`, which the bare job deliberately lacks.
       - name: install cryptography for the send-approval test
-        run: pip install cryptography
+        run: pip install cryptography==50.0.1
       - name: send approvals by YubiKey touch
         run: python3 tests/test_sshsig.py
+      # Added 2026-10-07: the passkey ceremony end to end, with a software authenticator.
+      # --strict, so a missing webauthn is a failure and not a quiet skip.
+      - name: install webauthn for the passkey test
+        run: pip install webauthn==2.8.0
+      - name: mail approval by passkey
+        run: python3 tests/test_passkey.py --strict

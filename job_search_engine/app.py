@@ -9723,7 +9723,8 @@ def diag_config(request: Request, authorization: str | None = Header(None)):
     plain = ["APPROVAL_SK_ONLY", "MAIL_DOMAIN", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "STORAGE_ZONE",
              "STORAGE_HOST", "AI_PROVIDER", "AI_MODEL", "AI_BASE_URL", "AI_READ_ENABLED",
              "AI_READ_SCOPE", "TRUSTED_PROXY_HOPS", "GIT_REPO_SSH", "GIT_AUTHOR_EMAIL",
-             "RESTART_MARKER", "ALLOW_INBOUND_IPS", "DATA_DIR", "APPLICATIONS_DIR"]
+             "RESTART_MARKER", "ALLOW_INBOUND_IPS", "DATA_DIR", "APPLICATIONS_DIR",
+             "PUBLIC_URL"]
     return {
         "at": now(), "version": ENGINE_VERSION, "uptime_s": int(time.time() - BOOTED_AT),
         "secrets": {k: fp(os.environ.get(k)) for k in secret},
@@ -10296,13 +10297,20 @@ async def send(request: Request,
     require_admin(authorization, request)
     ip = client_ip(request)
     p = await request.json()
+    if p.get("approved") is not True:
+        raise HTTPException(400, "refused: 'approved' must be true (SPEC P5)")
+    _check_outgoing(p)
+    fp    = fingerprint(p["from_alias"], p["to"], p["subject"], p["body"])
+    nonce = verify_approval(x_approval, fp, ip)
+    # verify_approval has already proved an sk1. token, so the prefix is safe to read here.
+    return _deliver_approved(p, fp, nonce, ip, hw=(x_approval or "").startswith("sk1."))
 
+
+def _check_outgoing(p: dict) -> str:
+    """Field and header checks shared by /send and /send/queue. Returns the bare recipient."""
     for f in ("from_alias", "to", "subject", "body"):
         if not p.get(f):
             raise HTTPException(400, f"missing field: {f}")
-    if p.get("approved") is not True:
-        raise HTTPException(400, "refused: 'approved' must be true (SPEC P5)")
-
     from_alias = p["from_alias"]
     if not from_alias.endswith("@" + MAIL_DOMAIN):
         raise HTTPException(400, f"from_alias must be @{MAIL_DOMAIN}")
@@ -10312,10 +10320,20 @@ async def send(request: Request,
     # One recipient per call. Headers with commas are how a reply becomes a mailshot.
     if any(c in p["to"] for c in ",;") or any(c in (p["subject"] + from_alias) for c in "\r\n"):
         raise HTTPException(400, "refused: multiple recipients or header injection")
+    return to_addr
 
-    fp    = fingerprint(from_alias, p["to"], p["subject"], p["body"])
-    nonce = verify_approval(x_approval, fp, ip)
 
+def _deliver_approved(p: dict, fp: str, nonce: str, ip: str, hw: bool) -> dict:
+    """Everything after a valid approval: the single-use nonce, the rate limit, the known-
+    recipient rule, the transport, the BCC copy and the interaction record.
+
+    ⭐ ONE COPY FOR EVERY APPROVAL PATH. Ed25519, YubiKey-SSH and passkey approvals differ only
+    in how they prove a human said yes. `hw` is True when a hardware-backed device with a
+    human gesture approved THIS exact recipient (YubiKey-SSH touch, or a passkey with user
+    verification); only then may SK_ALLOWS_COLD reach a new address.
+    """
+    from_alias = p["from_alias"]
+    to_addr = parseaddr(p["to"])[1]
     if not (SMTP_USER and SMTP_PASS):
         raise HTTPException(500, "SMTP credentials not configured")
 
@@ -10323,8 +10341,7 @@ async def send(request: Request,
     with db() as con:
         check_send_rate(con, ip)
         if REQUIRE_KNOWN_RECIPIENT and not known_correspondent(con, from_alias, to_addr):
-            # verify_approval has already proved an sk1. token, so the prefix is safe to read.
-            if SK_ALLOWS_COLD and (x_approval or "").startswith("sk1."):
+            if SK_ALLOWS_COLD and hw:
                 log_event(con, "send_cold_sk",
                           f"{to_addr} has never written to {from_alias}; allowed by a "
                           f"security-key approval of this exact recipient", ip)
@@ -10443,6 +10460,331 @@ async def send(request: Request,
         con.execute("UPDATE draft SET status='failed',error=? WHERE id=?", (detail[:900], did))
         log_event(con, "send_error", f"draft {did}: {detail}", ip)
     raise HTTPException(502, f"all transports failed: {detail}")
+
+
+# ============================================================ mail approval by passkey
+# PLAN §4 of the operator's harness migration, decided 2026-10-07. An agent QUEUES an email;
+# the operator approves it on a page this relay serves, with a WebAuthn credential (a
+# YubiKey over NFC, or a phone passkey) and user verification. See passkey.py for the
+# property and for why enrollment needs a hardware-key activation.
+#
+# ⚠️ PUBLIC_URL is the origin, and its host is the WebAuthn RP ID. A credential is bound to
+# that RP ID for life, so changing PUBLIC_URL means enrolling again. Unset: every passkey
+# route answers 503, and the other approval paths are untouched.
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
+
+
+def _pk_cfg() -> tuple[str, str]:
+    from urllib.parse import urlparse
+    host = urlparse(PUBLIC_URL).hostname if PUBLIC_URL.startswith("https://") else None
+    if not host:
+        raise HTTPException(503, "passkey approval is not configured (PUBLIC_URL)")
+    return host, PUBLIC_URL
+
+
+def _pk_page(body: str, status: int = 200):
+    import passkey as _P
+    from fastapi.responses import Response
+    return Response(body, status_code=status, media_type="text/html; charset=utf-8",
+                    headers=_P.PAGE_HEADERS)
+
+
+def _pk_active(con) -> list:
+    return [dict(r) for r in con.execute(
+        "SELECT * FROM passkey_credential WHERE status='active'").fetchall()]
+
+
+@app.get("/passkey.js")
+def passkey_js():
+    import passkey as _P
+    from fastapi.responses import Response
+    return Response(_P.SCRIPT, media_type="application/javascript",
+                    headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+
+@app.post("/send/queue")
+async def send_queue_add(request: Request, authorization: str | None = Header(None)):
+    """Queue an exact email for a passkey approval. NOTHING IS SENT HERE.
+
+    The caller gets the approval page's URL; the operator gets an ntfy alert that opens it.
+    Holding the admin token is enough to queue, and never enough to send.
+    """
+    require_admin(authorization, request)
+    import passkey as _P
+    _pk_cfg()
+    ip = client_ip(request)
+    p = await request.json()
+    _check_outgoing(p)
+    fp = fingerprint(p["from_alias"], p["to"], p["subject"], p["body"])
+    token = secrets.token_urlsafe(24)
+    with db() as con:
+        if not _pk_active(con):
+            raise HTTPException(409, "no ACTIVE passkey: enroll one and activate it first")
+        cur = con.execute(
+            "INSERT INTO send_queue(token,created_at,expires_at,from_alias,to_addr,subject,body,"
+            "in_reply_to_id,intent,fingerprint) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (token, now(), int(time.time()) + _P.QUEUE_TTL_S, p["from_alias"], p["to"],
+             p["subject"], p["body"], p.get("in_reply_to_id"), p.get("intent"), fp))
+        qid = cur.lastrowid
+        log_event(con, "send_queued", f"queue {qid} fp={fp[:16]} -> {parseaddr(p['to'])[1]}", ip)
+    url = f"{PUBLIC_URL}/approve/{token}"
+    alerted = "disabled"
+    if NTFY_URL:
+        import notify as _N
+        ok, detail = _N.send(NTFY_URL, NTFY_TOKEN, {
+            "title": f"Approve email to {parseaddr(p['to'])[1]}"[:200],
+            "message": f"Subject: {p['subject'][:200]}\nFrom: {p['from_alias']}\nTap to read and approve.",
+            "priority": 4, "tags": ["email", "key"], "click": url})
+        alerted = "sent" if ok else f"failed: {detail}"
+    return {"ok": True, "queue_id": qid, "url": url, "fingerprint": fp, "alert": alerted}
+
+
+def _queue_item(con, token: str) -> dict:
+    row = con.execute("SELECT * FROM send_queue WHERE token=?", (token,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "not found")
+    item = dict(row)
+    if item["status"] == "queued" and time.time() > item["expires_at"]:
+        con.execute("UPDATE send_queue SET status='expired' WHERE id=? AND status='queued'",
+                    (item["id"],))
+        item["status"] = "expired"
+    return item
+
+
+@app.get("/approve/{token}")
+def approve_page(token: str):
+    import passkey as _P
+    _pk_cfg()
+    with db() as con:
+        try:
+            item = _queue_item(con, token)
+        except HTTPException:
+            return _pk_page(_P._page("Not found", "<h1>Not found</h1>"), 404)
+    return _pk_page(_P.approve_page(token, item))
+
+
+@app.post("/approve/{token}/options")
+def approve_options(token: str, request: Request):
+    import passkey as _P
+    rp_id, _ = _pk_cfg()
+    with db() as con:
+        item = _queue_item(con, token)
+        if item["status"] != "queued":
+            raise HTTPException(409, f"this email is {item['status']}")
+        creds = _pk_active(con)
+        if not creds:
+            raise HTTPException(409, "no active passkey")
+        ch = _P.challenge_for(item["fingerprint"])
+        con.execute("UPDATE send_queue SET challenge=?, challenge_expires=? WHERE id=?",
+                    (_P.b64u(ch), int(time.time()) + _P.CHALLENGE_TTL_S, item["id"]))
+    return JSONResponse(json.loads(_P.authentication_options(
+        rp_id, ch, [_P.unb64u(c["credential_id"]) for c in creds])))
+
+
+@app.post("/approve/{token}/verify")
+async def approve_verify(token: str, request: Request):
+    """The approval. Every check here must pass before _deliver_approved runs."""
+    import passkey as _P
+    rp_id, origin = _pk_cfg()
+    ip = client_ip(request)
+    body = await request.json()
+    with db() as con:
+        item = _queue_item(con, token)
+        if item["status"] != "queued":
+            raise HTTPException(409, f"this email is {item['status']}")
+        ch_b64 = item["challenge"]
+        # 🚨 SINGLE USE, CLAIMED BEFORE VERIFYING. A conditional UPDATE clears the challenge,
+        # so two concurrent posts cannot both proceed with it.
+        cur = con.execute("UPDATE send_queue SET challenge=NULL WHERE id=? AND challenge=?",
+                          (item["id"], ch_b64))
+        if not ch_b64 or not (cur.rowcount or 0):
+            raise HTTPException(409, "no open challenge: press the button again")
+        if time.time() > (item["challenge_expires"] or 0):
+            raise HTTPException(409, "the challenge expired: press the button again")
+        cred = con.execute("SELECT * FROM passkey_credential WHERE credential_id=? AND status='active'",
+                           (str(body.get("rawId") or body.get("id") or ""),)).fetchone()
+    if cred is None:
+        audit("send_refused", "passkey approval from an unknown or inactive credential", ip)
+        raise HTTPException(403, "refused: approval does not match this message")
+    cred = dict(cred)
+    challenge = _P.unb64u(ch_b64)
+    # ⭐ THREE FINGERPRINTS MUST AGREE: recomputed from the stored email, stored at queue
+    # time, and carried inside the challenge the authenticator signed.
+    fp = fingerprint(item["from_alias"], item["to_addr"], item["subject"], item["body"])
+    if not (fp == item["fingerprint"] == _P.fp_in_challenge(challenge)):
+        audit("send_refused", f"queue {item['id']}: fingerprint mismatch", ip)
+        raise HTTPException(403, "refused: approval does not match this message")
+    try:
+        new_count = _P.verify_authentication(body, challenge, rp_id, origin,
+                                             _P.unb64u(cred["public_key"]), cred["sign_count"])
+    except Exception as e:                                    # noqa: BLE001
+        # The reason goes to the audit log only; the caller gets one answer for every failure.
+        audit("send_refused", f"passkey verification failed: {type(e).__name__}: {e}"[:400], ip)
+        raise HTTPException(403, "refused: approval does not match this message")
+    if not _P.sign_count_ok(cred["sign_count"], new_count):
+        audit("send_refused", f"passkey sign count did not grow ({cred['sign_count']} -> {new_count}); "
+                              f"possible cloned credential {cred['credential_id'][:12]}", ip)
+        raise HTTPException(403, "refused: approval does not match this message")
+    with db() as con:
+        con.execute("UPDATE passkey_credential SET sign_count=?, last_used_at=? WHERE credential_id=?",
+                    (new_count, now(), cred["credential_id"]))
+        # Claim the row, so a second verify of the same email cannot send it twice.
+        cur = con.execute("UPDATE send_queue SET status='sending' WHERE id=? AND status='queued'",
+                          (item["id"],))
+        if not (cur.rowcount or 0):
+            raise HTTPException(409, "this email is already being sent")
+    audit("send_approved_passkey", f"queue {item['id']} credential {cred['credential_id'][:12]} "
+                                   f"({cred.get('label') or '-'}) count {new_count} fp {fp[:16]}", ip)
+    p = {"from_alias": item["from_alias"], "to": item["to_addr"], "subject": item["subject"],
+         "body": item["body"], "in_reply_to_id": item["in_reply_to_id"], "intent": item["intent"],
+         "approved_by": f"passkey:{cred.get('label') or cred['credential_id'][:12]}"}
+    nonce = "wa." + challenge[:16].hex()
+    try:
+        out = _deliver_approved(p, fp, nonce, ip, hw=True)
+    except Exception as e:                                    # noqa: BLE001
+        # Any failure, not only an HTTPException, or the row would sit at 'sending' forever.
+        with db() as con:
+            con.execute("UPDATE send_queue SET status='failed', error=? WHERE id=?",
+                        (str(getattr(e, "detail", e))[:500], item["id"]))
+        raise
+    with db() as con:
+        con.execute("UPDATE send_queue SET status='sent', draft_id=?, approved_by=? WHERE id=?",
+                    (out.get("draft_id"), p["approved_by"], item["id"]))
+    return out
+
+
+# ------------------------------------------------------------ passkey enrollment --
+
+@app.post("/passkey/enroll")
+def passkey_enroll_start(request: Request, authorization: str | None = Header(None)):
+    """Mint a one-time enrollment link for the phone. The admin token can do this, and that
+    is safe ONLY because what it produces is PENDING until a hardware key activates it."""
+    require_admin(authorization, request)
+    import passkey as _P
+    _pk_cfg()
+    token = secrets.token_urlsafe(24)
+    with db() as con:
+        con.execute("INSERT INTO passkey_enroll(token,created_at,expires_at) VALUES (?,?,?)",
+                    (token, now(), int(time.time()) + _P.ENROLL_TTL_S))
+        log_event(con, "passkey_enroll_link", "enrollment link minted", client_ip(request))
+    return {"ok": True, "url": f"{PUBLIC_URL}/passkey/enroll/{token}", "expires_in_s": _P.ENROLL_TTL_S}
+
+
+def _enroll_row(con, token: str) -> dict:
+    row = con.execute("SELECT * FROM passkey_enroll WHERE token=?", (token,)).fetchone()
+    if row is None or row["used_at"] or time.time() > row["expires_at"]:
+        raise HTTPException(404, "this enrollment link is used, expired or unknown")
+    return dict(row)
+
+
+@app.get("/passkey/enroll/{token}")
+def passkey_enroll_page(token: str):
+    import passkey as _P
+    _pk_cfg()
+    with db() as con:
+        try:
+            _enroll_row(con, token)
+        except HTTPException:
+            return _pk_page(_P._page("Not found", "<h1>This link is used, expired or unknown</h1>"), 404)
+    return _pk_page(_P.enroll_page(token))
+
+
+@app.post("/passkey/enroll/{token}/options")
+def passkey_enroll_options(token: str):
+    import passkey as _P
+    rp_id, _ = _pk_cfg()
+    with db() as con:
+        _enroll_row(con, token)
+        existing = [_P.unb64u(r["credential_id"]) for r in con.execute(
+            "SELECT credential_id FROM passkey_credential WHERE status!='revoked'").fetchall()]
+        opts, ch = _P.registration_options(rp_id, "job-search mail approval", existing)
+        con.execute("UPDATE passkey_enroll SET challenge=? WHERE token=?", (_P.b64u(ch), token))
+    return JSONResponse(json.loads(opts))
+
+
+@app.post("/passkey/enroll/{token}/verify")
+async def passkey_enroll_verify(token: str, request: Request):
+    import passkey as _P
+    rp_id, origin = _pk_cfg()
+    ip = client_ip(request)
+    body = await request.json()
+    with db() as con:
+        row = _enroll_row(con, token)
+        cur = con.execute("UPDATE passkey_enroll SET used_at=? WHERE token=? AND used_at IS NULL",
+                          (now(), token))
+        if not row["challenge"] or not (cur.rowcount or 0):
+            raise HTTPException(409, "this enrollment link is already used")
+    try:
+        v = _P.verify_registration(body.get("credential") or {}, _P.unb64u(row["challenge"]),
+                                   rp_id, origin)
+    except Exception as e:                                    # noqa: BLE001
+        audit("passkey_enroll_refused", f"{type(e).__name__}: {e}"[:400], ip)
+        raise HTTPException(400, "registration could not be verified")
+    cid = _P.b64u(v["credential_id"])
+    code = _P.short_code(v["public_key"])
+    label = re.sub(r"[^\w .,()+-]", "", str(body.get("label") or ""))[:40] or None
+    with db() as con:
+        con.execute("INSERT INTO passkey_credential(credential_id,public_key,sign_count,label,code,"
+                    "status,created_at) VALUES (?,?,?,?,?,'pending',?)",
+                    (cid, _P.b64u(v["public_key"]), v["sign_count"], label, code, now()))
+        log_event(con, "passkey_registered", f"PENDING {cid[:12]} code {code} ({label or '-'})", ip)
+    return {"ok": True, "status": "pending", "code": code, "credential_id": cid}
+
+
+@app.get("/passkey/credentials")
+def passkey_credentials(request: Request, authorization: str | None = Header(None)):
+    """Every credential with its status and code. Public keys are not secret, but the list
+    is admin-only because it names the operator's devices."""
+    require_admin(authorization, request)
+    with db() as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT credential_id,label,code,status,created_at,activated_at,last_used_at,"
+            "sign_count,public_key FROM passkey_credential ORDER BY created_at").fetchall()]
+    return {"credentials": rows}
+
+
+@app.post("/passkey/activate")
+async def passkey_activate(request: Request, authorization: str | None = Header(None)):
+    """Turn a PENDING credential ACTIVE. Needs an SSHSIG from a key in APPROVAL_SK_KEYS, in
+    the enrollment namespace, over passkey.enroll_message(). The admin token alone cannot."""
+    require_admin(authorization, request)
+    import passkey as _P
+    import sshsig as _S
+    ip = client_ip(request)
+    p = await request.json()
+    cid, sig_b64 = str(p.get("credential_id") or ""), str(p.get("signature") or "")
+    with db() as con:
+        row = con.execute("SELECT * FROM passkey_credential WHERE credential_id=?", (cid,)).fetchone()
+    if row is None or row["status"] != "pending":
+        raise HTTPException(404, "no PENDING credential with that id")
+    allowed = _sk_allowed()
+    if not allowed:
+        raise HTTPException(500, "no APPROVAL_SK_KEYS configured: nothing can activate a passkey")
+    try:
+        got = _S.verify(_P.unb64u(sig_b64), _P.enroll_message(cid, _P.unb64u(row["public_key"])),
+                        _P.ENROLL_NAMESPACE, allowed)
+    except Exception as e:                                    # noqa: BLE001
+        audit("passkey_activate_refused", f"{cid[:12]}: {type(e).__name__}: {e}"[:300], ip)
+        raise HTTPException(403, "refused: the activation signature does not verify")
+    with db() as con:
+        con.execute("UPDATE passkey_credential SET status='active', activated_at=? "
+                    "WHERE credential_id=? AND status='pending'", (now(), cid))
+        log_event(con, "passkey_activated", f"{cid[:12]} code {row['code']} by sk key "
+                                            f"{got['key_index']}", ip)
+    return {"ok": True, "credential_id": cid, "status": "active", "code": row["code"]}
+
+
+@app.post("/passkey/revoke")
+async def passkey_revoke(request: Request, authorization: str | None = Header(None)):
+    """Revoking needs only the admin token: the worst an agent can do with it is stop the
+    operator approving, which is loud and harmless."""
+    require_admin(authorization, request)
+    p = await request.json()
+    with db() as con:
+        con.execute("UPDATE passkey_credential SET status='revoked' WHERE credential_id=?",
+                    (str(p.get("credential_id") or ""),))
+        log_event(con, "passkey_revoked", str(p.get("credential_id") or "")[:12], client_ip(request))
+    return {"ok": True}
 
 
 def _sent_copy_bcc() -> str | None:

@@ -39,8 +39,12 @@ dependencies = [
   # webhook is form-encoded whenever ImprovMX does not send JSON.
   "python-multipart==0.0.20",
   "email-reply-parser==0.5.12",
-  "cryptography==44.0.0",
+  # 50.0.1 since 2026-10-07: webauthn needs >=46. Backup round-trip and sshsig re-tested on it.
+  "cryptography==50.0.1",
   "anthropic==0.122.0",
+  # Mail approval by passkey (passkey.py). Imported lazily, so the bare suite runs without it.
+  # 2.8.0, not 3.x: 3.0.1 was under two weeks old, and 3.x needs cryptography>=49.
+  "webauthn==2.8.0",
 ]
 
 [project.optional-dependencies]

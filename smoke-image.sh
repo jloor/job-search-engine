@@ -41,7 +41,7 @@ sq() { curl -s --max-time 20 -H "Authorization: Bearer smokeadmin" "http://127.0
 # 🚨 The dependencies pyproject once failed to declare, which killed backups for a day.
 "$ENGINE" exec "$CID" python -c "
 import importlib
-for m in ('cryptography.hazmat.primitives.asymmetric.x25519','email_reply_parser','anthropic','multipart'):
+for m in ('cryptography.hazmat.primitives.asymmetric.x25519','email_reply_parser','anthropic','multipart','webauthn','cbor2'):
     importlib.import_module(m)" 2>/dev/null \
   && ok "every runtime dependency imports" || bad "every runtime dependency imports"
 # The backup path specifically: its failure is invisible until the day it is needed.

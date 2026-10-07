@@ -75,7 +75,8 @@ TOUCH_WINDOW_S = 240
 REARM_LIMIT = 40          # re-arms per window: a key that fails instantly must not spin forever
 
 
-def touch_sign(key: str, message: bytes, header: list[str], body: str) -> tuple[str | None, str]:
+def touch_sign(key: str, message: bytes, header: list[str], body: str,
+               namespace: str = SK_NAMESPACE) -> tuple[str | None, str]:
     """Show the exact email in a window, then ask the security key to sign. (armored, why).
 
     ⭐ THE WINDOW IS THE GATE, NOT THE TOUCH. A touch proves someone was there, not what they
@@ -156,7 +157,7 @@ def touch_sign(key: str, message: bytes, header: list[str], body: str) -> tuple[
         # ⚠️ SSH_ASKPASS_REQUIRE=never: there is no askpass here, and a PIN prompt it cannot
         # show would be sent EMPTY and burn a PIN attempt. A key that wants a PIN fails instead.
         env = {**os.environ, "SSH_ASKPASS_REQUIRE": "never"}
-        p = subprocess.Popen(["ssh-keygen", "-Y", "sign", "-f", key, "-n", SK_NAMESPACE],
+        p = subprocess.Popen(["ssh-keygen", "-Y", "sign", "-f", key, "-n", namespace],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, env=env)
         st["proc"] = p
@@ -217,7 +218,78 @@ def mint_sk(fp: str, key: str, ttl: int, header: list[str], body: str) -> str | 
     return f"sk1.{nonce}.{expires}.{base64.urlsafe_b64encode(blob).decode().rstrip('=')}"
 
 
+def passkey_activate_main(argv: list[str]) -> int:
+    """`approve.py passkey-activate --sk-key KEY [--credential-id ID]`
+
+    Turn a PENDING passkey ACTIVE on the relay. The window shows the credential's label and
+    code; the YubiKey signs only after the window is up, in the ENROLLMENT namespace, so this
+    signature can never be replayed as a send approval (or the other way round).
+
+    ⭐ COMPARE THE CODE. The phone showed one when it registered. If this window shows a
+    different code, or a credential you did not just register, close it: something else
+    registered that credential.
+    """
+    import passkey, sshsig
+    ap = argparse.ArgumentParser(prog="approve.py passkey-activate")
+    ap.add_argument("--sk-key", required=True, help="the YubiKey-SSH handle, as for sends")
+    ap.add_argument("--credential-id", default=None, help="needed only if several are pending")
+    a = ap.parse_args(argv)
+    url = os.environ.get("RELAY_URL", "").rstrip("/")
+    api = os.environ.get("RELAY_API_TOKEN", "")
+    if not url or not api:
+        print("RELAY_URL and RELAY_API_TOKEN must be set", file=sys.stderr)
+        return 2
+
+    def call(path, payload=None):
+        req = urllib.request.Request(url + path, method="POST" if payload is not None else "GET",
+                                     data=json.dumps(payload).encode() if payload is not None else None,
+                                     headers={"Authorization": f"Bearer {api}",
+                                              "Content-Type": "application/json",
+                                              "User-Agent": "approve.py"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    pending = [c for c in call("/passkey/credentials")["credentials"] if c["status"] == "pending"]
+    if a.credential_id:
+        pending = [c for c in pending if c["credential_id"] == a.credential_id]
+    if len(pending) != 1:
+        print(f"{len(pending)} pending credential(s) match; name one with --credential-id:", file=sys.stderr)
+        for c in pending:
+            print(f"  {c['credential_id']}  code {c['code']}  {c['label'] or '-'}  {c['created_at']}",
+                  file=sys.stderr)
+        return 1
+    c = pending[0]
+    msg = passkey.enroll_message(c["credential_id"], passkey.unb64u(c["public_key"]))
+    header = ["ACTIVATE A PASSKEY FOR MAIL APPROVAL", f"Code: {c['code']}",
+              f"Name: {c['label'] or '-'}", f"Registered: {c['created_at']}"]
+    body = ("Touch the key ONLY if this code matches the code your phone showed.\n\n"
+            "Once active, this credential can approve sending mail as you, from any browser "
+            "that holds it.")
+    print(f"waiting for approval in the window: code {c['code']}", file=sys.stderr)
+    armored, why = touch_sign(a.sk_key, msg, header, body, namespace=passkey.ENROLL_NAMESPACE)
+    if not armored:
+        print(f"nothing activated: {why}", file=sys.stderr)
+        return 1
+    blob = sshsig.unarmor(armored)
+    try:
+        sshsig.verify(blob, msg, passkey.ENROLL_NAMESPACE,
+                      [sshsig.parse_pubkey_line(open(a.sk_key + ".pub").read())])
+    except Exception as e:
+        print(f"the signature does not verify locally: {e}", file=sys.stderr)
+        return 1
+    try:
+        out = call("/passkey/activate", {"credential_id": c["credential_id"],
+                                         "signature": passkey.b64u(blob)})
+    except urllib.error.HTTPError as e:
+        print(f"relay refused: HTTP {e.code} {e.read().decode(errors='replace')[:200]}", file=sys.stderr)
+        return 1
+    print(f"ACTIVE: {out['credential_id'][:16]}… code {out['code']}")
+    return 0
+
+
 def main() -> int:
+    if sys.argv[1:2] == ["passkey-activate"]:
+        return passkey_activate_main(sys.argv[2:])
     ap = argparse.ArgumentParser(description="Approve one outgoing relay message.")
     ap.add_argument("--from", dest="from_alias", required=True)
     ap.add_argument("--to", required=True)

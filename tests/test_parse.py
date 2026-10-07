@@ -2174,7 +2174,7 @@ On Wed, Aug 12, 2026 the candidate wrote:
           sorted(_thirdparty - _declared), [])
     check("...and the imports found are the ones expected",
           sorted(_thirdparty),
-          ["anthropic", "cryptography", "email-reply-parser", "fastapi"])
+          ["anthropic", "cryptography", "email-reply-parser", "fastapi", "webauthn"])
     # uvicorn and python-multipart are declared and never imported, which is correct: one is
     # the server the Dockerfile runs, the other is what FastAPI needs to parse a form-encoded
     # body. Named here so "declared but unused" cannot quietly grow.
@@ -4237,7 +4237,12 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # ── /send files the outbound half ────────────────────────────────────────────────
     # ⭐ Recording by hand works and is forgotten. Recording at the moment of the send
     # cannot be, and /send is the only place that knows a message left.
-    _ssrc = _src_of(_appv.send)
+    # 📌 2026-10-07: the delivery half of /send moved into _deliver_approved, so every
+    # approval path (Ed25519, YubiKey-SSH, passkey) shares one copy. Read it there, and
+    # prove /send still goes through it.
+    check("/send delivers through the shared _deliver_approved",
+          "_deliver_approved(" in _src_of(_appv.send), True)
+    _ssrc = _src_of(_appv._deliver_approved)
     check("/send records an outbound interaction",
           ('record_interaction(' in _ssrc, '"outbound_mail"' in _ssrc), (True, True))
     check("...keyed on the draft, so a retry cannot double it",

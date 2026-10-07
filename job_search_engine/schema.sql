@@ -96,6 +96,48 @@ CREATE TABLE IF NOT EXISTS approval_nonce (
   fingerprint TEXT NOT NULL                     -- sha256 over (from,to,subject,body)
 );
 
+-- Mail approval by passkey (passkey.py). A credential is PENDING until a hardware security
+-- key in APPROVAL_SK_KEYS signs its activation; only an ACTIVE one can approve a send.
+CREATE TABLE IF NOT EXISTS passkey_credential (
+  credential_id TEXT PRIMARY KEY,               -- base64url
+  public_key    TEXT NOT NULL,                  -- COSE, base64url
+  sign_count    INTEGER NOT NULL DEFAULT 0,
+  label         TEXT,
+  code          TEXT NOT NULL,                  -- short code a human compares at activation
+  status        TEXT NOT NULL DEFAULT 'pending',-- pending | active | revoked
+  created_at    TEXT NOT NULL,
+  activated_at  TEXT,
+  last_used_at  TEXT
+);
+-- One-time links for the phone to register a credential. Admin mints them.
+CREATE TABLE IF NOT EXISTS passkey_enroll (
+  token         TEXT PRIMARY KEY,
+  created_at    TEXT NOT NULL,
+  expires_at    INTEGER NOT NULL,
+  challenge     TEXT,
+  used_at       TEXT
+);
+-- An email an agent QUEUED. Nothing here is sent until a passkey approves it.
+CREATE TABLE IF NOT EXISTS send_queue (
+  id            INTEGER PRIMARY KEY,
+  token         TEXT NOT NULL UNIQUE,           -- the approval page's capability
+  created_at    TEXT NOT NULL,
+  expires_at    INTEGER NOT NULL,
+  from_alias    TEXT NOT NULL,
+  to_addr       TEXT NOT NULL,
+  subject       TEXT NOT NULL,
+  body          TEXT NOT NULL,
+  in_reply_to_id INTEGER,
+  intent        TEXT,
+  fingerprint   TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'queued', -- queued | sent | failed | expired | cancelled
+  challenge     TEXT,                           -- base64url, single use
+  challenge_expires INTEGER,
+  draft_id      INTEGER,
+  approved_by   TEXT,
+  error         TEXT
+);
+
 -- A model's reading of a message. Deliberately NOT columns on message: the regex verdict
 -- in message.classification is the one the pipeline acts on, and a model that is confident
 -- and wrong must not be able to overwrite it. This table only ever adds a second opinion.
