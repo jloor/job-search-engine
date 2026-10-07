@@ -24,6 +24,13 @@ on:
 
 permissions: {}
 
+# 🚨 WITHOUT THIS, A FAILED PUSH DID NOT STOP THE STEP. A `run:` with no `shell:` runs as
+# `bash -e`, WITHOUT pipefail, so `docker push | tee` reported tee's success. v0.89.3's first
+# attempt went on to a second push after the first was denied. `shell: bash` adds pipefail.
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -45,7 +52,7 @@ jobs:
     env:
       IMAGE: ghcr.io/${{ github.repository_owner }}/job-search-engine
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
@@ -83,16 +90,23 @@ jobs:
           printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           docker push "$IMAGE:$GITHUB_REF_NAME" | tee push.log
           docker push "$IMAGE:sha-$GITHUB_SHA"
-          docker logout ghcr.io
           digest=$(grep -oP 'digest: \Ksha256:[0-9a-f]{64}' push.log | tail -1)
           [ -n "$digest" ] || { echo "::error::no digest in the push output"; exit 1; }
           echo "DIGEST=$digest" >> "$GITHUB_ENV"
 
-      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ env.DIGEST }}
           push-to-registry: true
+
+      # ⚠️ THE LOGOUT COMES AFTER THE ATTESTATION, NOT AFTER THE PUSH. push-to-registry needs
+      # the same login. v0.89.3 logged out in the push step, and the attestation could not be
+      # copied to ghcr ("No credentials found for registry ghcr.io"). It still reached
+      # GitHub's attestation store, which is what the deploy verifies against.
+      - name: logout
+        if: always()
+        run: docker logout ghcr.io || true
 
       - name: summary
         run: |
