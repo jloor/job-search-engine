@@ -24,10 +24,12 @@ import pathlib
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
-spec = importlib.util.spec_from_file_location("app", HERE.parent / "job_search_engine" / "app.py")
-app = importlib.util.module_from_spec(spec)
+# 📌 Through the shared loader, which stubs fastapi. CI's "bare" job installs nothing, and a
+# plain exec_module of app.py died there on `import fastapi` from 2026-09-18 onward.
+sys.path.insert(0, str(HERE))
+import test_posting_age as TPA                                # noqa: E402
+app = TPA.load_app()
 sys.modules["app"] = app
-spec.loader.exec_module(app)
 fails = []
 
 
