@@ -286,6 +286,8 @@ seen_ns = []
 def _fake_touch(key, message, header, body, namespace=AP.SK_NAMESPACE):
     seen_ns.append(namespace)
     check("the window shows the code the phone showed", any(reg2["code"] in h for h in header))
+    # touch_sign() splits each header line on its first colon; v0.90.0 shipped one without.
+    check("every window header line is 'Label: value'", all(":" in h for h in header))
     raw = P.unb64u(sk_sign(message, ns=namespace))
     return "-----BEGIN SSH SIGNATURE-----\n" + base64.b64encode(raw).decode() + "\n-----END SSH SIGNATURE-----", ""
 

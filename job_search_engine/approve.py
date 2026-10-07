@@ -260,7 +260,9 @@ def passkey_activate_main(argv: list[str]) -> int:
         return 1
     c = pending[0]
     msg = passkey.enroll_message(c["credential_id"], passkey.unb64u(c["public_key"]))
-    header = ["ACTIVATE A PASSKEY FOR MAIL APPROVAL", f"Code: {c['code']}",
+    # ⚠️ EVERY LINE IS "Label: value". touch_sign() splits each on the first colon to bold the
+    # label, and a line without one raised IndexError before the window opened (v0.90.0).
+    header = ["Action: ACTIVATE A PASSKEY FOR MAIL APPROVAL", f"Code: {c['code']}",
               f"Name: {c['label'] or '-'}", f"Registered: {c['created_at']}"]
     body = ("Touch the key ONLY if this code matches the code your phone showed.\n\n"
             "Once active, this credential can approve sending mail as you, from any browser "
