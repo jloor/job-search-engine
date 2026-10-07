@@ -172,7 +172,8 @@ eligible.
 | `job_search_engine/bunny.py` | Provisions the database, mints its token, applies the schema. |
 | `job_search_engine/backup.py` | Encrypted nightly snapshots. Age/X25519. |
 | `job_search_engine/gitsync.py` | Pulls the private working copy the profile is read from. |
-| `deploy.sh` | Builds `linux/amd64`, smoke-tests the image, pushes to GHCR. |
+| `smoke-image.sh` | Starts an image and asserts what it answers. CI and the deploy run the same copy. |
+| `.github/workflows/release.yml` | On a `v*` tag: suite, build, smoke test, push to GHCR, provenance attestation. |
 | `Dockerfile` | Non-root (uid 10001), no `--proxy-headers` (see SECURITY.md). |
 | `tests/` | Plain scripts, not pytest. CI runs them on 3.11, 3.12 and 3.13. |
 
@@ -258,19 +259,28 @@ correspondence should be a considered act in the dashboard, not a flag on a scri
 
 ### 2. Image
 
+Push a tag. **`.github/workflows/release.yml` builds the image; no machine of yours does.**
+
 ```bash
-gh auth refresh -h github.com -s write:packages
-gh auth token | podman login ghcr.io -u <owner> --password-stdin
-./deploy.sh
+# bump __version__ in job_search_engine/__init__.py, commit, then:
+git tag v1.2.3 && git push origin v1.2.3
 ```
 
-`deploy.sh` pins `--platform linux/amd64` (Magic Containers runs nothing else), builds
-with `--format docker` so podman keeps the `HEALTHCHECK`, and **starts the image and
-calls `/health` before it pushes**. An image that cannot boot never reaches the registry.
+The workflow refuses a tag that disagrees with `__version__`, runs the full suite, builds
+`linux/amd64` (Magic Containers runs nothing else), **starts the image and runs
+`smoke-image.sh` before it pushes**, then pushes `ghcr.io/<owner>/job-search-engine:v1.2.3`
+and `:sha-<commit>` and attests build provenance. There is no `:latest`. Deploy by digest.
+
+To check an image yourself: `./smoke-image.sh <image> <version>`.
+
+⚠️ **Protect the tags.** A ruleset that blocks update and delete of `refs/tags/v*` makes a
+release impossible to re-point after it is built. It also means a bad tag stays: cut the
+next version instead.
 
 ### 3. Magic Containers app
 
-1. The GHCR package is private, so connect the registry once: type GitHub, username
+1. **If you make the GHCR package public, skip this step**: Magic Containers pulls it
+   anonymously. A private package needs the registry connected once: type GitHub, username
    `<owner>`, and a PAT with `read:packages`.
 
    🚨 **It must be a *classic* PAT (`ghp_…`), not a fine-grained one (`github_pat_…`).**
@@ -283,7 +293,8 @@ calls `/health` before it pushes**. An image that cannot boot never reaches the 
    ⚠️ **Set the expiry deliberately and write the date down.** Classic PATs default to 30
    days. The first token minted for this expired unnoticed, and the failure mode months
    later is an app that cannot restart for reasons nobody remembers.
-2. Image `ghcr.io/<owner>/job-search-relay:latest`, port `8080`.
+2. Image `ghcr.io/<owner>/job-search-engine@sha256:<digest>`, port `8080`. Use the digest
+   from the release run's summary, never a mutable tag.
 3. Database > Access > **Generate Tokens** > **Add Secrets to Magic Container App**.
    That injects `BUNNY_DATABASE_URL` and `BUNNY_DATABASE_AUTH_TOKEN` under exactly those
    names, which `app.py` reads with no further configuration.

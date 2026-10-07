@@ -1,4 +1,18 @@
-FROM python:3.12-slim
+# The deployment image, built by .github/workflows/release.yml on every v* tag.
+#
+# ⭐ THE IMAGE IS BUILT FROM THE TAGGED CHECKOUT ITSELF. The operator's old recipe installed
+# the package from `git+https://...@<tag>` inside the build, so the commit that was built was
+# whatever the tag pointed at when the build ran. Here the workflow checks out the tag and
+# installs THAT tree, and the provenance attestation names the same commit. One commit, one
+# image, one signed statement that connects them.
+#
+# ⚠️ An older version of this file copied app.py and its siblings from the repository root.
+# They moved into job_search_engine/ long ago, so it could not build at all. Nothing ran it.
+#
+# 📌 THE BASE IMAGE IS PINNED BY DIGEST (the multi-arch index of python:3.12-slim, read
+# 2026-10-07). A tag alone moves, and the same tag rebuilt a week later is a different image.
+# Bump the digest deliberately, in a commit that says why.
+FROM python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
 
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
@@ -10,20 +24,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates git openssh-client \
  && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# ⚠️ candidate.py and gates.py hold the rules that decide which jobs are shown. They ran
-# as CLI tools during a backfill while the deployed service applied an older, looser set,
-# so the nightly sweep and the manual run disagreed. They ship together now.
+# Only what the package build reads. tests/, seed/ and .git stay out of the image.
+# 📌 uvicorn comes with the package: pyproject.toml pins it exactly, with every other runtime
+# dependency, so there is no second, unpinned install here.
 # 📌 config/candidate.toml is deliberately NOT baked in: gitsync keeps a working copy at
-# /data/repo, so changing a salary floor is a commit and a sync, not a rebuild. Before the
-# first clone lands there is no config, and the scan job declines rather than running with
-# no filters at all.
-COPY schema.sql app.py gitsync.py backup.py candidate.py gates.py ./
+# /data/repo, so changing a salary floor is a commit and a sync, not a rebuild.
+COPY pyproject.toml README.md LICENSE /src/
+COPY job_search_engine/ /src/job_search_engine/
+RUN pip install --no-cache-dir /src && rm -rf /src
 
-# persistent volume mounts here (Bunny Magic Containers: attach a volume at /data)
-# Not needed when BUNNY_DB_URL is set: storage is then the managed database.
+# Not needed when BUNNY_DATABASE_URL is set: storage is then the managed database.
 ENV DB_PATH=/data/relay.db
 VOLUME ["/data"]
 
@@ -41,4 +51,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
 # X-Forwarded-For, and if --forwarded-allow-ips is ever widened to '*' it takes the
 # LEFT-most entry, which the caller controls. client_ip() in app.py counts in from the
 # right by a known hop count instead. One component owns this decision, explicitly.
-CMD ["uvicorn","app:app","--host","0.0.0.0","--port","8080"]
+CMD ["uvicorn","job_search_engine.app:app","--host","0.0.0.0","--port","8080"]

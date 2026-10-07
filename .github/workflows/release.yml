@@ -1,0 +1,107 @@
+# release: on a v* tag, test, build, smoke-test, push to ghcr.io, and attest provenance.
+#
+# ⭐ WHY THE IMAGE IS BUILT HERE AND NOT ON THE OPERATOR'S MACHINE. A build on a machine
+# needs a registry credential on that machine. Here the credential is the job's own
+# short-lived GITHUB_TOKEN, scoped to this run, and the provenance attestation ties the
+# image digest to this repository, this workflow and the tagged commit. The deploy side
+# then needs no registry credential at all: the package is public, so it reads the digest
+# anonymously and verifies the attestation before it points production at anything.
+#
+# 🚨 RULES THIS FILE KEEPS. Change them only on purpose:
+#   - Triggered by a v* tag ONLY. Tags are immutable (ruleset 24673488 blocks update and
+#     delete of refs/tags/v*), so a release cannot be re-pointed after it is built.
+#   - Every action is pinned by commit SHA, with the tag in a comment. A tag on an action
+#     repository can move; a SHA cannot.
+#   - Permissions are empty at the top and granted per job, least first.
+#   - Nothing is pushed unless the full suite passed AND the image passed smoke-image.sh.
+#   - Tags pushed: vX.Y.Z and sha-<commit>. Never :latest, a mutable label nothing should read.
+#   - A FAILED RUN MUST BE SEEN. The operator's machine polls this repository's runs and
+#     sends a phone alert on any failure. The CI suite was once red for three weeks unseen.
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  image:
+    needs: tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/job-search-engine
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # ⚠️ Two tags once shipped __version__ = "0.33.1". The deploy caught it only after the
+      # image existed. Refuse here, before anything is built.
+      - name: the tag and the code agree on the version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          code=$(python3 -c "import re; print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', open('job_search_engine/__init__.py').read()).group(1))")
+          if [ "$tag" != "$code" ]; then
+            echo "::error::tag $GITHUB_REF_NAME but __version__ is $code"; exit 1
+          fi
+          echo "VERSION=$tag" >> "$GITHUB_ENV"
+
+      # 📌 --provenance=false and --sbom=false keep ONE linux/amd64 manifest. Bunny Magic
+      # Containers runs amd64 only and pulls by digest; buildx's own attestations would wrap
+      # the image in an index. Provenance comes from the attest step below instead.
+      - name: build
+        run: |
+          docker build --platform linux/amd64 --provenance=false --sbom=false \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            -t "$IMAGE:$GITHUB_REF_NAME" -t "$IMAGE:sha-$GITHUB_SHA" .
+
+      - name: smoke test (the same script the deploy runs against the pulled digest)
+        run: CONTAINER_ENGINE=docker ./smoke-image.sh "$IMAGE:$GITHUB_REF_NAME" "$VERSION"
+
+      # 🚨 THE DIGEST IS READ FROM THE PUSH, NEVER FROM `docker inspect` BEFORE IT. The
+      # registry digest is the only one that names what Bunny will pull.
+      - name: push
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:$GITHUB_REF_NAME" | tee push.log
+          docker push "$IMAGE:sha-$GITHUB_SHA"
+          docker logout ghcr.io
+          digest=$(grep -oP 'digest: \Ksha256:[0-9a-f]{64}' push.log | tail -1)
+          [ -n "$digest" ] || { echo "::error::no digest in the push output"; exit 1; }
+          echo "DIGEST=$digest" >> "$GITHUB_ENV"
+
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ env.DIGEST }}
+          push-to-registry: true
+
+      - name: summary
+        run: |
+          {
+            echo "### ${IMAGE}:${GITHUB_REF_NAME}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| version | \`${VERSION}\` |"
+            echo "| commit | \`${GITHUB_SHA}\` |"
+            echo "| digest | \`${DIGEST}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
