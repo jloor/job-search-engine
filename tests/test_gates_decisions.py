@@ -169,6 +169,36 @@ check("gate keeps the RAW string for the too_far lookup",
       gates.gate({"location": "AZ_Mesa_HQ", "description": ""}, CFG,
                  too_far={"AZ_Mesa_HQ"})[1], "over the commute ceiling")
 
+# 🚨 REMOTE EVIDENCE THE GATE USED TO IGNORE (2026-10-07). Each case is a real row that was
+# rejected "out on geography" in the 2026-09-23 Fantastic pull. All three only ever KEEP.
+check("title says remote keeps a row with a far location",
+      gates.gate({"title": "Implementation Engineer (REMOTE)", "location": "United States",
+                  "description": "Join our team."}, CFG), (True, "title says remote"))
+check("'work remotely' in the body keeps a row",
+      gates.gate({"title": "Implementation Lead", "location": "United States",
+                  "description": "Perks: Work remotely within a flexible work environment."},
+                 CFG), (True, "body mentions remote"))
+check("the source's Remote Solely label keeps a row",
+      gates.gate({"title": "Implementation Specialist II", "location": "Texas, United States",
+                  "description": "", "work_arrangement": "Remote Solely"}, CFG),
+      (True, "source labels it remote"))
+check("the source's Remote OK label keeps a row",
+      gates.gate({"title": "Integration Engineer II", "location": "Denver, Colorado",
+                  "description": "", "work_arrangement": "Remote OK"}, CFG),
+      (True, "source labels it remote"))
+# ...and they never override eligibility, which still asks first.
+check("a remote title does not rescue an ineligible country",
+      gates.gate({"title": "Remote Support Engineer", "location": "London, United Kingdom",
+                  "description": ""}, CFG)[0], False)
+# ...and they never invent remote where nothing says it.
+check("On-site label with a far city is still out on geography",
+      gates.gate({"title": "Implementation Specialist", "location": "Denver, Colorado",
+                  "description": "", "work_arrangement": "On-site"}, CFG),
+      (False, "out on geography"))
+check("'Distributed' in a title is not remote evidence",
+      gates.gate({"title": "Distributed Systems Engineer", "location": "Denver, Colorado",
+                  "description": ""}, CFG), (False, "out on geography"))
+
 # It returns the employer's own sentence, so a human reads words rather than a verdict.
 _span = gates.office_obligation("blah This role is based in San Francisco (3 days in office) blah")
 check("returns the sentence, not a boolean", "3 days in office" in (_span or ""), True)

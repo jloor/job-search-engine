@@ -104,7 +104,24 @@ def norm_loc(location: str | None) -> str:
     return _JOINER.sub(" ", location or "")
 BODY_REMOTE = re.compile(
     r"\b(fully remote|100% remote|remote[- ]first|remote.friendly|work from anywhere|"
-    r"remote (?:role|position|opportunity)|or remote|remote or)\b", re.I)
+    r"remote (?:role|position|opportunity)|or remote|remote or|work(?:ing)? remotely)\b", re.I)
+
+# 🚨 THREE KINDS OF REMOTE EVIDENCE THE GATE USED TO IGNORE. Measured 2026-10-07 by replaying
+# the 2026-09-23 Fantastic pull through gate(): of 379 rows rejected "out on geography", 60
+# were labelled "Remote Solely" or "Remote OK" by the source, against 113 rows kept in total.
+# The examples were his target roles:
+#   "Implementation Engineer (REMOTE)"  location "United States"  -> the TITLE says remote
+#   "Implementation Lead"               body "Work remotely within a flexible work environment"
+#   "Implementation Specialist II"      source label "Remote Solely", location "Texas"
+# The Fantastic feed leaves is_remote as None on purpose, because its arrangement field was
+# measured wrong 21% of the time, so a far-away city then ended the decision.
+# ⭐ ALL THREE ARE WEAK EVIDENCE AND ONLY EVER KEEP A ROW. None of them can reject one. A
+# kept row still goes through remote_check, which reads the sentence. Wrong in the keep
+# direction costs one triage; wrong in the reject direction costs a job nobody sees.
+# 📌 The title test is the bare word only. REMOTE_TXT also matches "distributed" and
+# "anywhere", and "Distributed Systems Engineer" is not a statement about location.
+TITLE_REMOTE = re.compile(r"\bremote\b", re.I)
+SOURCE_REMOTE = re.compile(r"^\s*remote\b", re.I)
 
 
 def eligibility(location: str | None) -> str:
@@ -143,6 +160,12 @@ def gate(posting: dict, cfg: dict | None = None, too_far: set | None = None) -> 
         # ⚠️ Deliberately weak evidence, kept on purpose. It is confirmed later by the
         # remote_check job, which reads the sentence rather than matching a phrase in it.
         return True, "body mentions remote"
+    if TITLE_REMOTE.search(norm_loc(posting.get("title") or "")):
+        return True, "title says remote"
+    if SOURCE_REMOTE.search(posting.get("work_arrangement") or ""):
+        # The source's own label, e.g. Fantastic's ai_work_arrangement. Recorded and never
+        # gated on in the reject direction; here it is only allowed to keep a row.
+        return True, "source labels it remote"
     if too_far and loc in too_far:
         return False, "over the commute ceiling"
 
