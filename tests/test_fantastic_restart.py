@@ -18,9 +18,10 @@ Run:  python3 tests/test_fantastic_restart.py
 
 import importlib.util, json, os, pathlib, sqlite3, sys, tempfile
 from datetime import datetime, timedelta, timezone
-HERE = pathlib.Path("/home/bullwinkle/job-search-engine"); SRC = HERE/"job_search_engine"
+HERE = pathlib.Path(__file__).resolve().parent.parent; SRC = HERE/"job_search_engine"
 DB = tempfile.mkdtemp()+"/g.db"; os.environ["DB_PATH"]=DB
-os.environ["CANDIDATE_CONFIG"]="/home/bullwinkle/job-search/config/candidate.toml"
+# No candidate config: the suite must pass with no real person on disk, and in CI.
+os.environ["CANDIDATE_CONFIG"]=str(pathlib.Path(tempfile.gettempdir())/"no-such-candidate.toml")
 os.environ["FANTASTIC_API_KEY"]="x"; os.environ["FANTASTIC_EVERY_MIN"]="60"
 sys.path.insert(0,str(SRC)); sys.path.insert(0,str(HERE/"tests"))
 import test_posting_age as TPA
