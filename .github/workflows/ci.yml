@@ -75,9 +75,8 @@ jobs:
       # Added 2026-10-01: the phone alert. Guards that a message alerts once, that the
       # body never goes out with it, and that a failed send is loud.
       - run: python3 tests/test_notify.py
-      # Added 2026-10-01: send approvals by YubiKey touch. Guards every refusal a forged
-      # approval could slip past, against OpenSSH's own format and one real device signature.
-      - run: python3 tests/test_sshsig.py
+      # 📌 test_sshsig.py MOVED to the drift job on 2026-10-07. It imports `cryptography`,
+      # so in this job it failed on every push since 2026-10-01 and kept the suite red.
       # Added 2026-10-01: the operator's BCC copy of every approved send. Guards that the
       # address never reaches a header the employer sees.
       - run: python3 tests/test_sent_copy.py
@@ -113,3 +112,10 @@ jobs:
           pip install "fetch-job-description @ git+https://github.com/jloor/fetch_job_description@main"
       - name: the suite, where a skip is a failure
         run: python3 tests/test_parse.py --strict
+      # Added 2026-10-01, moved here 2026-10-07: send approvals by YubiKey touch. Guards every
+      # refusal a forged approval could slip past, against OpenSSH's own format and one real
+      # device signature. It needs `cryptography`, which the bare job deliberately lacks.
+      - name: install cryptography for the send-approval test
+        run: pip install cryptography
+      - name: send approvals by YubiKey touch
+        run: python3 tests/test_sshsig.py
