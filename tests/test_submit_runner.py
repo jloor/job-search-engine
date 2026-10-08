@@ -249,6 +249,12 @@ kf.write_text("")
 check("the kill file stops runs", S.killed())
 os.environ.pop("SUBMIT_DISABLED")
 
+print("\nholding the form on screen:")
+for v, want in (("", 0), ("120", 120), ("900", 600), ("-5", 0), ("abc", 0)):
+    os.environ["SUBMIT_HOLD_SECONDS"] = v
+    check(f"SUBMIT_HOLD_SECONDS={v!r} holds {want}s (capped at 600, junk is 0)", S._hold_seconds() == want)
+os.environ.pop("SUBMIT_HOLD_SECONDS")
+
 print("\nthe relay client:")
 seen = []
 

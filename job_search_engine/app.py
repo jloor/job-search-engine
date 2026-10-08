@@ -11765,6 +11765,35 @@ def _submit_close(con, run_id: int, p: dict) -> None:
         raise HTTPException(409, f"run {run_id} is already closed")
 
 
+def _submit_clear(con, app_id: int, note: str) -> int:
+    """Mark an application's stopped and error runs 'cleared', so /submit/next offers it again.
+
+    A STOPPED run waits for a person: the timer must not retry it. Once the person has fixed the
+    cause (an answer added, a driver bug released), this is how the draft becomes eligible again.
+    The runs and their steps are kept; only the outcome changes, and the note says why.
+    """
+    note = (note or "").strip()
+    if not note:
+        raise HTTPException(400, "a note saying what was fixed is required")
+    return con.execute(
+        "UPDATE submit_run SET outcome='cleared', "
+        "stop_reason=coalesce(stop_reason,'') || ' [cleared ' || ? || ': ' || ? || ']' "
+        "WHERE application_id=? AND outcome IN ('stopped','error')",
+        (now(), note[:300], int(app_id))).rowcount
+
+
+@app.post("/submit/clear/{app_id}")
+async def submit_clear(app_id: int, request: Request, authorization: str | None = Header(None)):
+    """Admin only: the submit token must not be able to clear its own stops."""
+    require_admin(authorization, request)
+    p = await request.json()
+    with db() as con:
+        n = _submit_clear(con, app_id, p.get("note", ""))
+        log_event(con, "submit_clear", f"app {app_id}: {n} run(s) cleared: {p.get('note', '')[:200]}",
+                  client_ip(request))
+    return {"ok": True, "cleared": n}
+
+
 @app.get("/submit/next")
 def submit_next(request: Request, authorization: str | None = Header(None), app_id: int | None = None):
     require_submit(authorization, request)

@@ -26,7 +26,7 @@
     <input type="tel" id="phone" aria-required="true"></div>
   <div class="field"><label for="country">Country*</label>
     <div class="select__control"><input class="select__input" id="country" aria-required="true"
-      data-options="Canada|United Kingdom|United States|Uruguay"></div></div>
+      data-options="Canada|United Kingdom|United States +1|Uruguay"></div></div>
   <div class="field"><label for="resume">Attach</label>
     <input type="file" id="resume" class="visually-hidden"><span id="resume-name"></span></div>
   <div class="field"><label for="cover_letter">Attach</label>
@@ -57,7 +57,11 @@
       menu = document.createElement('div'); menu.className = 'select__menu';
       const q = input.value.toLowerCase();
       opts.filter((o) => o.toLowerCase().includes(q)).forEach((o) => {
-        const d = document.createElement('div'); d.className = 'select__option'; d.textContent = o;
+        // Like Greenhouse: a wrapper .select__option AND an inner role="option" per option, so a
+        // selector for either finds every option text twice.
+        const d = document.createElement('div'); d.className = 'select__option';
+        const inner = document.createElement('div'); inner.setAttribute('role', 'option'); inner.textContent = o;
+        d.appendChild(inner);
         d.addEventListener('mousedown', (e) => {
           e.preventDefault();
           if (!single) { single = document.createElement('div'); single.className = 'select__single-value'; ctl.insertBefore(single, input); }

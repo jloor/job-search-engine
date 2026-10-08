@@ -29,6 +29,7 @@ Environment (from the submitter host's env file, never from the repository):
   SUBMIT_HEADED         1 to draw on $DISPLAY (default 1 when DISPLAY is set)
   SUBMIT_DISABLED       1 stops every run before it starts (the kill switch)
   SUBMIT_KILL_FILE      a file whose existence is the same kill switch
+  SUBMIT_HOLD_SECONDS   keep the filled form on screen this long after the run ends (max 600)
   NTFY_URL, NTFY_TOKEN  the phone alert (optional)
 """
 from __future__ import annotations
@@ -42,6 +43,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -348,6 +350,11 @@ class Run:
             return self._done(app_id, "error", f"{step}: {e!r}")
         finally:
             if br is not None:
+                # 📌 Keep the filled form on the virtual screen for a person to inspect in the
+                # viewer. The run is already recorded and closed, and the page still cannot submit.
+                hold = _hold_seconds()
+                if hold:
+                    time.sleep(hold)
                 br.quit()
 
     def _safe_step(self, name, outcome, detail, br):
@@ -372,6 +379,14 @@ class Run:
 
 
 # ── the command line ──────────────────────────────────────────────────────────────────────
+def _hold_seconds() -> int:
+    """SUBMIT_HOLD_SECONDS, capped at 600 so a held window cannot outlive the unit's timeout."""
+    try:
+        return max(0, min(600, int(os.environ.get("SUBMIT_HOLD_SECONDS", "0") or 0)))
+    except ValueError:
+        return 0
+
+
 def killed() -> str | None:
     if os.environ.get("SUBMIT_DISABLED", "").strip() not in ("", "0"):
         return "SUBMIT_DISABLED is set"

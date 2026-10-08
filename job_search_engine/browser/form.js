@@ -106,6 +106,11 @@ async function harvest() {
 // two hits is ambiguous and is no match. ⚠️ Whole words only: a substring test lets "No" match
 // "I am not a veteran". answers.py applies the same tiers before the browser opens.
 function pickOption(opts, want) {
+  // ⚠️ DEDUPLICATE FIRST. Greenhouse renders each option as a wrapper AND an inner role="option"
+  // node, and the option selector matches both, so every option text arrives twice. Without this,
+  // the ambiguity rule below refused "United States +1" for matching itself (2026-10-08, the
+  // phone-country picker). Two DIFFERENT options that match are still refused.
+  opts = [...new Set(opts)];
   const w = String(want).trim().toLowerCase();
   const esc = w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const word = new RegExp('(?<![\\w])' + esc + '(?![\\w])');

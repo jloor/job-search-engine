@@ -114,6 +114,8 @@ try:
           all(r["status"] == "set" for r in fr["results"]), )
     check("the gender select chose the page's own wording (Woman), via [form_spellings]",
           status.get("gender", {}).get("chosen") == "Woman")
+    check("🚨 an option rendered twice (wrapper + role=option) is still chosen: 'United States +1'",
+          status.get("country", {}).get("chosen") == "United States +1")
     p1 = shots / "filled.png"
     br("shot", path=str(p1))
     check("a screenshot is written, and it is a PNG", p1.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n")

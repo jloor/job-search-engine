@@ -258,6 +258,7 @@ Admin is a superset, so driving by hand needs one token rather than two. Verifie
 | `/diag/ip`, `/diag/repo`, `/diag/mailports` | **403** | 200 | 401 |
 | `POST /send` | **403** | 400 (field validation, past auth) | 401 |
 | `/submit/*` | **403** | **403** | 401 (503 when `SUBMIT_TOKEN` is unset) |
+| `POST /submit/clear/{app}` | **403** | 200 | 401. ⚠️ **Admin only, and the submit token is refused:** a stopped run waits for a person, so the runner must not be able to clear its own stops. |
 
 📌 **`SUBMIT_TOKEN` is not on the read/admin ladder.** It opens nothing else, and neither
 other token opens its routes. Tested both ways in `tests/test_submit_routes.py`.

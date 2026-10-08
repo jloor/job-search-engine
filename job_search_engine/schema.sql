@@ -926,7 +926,7 @@ CREATE TABLE IF NOT EXISTS submit_run (
   ended_at       TEXT,
   mode           TEXT NOT NULL DEFAULT 'shadow',
   ats            TEXT,                 -- greenhouse | lever | workday | ashby
-  outcome        TEXT NOT NULL DEFAULT 'running',  -- running | shadow_complete | stopped | error
+  outcome        TEXT NOT NULL DEFAULT 'running',  -- running | shadow_complete | stopped | error | cleared
   stop_step      TEXT,                 -- the step name that stopped the run
   stop_reason    TEXT,                 -- why, in words a person can act on
   engine_version TEXT,

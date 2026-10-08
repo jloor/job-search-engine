@@ -198,6 +198,24 @@ with app.db() as con:
 check("a run left 'running' for hours is treated as abandoned",
       call(app.submit_next, auth=S, app_id=21)["next"] is not None)
 
+print("\nclearing a stop:")
+check("the submit token cannot clear its own stops (admin only)",
+      code_of(app.submit_clear, 2, Req({"note": "x"}), authorization=S) == 401)
+check("a clear needs a note saying what was fixed",
+      code_of(app.submit_clear, 2, Req({"note": " "}), authorization="Bearer admin-tok") == 400)
+call(app.submit_clear, 2, auth="Bearer admin-tok", body={"note": "answer added"})
+check("after a clear, the stopped application is offered again",
+      (call(app.submit_next, auth=S, app_id=2)["next"] or {}).get("application_id") == 2)
+check("…and a clear resets the error budget too",
+      (call(app.submit_clear, 20, auth="Bearer admin-tok", body={"note": "driver fixed"})["cleared"] == 3)
+      and call(app.submit_next, auth=S, app_id=20)["next"] is not None)
+with app.db() as con:
+    kept = con.execute("SELECT count(*) AS n FROM submit_run WHERE application_id=2").fetchone()["n"]
+    why = con.execute("SELECT stop_reason FROM submit_run WHERE application_id=2").fetchone()["stop_reason"]
+check("the cleared run is kept, with the note in its reason", kept == 1 and "answer added" in why)
+check("a shadow-complete run is never cleared", call(app.submit_clear, 1, auth="Bearer admin-tok",
+                                                     body={"note": "x"})["cleared"] == 0)
+
 print("\ndiagnostics:")
 check("SUBMIT_TOKEN is fingerprinted in /diag/config, never shown",
       '"SUBMIT_TOKEN"' in (HERE.parent / "job_search_engine" / "app.py").read_text())
