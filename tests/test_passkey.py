@@ -260,6 +260,36 @@ check("🚨 the same assertion cannot send it twice", e == 409 and len(delivered
 _, e = call(app.approve_options, qtok, Req())
 check("🚨 a sent email offers no new challenge", e == 409)
 
+print("\ncancel a queued email (added 2026-10-08):")
+qc, _ = call(app.send_queue_add, Req({**EMAIL, "body": "First wording."}), authorization=ADM)
+tc = qc["url"].rsplit("/", 1)[1]
+oc, _ = call(app.approve_options, tc, Req())          # a challenge is open when the cancel lands
+_, e = call(app.send_queue_cancel, qc["queue_id"], Req(), authorization=None)
+check("cancelling needs the admin token", e == 401)
+_, e = call(app.send_queue_cancel, 999999, Req(), authorization=ADM)
+check("an unknown queue id: 404", e == 404)
+r, e = call(app.send_queue_cancel, qc["queue_id"], Req({"why": "rewording"}), authorization=ADM)
+check("the admin token cancels a queued email", e is None and r["status"] == "cancelled")
+with app.db() as con:
+    _page = P.approve_page(tc, app._queue_item(con, tc))
+check("…its approval page says it is cancelled, with no button", "This email is cancelled" in _page
+      and "id='go'" not in _page)
+n_before = len(delivered)
+_, e = call(app.approve_verify, tc, Req(yk.get(oc)))
+check("🚨 a valid passkey assertion on the challenge opened BEFORE the cancel sends nothing",
+      e == 409 and len(delivered) == n_before)
+_, e = call(app.approve_options, tc, Req())
+check("…and no new challenge is offered", e == 409)
+_, e = call(app.send_queue_cancel, qc["queue_id"], Req(), authorization=ADM)
+check("a second cancel: 409", e == 409)
+_, e = call(app.send_queue_cancel, q["queue_id"], Req(), authorization=ADM)
+check("🚨 an email already SENT cannot be cancelled (409), and stays sent", e == 409)
+with app.db() as con:
+    st = con.execute("SELECT status FROM send_queue WHERE id=?", (q["queue_id"],)).fetchone()["status"]
+    ev = con.execute("SELECT detail FROM event WHERE kind='send_cancelled' ORDER BY id DESC LIMIT 1").fetchone()
+check("…its row still reads 'sent'", st == "sent")
+check("the cancel is in the audit log, with the reason", ev and "rewording" in ev["detail"])
+
 print("\nclone detection:")
 q2, _ = call(app.send_queue_add, Req({**EMAIL, "body": "Second one."}), authorization=ADM)
 t2 = q2["url"].rsplit("/", 1)[1]

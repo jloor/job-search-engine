@@ -10671,6 +10671,38 @@ def _queue_item(con, token: str) -> dict:
     return item
 
 
+@app.post("/send/queue/{qid}/cancel")
+async def send_queue_cancel(qid: int, request: Request, authorization: str | None = Header(None)):
+    """Withdraw a queued email before anyone approves it. It can only STOP a send, never cause one.
+
+    ⭐ WHY (2026-10-08). A wording change after queueing left two versions waiting on the phone,
+    and either could have been approved. With no route, the old one had to be cancelled by a
+    direct database update. Now: queue the new version, cancel the old one by its queue id.
+
+    Only a row still 'queued' moves, to 'cancelled', in one guarded UPDATE, so a cancel racing an
+    approval never touches an email that is sending or sent. The approval page then shows
+    "This email is cancelled", and its passkey step refuses (409).
+    """
+    require_admin(authorization, request)
+    p = {}
+    try:
+        p = await request.json()
+    except Exception:                                         # noqa: BLE001  (a body is optional)
+        pass
+    why = str((p or {}).get("why") or "")[:200]
+    with db() as con:
+        row = con.execute("SELECT id, status, to_addr FROM send_queue WHERE id=?", (qid,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "not found")
+        cur = con.execute("UPDATE send_queue SET status='cancelled', challenge=NULL "
+                          "WHERE id=? AND status='queued'", (qid,))
+        if not (cur.rowcount or 0):
+            raise HTTPException(409, f"this email is {row['status']}: only a queued email can be cancelled")
+        log_event(con, "send_cancelled", f"queue {qid} -> {parseaddr(row['to_addr'])[1]}"
+                  + (f": {why}" if why else ""), client_ip(request))
+    return {"ok": True, "queue_id": qid, "status": "cancelled"}
+
+
 @app.get("/approve/{token}")
 def approve_page(token: str):
     import passkey as _P
