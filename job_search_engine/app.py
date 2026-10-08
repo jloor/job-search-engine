@@ -906,6 +906,14 @@ MIGRATIONS = [
     # 2026-10-08: the one security code a live run may enter. See schema.sql.
     ("CREATE TABLE IF NOT EXISTS submit_code_used (run_id INTEGER PRIMARY KEY REFERENCES submit_run(id), "
      "message_id INTEGER NOT NULL REFERENCES message(id), at TEXT NOT NULL)"),
+    # 2026-10-08: a root operation approved by passkey, verified by the root broker. See schema.sql.
+    ("CREATE TABLE IF NOT EXISTS root_request ("
+     "id INTEGER PRIMARY KEY, token TEXT NOT NULL UNIQUE, op TEXT NOT NULL, args_json TEXT NOT NULL, "
+     "host TEXT NOT NULL, expires_at INTEGER NOT NULL, op_hash TEXT NOT NULL, created_at TEXT NOT NULL, "
+     "status TEXT NOT NULL DEFAULT 'pending', challenge TEXT, challenge_expires INTEGER, "
+     "assertion_json TEXT, approved_by TEXT, approved_at TEXT, result_code INTEGER, "
+     "result_output TEXT, done_at TEXT)"),
+    "CREATE INDEX IF NOT EXISTS idx_root_request_status ON root_request(status, id)",
 ]
 
 
@@ -1002,6 +1010,10 @@ ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN") or API_TOKEN
 # credential most exposed to hostile content. It therefore gets no fallback to API_TOKEN:
 # unset means the routes are closed, never that some other token works there.
 SUBMIT_TOKEN = os.environ.get("SUBMIT_TOKEN") or ""
+# ROOT_BROKER_TOKEN opens /root/pending and /root/result and nothing else, with no fallback, for
+# the same reason. It is NOT what protects root: the broker verifies the operator's passkey itself.
+# A leaked broker token can read pending requests and post a false result line, nothing more.
+ROOT_BROKER_TOKEN = os.environ.get("ROOT_BROKER_TOKEN") or ""
 
 
 def _bearer(auth: str | None) -> str:
@@ -1067,6 +1079,21 @@ def require_submit(auth: str | None, request=None) -> None:
               else "bad or missing bearer token (submit route)", ip)
         raise HTTPException(403 if scope else 401,
                             "forbidden: submit scope required" if scope else "unauthorized")
+
+
+def require_root_broker(auth: str | None, request=None) -> None:
+    """/root/pending and /root/result. Only ROOT_BROKER_TOKEN passes; no other token does."""
+    ip = client_ip(request) if request is not None else ""
+    if not ROOT_BROKER_TOKEN:
+        raise HTTPException(503, "ROOT_BROKER_TOKEN not configured: the broker routes are closed")
+    tok = _bearer(auth)
+    if not (tok and _eq(tok, ROOT_BROKER_TOKEN)):
+        scope = _scope_of(auth) or ("submit" if tok and SUBMIT_TOKEN and _eq(tok, SUBMIT_TOKEN) else None)
+        audit("auth_failure",
+              f"{scope} token used on a root broker route" if scope
+              else "bad or missing bearer token (root broker route)", ip)
+        raise HTTPException(403 if scope else 401,
+                            "forbidden: root broker scope required" if scope else "unauthorized")
 
 
 def fingerprint(from_alias: str, to: str, subject: str, body: str) -> str:
@@ -9766,7 +9793,8 @@ def diag_config(request: Request, authorization: str | None = Header(None)):
               "INBOUND_TOKEN", "APPROVAL_PUBKEY", "BACKUP_PUBKEY", "SMTP_PASS",
               "STORAGE_KEY", "GIT_DEPLOY_KEY_B64", "ANTHROPIC_API_KEY", "AI_API_KEY",
               "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GOOGLE_MAPS_API_KEY", "RESEND_API_KEY",
-              "APPROVAL_SK_KEYS", "NTFY_URL", "NTFY_TOKEN", "SENT_COPY_BCC", "SUBMIT_TOKEN"]
+              "APPROVAL_SK_KEYS", "NTFY_URL", "NTFY_TOKEN", "SENT_COPY_BCC", "SUBMIT_TOKEN",
+              "ROOT_BROKER_TOKEN"]
     plain = ["APPROVAL_SK_ONLY", "MAIL_DOMAIN", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "STORAGE_ZONE",
              "STORAGE_HOST", "AI_PROVIDER", "AI_MODEL", "AI_BASE_URL", "AI_READ_ENABLED",
              "AI_READ_SCOPE", "TRUSTED_PROXY_HOPS", "GIT_REPO_SSH", "GIT_AUTHOR_EMAIL",
@@ -12202,6 +12230,226 @@ async def submit_run_submitted(run_id: int, request: Request, authorization: str
         log_event(con, "submit_submitted", f"run {run_id} app {run['application_id']} {proof[:200]}",
                   client_ip(request))
     return {"ok": True}
+
+
+# ── root operations, approved by passkey, verified and run by the root broker (2026-10-08) ─────
+# 🚨 THE RELAY DECIDES NOTHING HERE. It stores a request, shows it, runs the passkey ceremony so the
+# phone gets an answer, and keeps the RAW assertion. The root broker on the host verifies that
+# assertion itself, against a public key in a root-owned file, over a hash it recomputes from the
+# operation it runs (rootops.py). The harness can change this code, so a check here is a courtesy.
+ROOT_PICKUP_S = 300             # the signed expiry leaves the broker this long after the last approval
+
+
+def _root_notify(title: str, message: str, url: str | None = None, priority: int = 4) -> str:
+    if not NTFY_URL:
+        return "off"
+    import notify as _N
+    body = {"title": title[:200], "message": message[:1000], "priority": priority, "tags": ["key"]}
+    if url:
+        body["click"] = url
+    ok, detail = _N.send(NTFY_URL, NTFY_TOKEN, body)
+    return "sent" if ok else f"failed: {detail}"
+
+
+def _root_item(con, token: str) -> dict:
+    row = con.execute("SELECT * FROM root_request WHERE token=?", (token,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "not found")
+    item = dict(row)
+    t = time.time()
+    if ((item["status"] == "pending" and t > item["expires_at"] - ROOT_PICKUP_S)
+            or (item["status"] == "approved" and t > item["expires_at"])):
+        con.execute("UPDATE root_request SET status='expired' WHERE id=? AND status IN ('pending','approved')",
+                    (item["id"],))
+        item["status"] = "expired"
+    return item
+
+
+@app.post("/root/request")
+async def root_request_create(request: Request, authorization: str | None = Header(None)):
+    """Queue a root operation for the operator's passkey. It runs nothing."""
+    import rootops as _R
+    require_admin(authorization, request)
+    p = await request.json()
+    op, args, host = str(p.get("op") or ""), p.get("args") or {}, str(p.get("host") or "")
+    try:
+        _R.validate(op, args, host)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    expires = int(time.time()) + _R.TTL_S + ROOT_PICKUP_S
+    h = _R.op_hash(op, args, host, expires)
+    token = secrets.token_urlsafe(24)
+    with db() as con:
+        cur = con.execute(
+            "INSERT INTO root_request(token, op, args_json, host, expires_at, op_hash, created_at) "
+            "VALUES (?,?,?,?,?,?,?)", (token, op, json.dumps(args, sort_keys=True), host, expires, h, now()))
+        rid = cur.lastrowid
+        log_event(con, "root_requested", f"root request {rid}: {op} {json.dumps(args, sort_keys=True)} "
+                  f"on {host} hash {h[:16]}", client_ip(request))
+    url = f"{PUBLIC_URL}/root/approve/{token}"
+    alert = _root_notify("Approve a root operation", f"{_R.describe(op, args)} on {host}. "
+                         "Tap to review and approve it with your passkey.", url)
+    return {"ok": True, "id": rid, "approval_url": url, "op_hash": h, "expires_at": expires, "alert": alert}
+
+
+@app.get("/root/request/{rid}")
+def root_request_get(rid: int, request: Request, authorization: str | None = Header(None)):
+    """The harness reads the outcome here. Never the assertion."""
+    require_admin(authorization, request)
+    with db() as con:
+        row = con.execute("SELECT token FROM root_request WHERE id=?", (rid,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "not found")
+        item = _root_item(con, row["token"])
+    return {k: item[k] for k in ("id", "op", "args_json", "host", "expires_at", "op_hash", "created_at",
+                                 "status", "approved_by", "approved_at", "result_code", "result_output",
+                                 "done_at")}
+
+
+@app.get("/root/approve/{token}")
+def root_approve_page(token: str):
+    import passkey as _P
+    _pk_cfg()
+    with db() as con:
+        try:
+            item = _root_item(con, token)
+        except HTTPException:
+            return _pk_page(_P._page("Not found", "<h1>Not found</h1>"), 404)
+    return _pk_page(_P.root_approve_page(token, item))
+
+
+@app.post("/root/approve/{token}/options")
+def root_approve_options(token: str, request: Request):
+    import passkey as _P
+    rp_id, _ = _pk_cfg()
+    with db() as con:
+        item = _root_item(con, token)
+        if item["status"] != "pending":
+            raise HTTPException(409, f"this request is {item['status']}")
+        creds = _pk_active(con)
+        if not creds:
+            raise HTTPException(409, "no active passkey")
+        ch = _P.challenge_for(item["op_hash"])
+        con.execute("UPDATE root_request SET challenge=?, challenge_expires=? WHERE id=?",
+                    (_P.b64u(ch), int(time.time()) + _P.CHALLENGE_TTL_S, item["id"]))
+    return JSONResponse(json.loads(_P.authentication_options(
+        rp_id, ch, [_P.unb64u(c["credential_id"]) for c in creds])))
+
+
+@app.post("/root/approve/{token}/verify")
+async def root_approve_verify(token: str, request: Request):
+    """Check the assertion so the phone gets a true answer, then KEEP it for the broker."""
+    import passkey as _P
+    import rootops as _R
+    rp_id, origin = _pk_cfg()
+    ip = client_ip(request)
+    body = await request.json()
+    with db() as con:
+        item = _root_item(con, token)
+        if item["status"] != "pending":
+            raise HTTPException(409, f"this request is {item['status']}")
+        ch_b64 = item["challenge"]
+        cur = con.execute("UPDATE root_request SET challenge=NULL WHERE id=? AND challenge=?",
+                          (item["id"], ch_b64))
+        if not ch_b64 or not (cur.rowcount or 0):
+            raise HTTPException(409, "no open challenge: press the button again")
+        if time.time() > (item["challenge_expires"] or 0):
+            raise HTTPException(409, "the challenge expired: press the button again")
+        cred = con.execute("SELECT * FROM passkey_credential WHERE credential_id=? AND status='active'",
+                           (str(body.get("rawId") or body.get("id") or ""),)).fetchone()
+    if cred is None:
+        audit("root_refused", "root approval from an unknown or inactive credential", ip)
+        raise HTTPException(403, "refused: approval does not match this request")
+    cred = dict(cred)
+    challenge = _P.unb64u(ch_b64)
+    h = _R.op_hash(item["op"], json.loads(item["args_json"]), item["host"], item["expires_at"])
+    if not (h == item["op_hash"] == _P.fp_in_challenge(challenge)):
+        audit("root_refused", f"root request {item['id']}: operation hash mismatch", ip)
+        raise HTTPException(403, "refused: approval does not match this request")
+    try:
+        new_count = _P.verify_authentication(body, challenge, rp_id, origin,
+                                             _P.unb64u(cred["public_key"]), cred["sign_count"])
+    except Exception as e:                                    # noqa: BLE001
+        audit("root_refused", f"passkey verification failed: {type(e).__name__}: {e}"[:400], ip)
+        raise HTTPException(403, "refused: approval does not match this request")
+    if not _P.sign_count_ok(cred["sign_count"], new_count):
+        audit("root_refused", f"passkey sign count did not grow ({cred['sign_count']} -> {new_count})", ip)
+        raise HTTPException(403, "refused: approval does not match this request")
+    by = f"passkey:{cred.get('label') or cred['credential_id'][:12]}"
+    keep = {"id": body.get("id"), "rawId": body.get("rawId"), "type": body.get("type"),
+            "response": {k: (body.get("response") or {}).get(k)
+                         for k in ("clientDataJSON", "authenticatorData", "signature", "userHandle")},
+            "clientExtensionResults": {}}
+    with db() as con:
+        con.execute("UPDATE passkey_credential SET sign_count=?, last_used_at=? WHERE credential_id=?",
+                    (new_count, now(), cred["credential_id"]))
+        burn_nonce(con, "ro." + challenge[:16].hex(), h)
+        cur = con.execute("UPDATE root_request SET status='approved', approved_by=?, approved_at=?, "
+                          "assertion_json=? WHERE id=? AND status='pending'",
+                          (by, now(), json.dumps(keep), item["id"]))
+        if not (cur.rowcount or 0):
+            raise HTTPException(409, "this request was already decided")
+        log_event(con, "root_approved_passkey", f"root request {item['id']} {item['op']} by {by} "
+                  f"hash {h[:16]}", ip)
+    return {"ok": True, "approved": True, "id": item["id"]}
+
+
+@app.get("/root/pending")
+def root_pending(request: Request, authorization: str | None = Header(None)):
+    """Approved requests, oldest first, with the raw assertion. The broker verifies everything."""
+    require_root_broker(authorization, request)
+    with db() as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT * FROM root_request WHERE status='approved' ORDER BY id LIMIT 5").fetchall()]
+        out = []
+        for r in rows:
+            r = _root_item(con, r["token"])
+            if r["status"] == "approved":
+                out.append({k: r[k] for k in ("id", "op", "args_json", "host", "expires_at", "op_hash",
+                                              "assertion_json")})
+    return {"pending": out}
+
+
+@app.get("/root/credentials")
+def root_credentials(request: Request, authorization: str | None = Header(None)):
+    """The ACTIVE passkeys, for the broker's one-time install. ⚠️ The installer shows each key's
+    short code, computed by the installer from the key, for the operator to compare by eye. This
+    route is not trusted for the key; the comparison is."""
+    require_root_broker(authorization, request)
+    with db() as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT credential_id, public_key, sign_count, label, code, activated_at FROM passkey_credential "
+            "WHERE status='active' ORDER BY activated_at").fetchall()]
+    return {"credentials": rows}
+
+
+@app.post("/root/result/{rid}")
+async def root_result(rid: int, request: Request, authorization: str | None = Header(None)):
+    """The broker reports what it did: done, failed (the op ran and exited non-zero), or refused."""
+    require_root_broker(authorization, request)
+    p = await request.json()
+    outcome = str(p.get("outcome") or "")
+    if outcome not in ("done", "failed", "refused"):
+        raise HTTPException(400, "outcome must be done, failed or refused")
+    code = p.get("code")
+    output = str(p.get("output") or "")[-4000:]
+    with db() as con:
+        row = con.execute("SELECT * FROM root_request WHERE id=?", (rid,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "not found")
+        cur = con.execute("UPDATE root_request SET status=?, result_code=?, result_output=?, done_at=? "
+                          "WHERE id=? AND status IN ('approved','expired')",
+                          (outcome, code if isinstance(code, int) else None, output, now(), rid))
+        if not (cur.rowcount or 0):
+            raise HTTPException(409, f"this request is {row['status']}")
+        log_event(con, f"root_{outcome}", f"root request {rid} {row['op']} code {code} "
+                  f"{output[-200:]}", client_ip(request))
+    import rootops as _R
+    alert = _root_notify(f"Root operation {outcome}",
+                         f"{_R.describe(row['op'], json.loads(row['args_json']))}: {outcome}"
+                         f"{'' if code is None else f' (exit {code})'}. {output[-300:]}",
+                         priority=3 if outcome == "done" else 4)
+    return {"ok": True, "alert": alert}
 
 
 @app.post("/mcp")

@@ -199,6 +199,29 @@ def submit_approve_page(token: str, item: dict) -> str:
     return _page("Approve application", head + card + tail)
 
 
+def root_approve_page(token: str, item: dict) -> str:
+    """One root operation on one host. Approving it stores the assertion; the root broker on the
+    host verifies it again, itself, and only then runs the operation. Nothing runs here."""
+    import rootops
+    e = html.escape
+    args = json.loads(item.get("args_json") or "{}")
+    status = item.get("status")
+    head = ("<h1>Approve a root operation?</h1><p class='mut'>The root broker on the host checks your "
+            "passkey signature itself, then runs exactly this, once.</p>")
+    rows = "".join(f"<dt>{e(k)}</dt><dd><code>{e(str(v))}</code></dd>" for k, v in sorted(args.items()))
+    card = (f"<div class='card'><dl class='rec'><dt>Operation</dt><dd><b>{e(rootops.describe(item['op'], args))}</b>"
+            f"</dd><dt>Host</dt><dd>{e(item.get('host') or '')}</dd><dt>Op</dt><dd><code>{e(item['op'])}</code></dd>"
+            f"{rows}<dt>Requested</dt><dd>{e((item.get('created_at') or '').replace('T', ' ')[:16])} UTC</dd>"
+            f"<dt>Hash</dt><dd><code>{e(item['op_hash'][:16])}…</code></dd></dl></div>")
+    if status != "pending":
+        tail = f"<p id='msg' class='bad'>This request is {e(status or 'unknown')}. Nothing more can be done here.</p>"
+    else:
+        tail = (f"<button id='go' data-mode='approve' data-base='/root/approve/' "
+                f"data-done='Approved. The broker runs it within about a minute.' "
+                f"data-token='{e(token)}'>Approve this root operation</button><p id='msg'></p>")
+    return _page("Approve root operation", head + card + tail)
+
+
 def enroll_page(token: str) -> str:
     e = html.escape
     inner = ("<h1>Register a passkey for mail approval</h1>"

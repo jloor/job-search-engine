@@ -986,3 +986,29 @@ CREATE TABLE IF NOT EXISTS submit_code_used (
   message_id  INTEGER NOT NULL REFERENCES message(id),
   at          TEXT NOT NULL
 );
+
+-- A root operation the operator approves by passkey (rootops.py, 2026-10-08). The relay CARRIES
+-- it: it stores the request and the raw assertion, and a root broker on the host verifies the
+-- assertion itself against a public key in a root-owned file. 🚨 status='approved' here is a
+-- claim by code the harness can change, so the broker never trusts it. It recomputes op_hash
+-- from op, args_json, host and expires_at, and the signed challenge must carry that hash.
+CREATE TABLE IF NOT EXISTS root_request (
+  id                INTEGER PRIMARY KEY,
+  token             TEXT NOT NULL UNIQUE,                  -- the approval page's link
+  op                TEXT NOT NULL,
+  args_json         TEXT NOT NULL,
+  host              TEXT NOT NULL,
+  expires_at        INTEGER NOT NULL,                      -- Unix seconds, inside the signed hash
+  op_hash           TEXT NOT NULL,
+  created_at        TEXT NOT NULL,
+  status            TEXT NOT NULL DEFAULT 'pending',       -- pending | approved | done | failed | refused | expired
+  challenge         TEXT,
+  challenge_expires INTEGER,
+  assertion_json    TEXT,                                  -- the raw WebAuthn assertion, for the broker
+  approved_by       TEXT,
+  approved_at       TEXT,
+  result_code       INTEGER,
+  result_output     TEXT,
+  done_at           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_root_request_status ON root_request(status, id);

@@ -525,3 +525,48 @@ earlier. The limits, each enforced in code and tested:
 a form's labels and options decide nothing on their own: an answer comes from the candidate's
 config or the run stops.
 
+
+## 🔐 Root operations approved by passkey, added 2026-10-08 with `rootops.py`
+
+Some maintenance on the submitter's host needs root (an engine install into the runner's venv,
+the runner's timer and kill switch, one sudo grant line). The operator is often away from the
+host's admin login. A **root broker** on the host runs a FIXED list of those operations, each one
+only after the operator approves it with his passkey on `/root/approve/{token}`.
+
+**The relay carries; the broker decides.** The agent that drives this system can change and
+redeploy the relay, so a root process that trusted the relay's word "approved" would let that
+agent approve itself. The relay therefore stores the request and the RAW WebAuthn assertion, and
+the broker verifies everything again, from its own root-owned copies:
+- the operation and its arguments, against the broker's own list and patterns (`rootops.py` is a
+  copy for display and early typo checks; the two agree on `CANONICAL_VECTOR`, checked by both
+  test suites);
+- the host name, so an approval for one machine cannot run on another;
+- the signed expiry (at most one hour out);
+- the challenge: 16 random bytes, then sha256 of the canonical form (`rootops.canonical`: a domain
+  string, the op, the arguments, the host and the expiry), RECOMPUTED by the broker from the
+  operation it is about to run. The relay's stored hash is ignored. A request the relay altered
+  after approval does not match;
+- the 16 random bytes, never used before (root-owned state, written to disk BEFORE the operation
+  starts, so a crash cannot turn one approval into two runs);
+- the assertion itself, under a public key in a root-owned file: RP ID, origin, user presence and
+  user verification, and a sign count that grows (for a credential that counts).
+
+**`ROOT_BROKER_TOKEN`** opens `GET /root/pending`, `GET /root/credentials` and
+`POST /root/result/{id}` only, with no fallback, and no other token opens them. It does not protect
+root. A leaked broker token can read approved requests (which carry no secret) and post a false
+result line; it cannot make the broker run anything.
+
+**The credential is bound once, by a person.** The installer reads the active passkey's public key
+from the relay, computes its short code itself, and installs the key only if the operator TYPES the
+code he recorded when he activated the passkey with his hardware key. The code the installer prints
+is not the reference; his own record is.
+
+🚫 **Not on the list, deliberately:** replacing the broker, the root control command, or any root
+file with new content. New root code cannot be reviewed on a phone, and a passkey tap would only
+make it look reviewed. That stays with the admin login.
+
+⚠️ **What the approval does not stop.** `submitter-install` installs a release tag that the agent
+can publish, into the runner's venv, where it runs as the runner user. The passkey approves the
+INSTALL; it cannot review the tag's code. That is the same trust the admin login gave this step
+before the broker existed: the release tag is attested by the engine's CI, and the runner user is
+contained as described in the browser submitter section.
