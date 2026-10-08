@@ -123,12 +123,24 @@ class Browser:
 
 
 # ── checks with no browser ────────────────────────────────────────────────────────────────
+# A location that names the whole eligible country and nothing smaller.
+COUNTRY_WIDE = re.compile(r"^(united states( of america)?|u\.?s\.?a?\.?)$", re.I)
+
+
 def check_gates(job_doc: dict, cfg: dict) -> None:
     import comp as COMP
     import gates as G
     desc = GH.description(job_doc)
     loc = ((job_doc.get("location") or {}).get("name") or "").strip()
     keep, why = G.gate({"location": loc, "title": job_doc.get("title") or "", "description": desc}, cfg)
+    # ⚠️ THE RUNNER MUST NOT BE STRICTER THAN THE DECISION IT CARRIES OUT. gate() is the cheap
+    # first filter: it keeps on evidence and leaves the rest to the remote reader, which an
+    # approved posting has already passed. A posting located only "United States" reads as
+    # "out on geography" there, while it names no city at all. Found 2026-10-08 on an
+    # approved role whose body said "our remote implementation model". A country-wide
+    # location passes here; the office-obligation check below still runs on its text.
+    if not keep and why == "out on geography" and COUNTRY_WIDE.match(loc):
+        keep = True
     if not keep:
         raise Stop(f"the remote gate fails: {why} (location {loc!r})")
     ob = G.office_obligation(desc)

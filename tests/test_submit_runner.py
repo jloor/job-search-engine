@@ -198,6 +198,23 @@ stopped_at("an office obligation in the text", "gates",
 stopped_at("no pay range", "gates", job=dict(JOB, content="Fully remote."))
 stopped_at("an onsite location", "gates",
            job=dict(JOB, location={"name": "Paris, France"}))
+PAY = " The pay range is $100,000 - $120,000 per year."
+r, relay, _ = stopped_at("a US city with no remote evidence", "gates",
+                         job=dict(JOB, location={"name": "Austin, Texas"}, content="Our team." + PAY))
+check("…for the geography, not the pay", "geography" in relay.closed["stop_reason"])
+r, relay, _ = run(job=dict(JOB, location={"name": "United States"},
+                           content="Our implementation model." + PAY))[:3]
+check("a country-wide location passes the gate (the runner is not stricter than the queue)",
+      r["outcome"] == "shadow_complete")
+r, relay, _ = stopped_at("a country-wide location that states an office obligation", "gates",
+                         job=dict(JOB, location={"name": "United States"},
+                                  content="This role is hybrid." + PAY))
+check("…for the office obligation, not the pay", "office obligation" in relay.closed["stop_reason"])
+import greenhouse as GH                                          # noqa: E402
+q = GH.questions({"questions": [{"label": "Resume/CV", "required": True, "fields": [
+    {"name": "resume", "type": "input_file"}, {"name": "resume_text", "type": "textarea"}]}]})
+check("only the first field of a Greenhouse question carries 'required'",
+      q["resume"]["required"] and not q["resume_text"]["required"])
 PDF_TEXT["resume.pdf"] = "Alex Rivera other@jobs.example.com"
 stopped_at("the résumé carries a different alias", "package")
 PDF_TEXT["resume.pdf"] = f"Alex Rivera {ALIAS}"

@@ -126,12 +126,15 @@ def questions(job_doc: dict) -> dict:
     out: dict = {}
 
     def add(q: dict, group: str):
-        for f in q.get("fields") or []:
+        # ⚠️ Only the FIRST field of a question carries its "required". Greenhouse groups
+        # alternatives under one question (Resume/CV: a file, or text typed in place of it),
+        # and marking both required demands an answer the form never needs.
+        for i, f in enumerate(q.get("fields") or []):
             name = f.get("name")
             if not name or name in out:
                 continue
             out[name] = {"label": html.unescape(q.get("label") or ""),
-                         "required": bool(q.get("required")),
+                         "required": bool(q.get("required")) and i == 0,
                          "type": f.get("type") or "",
                          "options": [html.unescape(v.get("label") or "") for v in f.get("values") or []],
                          "group": group}
