@@ -269,5 +269,14 @@ with app.db() as con:
 _, e = opts()
 check("an expired approval cannot be approved", e == 409)
 
+print("\nreleasing a record:")
+with app.db() as con:
+    con.execute("UPDATE submit_approval SET status='pending', expires_at=? WHERE application_id=1",
+                (2_000_000_000,))
+call(app.submit_clear, 1, Req({"note": "retake"}), authorization=ADM)
+with app.db() as con:
+    st = con.execute("SELECT status FROM submit_approval WHERE application_id=1").fetchone()["status"]
+check("a clear expires the application's unused approval, so a stale record is never approved", st == "expired")
+
 print(f"\n{'FAILED: ' + str(len(fails)) if fails else 'all passed'}")
 sys.exit(1 if fails else 0)

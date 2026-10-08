@@ -11871,10 +11871,17 @@ def _submit_clear(con, app_id: int, note: str) -> int:
     note = (note or "").strip()
     if not note:
         raise HTTPException(400, "a note saying what was fixed is required")
+    # A complete shadow run is released too (2026-10-08): it blocks a NEW shadow run, and a
+    # record taken before approvals existed, or one the person wants retaken, needs a new one.
+    # Its unused approval is expired with it, so a stale record can never be approved later.
+    # ⚠️ A consumed approval, an 'unknown' run and a 'submitted' run are never released: those
+    # mean a click happened or may have.
+    con.execute("UPDATE submit_approval SET status='expired' WHERE application_id=? "
+                "AND status IN ('pending','approved')", (int(app_id),))
     return con.execute(
         "UPDATE submit_run SET outcome='cleared', "
         "stop_reason=coalesce(stop_reason,'') || ' [cleared ' || ? || ': ' || ? || ']' "
-        "WHERE application_id=? AND outcome IN ('stopped','error')",
+        "WHERE application_id=? AND outcome IN ('stopped','error','shadow_complete')",
         (now(), note[:300], int(app_id))).rowcount
 
 

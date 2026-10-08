@@ -215,8 +215,15 @@ with app.db() as con:
     kept = con.execute("SELECT count(*) AS n FROM submit_run WHERE application_id=2").fetchone()["n"]
     why = con.execute("SELECT stop_reason FROM submit_run WHERE application_id=2").fetchone()["stop_reason"]
 check("the cleared run is kept, with the note in its reason", kept == 1 and "answer added" in why)
-check("a shadow-complete run is never cleared", call(app.submit_clear, 1, auth="Bearer admin-tok",
-                                                     body={"note": "x"})["cleared"] == 0)
+check("a shadow-complete run can be released, so a new shadow run can take the record again",
+      call(app.submit_clear, 1, auth="Bearer admin-tok", body={"note": "retake"})["cleared"] == 1
+      and (call(app.submit_next, auth=S, app_id=1)["next"] or {}).get("application_id") == 1)
+with app.db() as con:
+    con.execute("INSERT INTO submit_run(application_id, started_at, mode, outcome) "
+                "VALUES (1, '2026-10-08T00:00:00+00:00', 'live', 'unknown')")
+check("🚨 an 'unknown' live run is NEVER released (a click may have happened)",
+      call(app.submit_clear, 1, auth="Bearer admin-tok", body={"note": "x"})["cleared"] == 0
+      and call(app.submit_next, auth=S, app_id=1)["next"] is None)
 
 print("\ndiagnostics:")
 check("SUBMIT_TOKEN is fingerprinted in /diag/config, never shown",
