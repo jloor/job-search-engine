@@ -175,6 +175,7 @@ and drop the duplicate row rather than throwing into the generic error path.
 | `REQUIRE_KNOWN_RECIPIENT` | `1` | Set to `0` only for a deliberate cold send. |
 | `SEND_RATE_PER_HOUR` | `10` | |
 | `BUNNY_DB_URL` / `BUNNY_DB_TOKEN` | unset | Unset uses the local SQLite file at `DB_PATH`. |
+| `SUBMIT_TOKEN` | unset | **Fails closed (503).** Opens the `/submit/*` routes only. No fallback to any other token. |
 
 Generate the three secrets:
 
@@ -247,6 +248,7 @@ anonymous requests to the same URL returned `401` every time. Same for `/mcp/mes
 |---|---|---|
 | `READ_TOKEN` | `/mcp`, `/mcp/messages`, `/mcp/message/{id}`, detailed `/health` | `~/.claude.json`, so this is the copy most likely to leak |
 | `ADMIN_TOKEN` | all of the above **plus** `/diag/*` and `/send` | his machine only |
+| `SUBMIT_TOKEN` | `/submit/*` **only** (added 2026-10-07) | the browser submitter's host user only |
 
 Admin is a superset, so driving by hand needs one token rather than two. Verified matrix:
 
@@ -255,6 +257,10 @@ Admin is a superset, so driving by hand needs one token rather than two. Verifie
 | `/mcp/messages`, `POST /mcp` | 200 | 200 | 401 |
 | `/diag/ip`, `/diag/repo`, `/diag/mailports` | **403** | 200 | 401 |
 | `POST /send` | **403** | 400 (field validation, past auth) | 401 |
+| `/submit/*` | **403** | **403** | 401 (503 when `SUBMIT_TOKEN` is unset) |
+
+📌 **`SUBMIT_TOKEN` is not on the read/admin ladder.** It opens nothing else, and neither
+other token opens its routes. Tested both ways in `tests/test_submit_routes.py`.
 
 ⭐ **403 rather than 401 when a valid token lacks the scope.** The distinction is recorded
 in the audit log too: *"read token used on an admin route"* is a very different event from
@@ -438,3 +444,33 @@ approval, and the exception is deliberately shaped so it cannot become a general
 
 **The line that must not be crossed:** if this ever grows a `to` parameter, it has become
 `/send` without the approval, and it must be deleted rather than guarded.
+
+## 🖱️ The browser submitter, added 2026-10-07 with `submit.py`
+
+A runner on a **separate host user** (never in the container) opens an employer's application
+form in a real browser, fills it from the candidate's config and package, reads every field
+back, and records each step with a screenshot. It is the one component that drives a browser
+through pages the operator does not control.
+
+**Phase 2 is shadow only, and that is enforced in code, not configuration.** The runner stops at
+the filled form and takes a review screenshot. There is no code path that clicks submit, the
+routes accept only `mode: shadow`, and no `/submit/*` route can change `application.status`.
+
+**Blast radius, by design:**
+- The runner holds `SUBMIT_TOKEN`, never the database token. A compromised runner can read the
+  next eligible draft (id, package path, alias, posting URL) and write run and step records.
+  It cannot read mail, send mail, or change any application's status.
+- The runner host user holds no approval key and cannot read the harness's vault.
+- ATS account passwords (where an ATS needs an account) live in a vault only that user can read.
+  🚨 A password field is never read back, printed, or captured: screenshots of pages with a
+  password input mask it first.
+
+**Hard limits, not settings:** no CAPTCHA or bot-check bypass of any kind (a CAPTCHA stops the
+run and goes to a person); an emailed security code is never typed by the runner; a question
+with no recorded answer stops the run rather than picking the nearest option; values are set
+with real input events, never by writing the DOM.
+
+**Page content is untrusted input.** The runner never follows instructions found on a page, and
+a form's labels and options decide nothing on their own: an answer comes from the candidate's
+config or the run stops.
+

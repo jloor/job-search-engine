@@ -883,6 +883,18 @@ MIGRATIONS = [
     "ALTER TABLE message ADD COLUMN notify_at TEXT",
     "ALTER TABLE message ADD COLUMN notify_attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE message ADD COLUMN notify_detail TEXT",
+    # 2026-10-07: the browser submitter's record. Declared in schema.sql with the reasoning.
+    # ⚠️ The column lists must stay identical to schema.sql.
+    ("CREATE TABLE IF NOT EXISTS submit_run ("
+     "id INTEGER PRIMARY KEY, application_id INTEGER NOT NULL REFERENCES application(id), "
+     "started_at TEXT NOT NULL, ended_at TEXT, mode TEXT NOT NULL DEFAULT 'shadow', ats TEXT, "
+     "outcome TEXT NOT NULL DEFAULT 'running', stop_step TEXT, stop_reason TEXT, "
+     "engine_version TEXT, host TEXT, evidence_dir TEXT)"),
+    "CREATE INDEX IF NOT EXISTS idx_submit_run_app ON submit_run(application_id, id DESC)",
+    ("CREATE TABLE IF NOT EXISTS submit_step ("
+     "id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES submit_run(id), "
+     "n INTEGER NOT NULL, name TEXT NOT NULL, at TEXT NOT NULL, outcome TEXT NOT NULL, "
+     "detail TEXT, screenshot_path TEXT, sha256 TEXT, UNIQUE(run_id, n))"),
 ]
 
 
@@ -973,6 +985,12 @@ def client_ip(request) -> str:
 # deploy degrades to the previous behaviour rather than locking everything out.
 READ_TOKEN  = os.environ.get("READ_TOKEN")  or API_TOKEN
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN") or API_TOKEN
+# 🚨 SUBMIT_TOKEN IS NOT A THIRD RUNG ON THE SAME LADDER. It opens the /submit/* routes and
+# nothing else, and neither READ nor ADMIN opens those routes. It lives on the browser
+# submitter's host user, which also drives a browser through third-party pages, so it is the
+# credential most exposed to hostile content. It therefore gets no fallback to API_TOKEN:
+# unset means the routes are closed, never that some other token works there.
+SUBMIT_TOKEN = os.environ.get("SUBMIT_TOKEN") or ""
 
 
 def _bearer(auth: str | None) -> str:
@@ -1023,6 +1041,21 @@ def require_admin(auth: str | None, request=None) -> str:
 # Kept so existing call sites keep working; admin is the safe default for anything unclassified.
 def require_api(auth: str | None, request=None) -> None:
     require_admin(auth, request)
+
+
+def require_submit(auth: str | None, request=None) -> None:
+    """The /submit/* routes. Only SUBMIT_TOKEN passes; admin and read do not (see above)."""
+    ip = client_ip(request) if request is not None else ""
+    if not SUBMIT_TOKEN:
+        raise HTTPException(503, "SUBMIT_TOKEN not configured: the submit routes are closed")
+    tok = _bearer(auth)
+    if not (tok and _eq(tok, SUBMIT_TOKEN)):
+        scope = _scope_of(auth)
+        audit("auth_failure",
+              f"{scope} token used on a submit route" if scope
+              else "bad or missing bearer token (submit route)", ip)
+        raise HTTPException(403 if scope else 401,
+                            "forbidden: submit scope required" if scope else "unauthorized")
 
 
 def fingerprint(from_alias: str, to: str, subject: str, body: str) -> str:
@@ -9719,7 +9752,7 @@ def diag_config(request: Request, authorization: str | None = Header(None)):
               "INBOUND_TOKEN", "APPROVAL_PUBKEY", "BACKUP_PUBKEY", "SMTP_PASS",
               "STORAGE_KEY", "GIT_DEPLOY_KEY_B64", "ANTHROPIC_API_KEY", "AI_API_KEY",
               "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GOOGLE_MAPS_API_KEY", "RESEND_API_KEY",
-              "APPROVAL_SK_KEYS", "NTFY_URL", "NTFY_TOKEN", "SENT_COPY_BCC"]
+              "APPROVAL_SK_KEYS", "NTFY_URL", "NTFY_TOKEN", "SENT_COPY_BCC", "SUBMIT_TOKEN"]
     plain = ["APPROVAL_SK_ONLY", "MAIL_DOMAIN", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "STORAGE_ZONE",
              "STORAGE_HOST", "AI_PROVIDER", "AI_MODEL", "AI_BASE_URL", "AI_READ_ENABLED",
              "AI_READ_SCOPE", "TRUSTED_PROXY_HOPS", "GIT_REPO_SSH", "GIT_AUTHOR_EMAIL",
@@ -11616,6 +11649,158 @@ def _mcp_call(name: str, args: dict) -> str:
         return "\n".join(out)
 
     raise ValueError(f"unknown tool {name}")
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════
+# The browser submitter's routes (2026-10-07). See submit.py for the runner and schema.sql for
+# submit_run / submit_step.
+#
+# 🚨 NARROW BY DESIGN. The submitter host holds SUBMIT_TOKEN and never the database token, so
+# these routes are everything it can do: read the next eligible draft, open and close a run,
+# and append steps. NO ROUTE HERE CHANGES application.status. Shadow mode cannot record a
+# submission, because nothing it can reach writes one.
+# ════════════════════════════════════════════════════════════════════════════════════════
+SUBMIT_MODES = ("shadow",)                       # a live mode is a future, separate decision
+SUBMIT_OUTCOMES = ("shadow_complete", "stopped", "error")
+SUBMIT_STEP_OUTCOMES = ("ok", "stop", "error")
+SUBMIT_RUN_STALE_S = 2 * 3600                    # a run still 'running' after this is abandoned
+SUBMIT_ERROR_RETRIES = 3                         # 'error' runs allowed before a draft is skipped
+
+# Greenhouse only for now: hosted boards and the gh_jid embed on an employer's own site.
+_SUBMIT_ATS_SQL = ("(p.canonical_url LIKE '%greenhouse.io/%' "
+                   "OR p.canonical_url LIKE '%gh_jid=%')")
+
+
+def _submit_eligible(con, app_id: int | None = None) -> dict | None:
+    """The oldest draft the submitter may take, or the named one if it qualifies.
+
+    Eligible: status 'draft', a package path, an alias, a Greenhouse URL, no run in progress,
+    and no earlier run that ended in anything other than 'error'. A run that STOPPED waits for
+    a person (a missing answer, a failed gate), so the timer must not retry it every cycle.
+    ⚠️ 'suspended' is never eligible: a held package is held by its status, not by a note.
+    """
+    # Same format as now(), so the text comparison in SQL orders correctly.
+    stale = (datetime.now(timezone.utc) - timedelta(seconds=SUBMIT_RUN_STALE_S)).isoformat(
+        timespec="seconds")
+    sql = (
+        "SELECT a.id, a.package_path, a.alias_used, p.canonical_url AS url "
+        "FROM application a JOIN posting p ON p.id = a.posting_id "
+        "WHERE a.status = 'draft' AND coalesce(a.package_path,'') <> '' "
+        "AND coalesce(a.alias_used,'') <> '' AND " + _SUBMIT_ATS_SQL + " "
+        "AND NOT EXISTS (SELECT 1 FROM submit_run r WHERE r.application_id = a.id "
+        "  AND ((r.outcome = 'running' AND r.started_at > ?) "
+        "    OR r.outcome IN ('shadow_complete','stopped'))) "
+        "AND (SELECT count(*) FROM submit_run r WHERE r.application_id = a.id "
+        "  AND r.outcome = 'error') < ? ")
+    params: list = [stale, SUBMIT_ERROR_RETRIES]
+    if app_id is not None:
+        sql += "AND a.id = ? "
+        params.append(int(app_id))
+    sql += "ORDER BY a.id LIMIT 1"
+    row = con.execute(sql, tuple(params)).fetchone()
+    if row is None:
+        return None
+    return {"application_id": row["id"], "package_path": row["package_path"],
+            "alias_used": row["alias_used"], "url": row["url"], "ats": "greenhouse"}
+
+
+def _submit_open(con, p: dict) -> int:
+    mode = p.get("mode") or "shadow"
+    if mode not in SUBMIT_MODES:
+        raise HTTPException(400, f"mode {mode!r} is not allowed; only {SUBMIT_MODES}")
+    app_id = int(p.get("application_id") or 0)
+    if _submit_eligible(con, app_id) is None:
+        raise HTTPException(409, f"application {app_id} is not eligible for a submit run")
+    cur = con.execute(
+        "INSERT INTO submit_run(application_id, started_at, mode, ats, engine_version, host, "
+        "evidence_dir) VALUES (?,?,?,?,?,?,?)",
+        (app_id, now(), mode, p.get("ats"), str(p.get("engine_version") or "")[:40],
+         str(p.get("host") or "")[:120], str(p.get("evidence_dir") or "")[:400]))
+    return cur.lastrowid
+
+
+def _submit_run_row(con, run_id: int) -> dict:
+    row = con.execute("SELECT * FROM submit_run WHERE id=?", (int(run_id),)).fetchone()
+    if row is None:
+        raise HTTPException(404, "no such run")
+    return dict(row)
+
+
+def _submit_step(con, run_id: int, p: dict) -> None:
+    run = _submit_run_row(con, run_id)
+    if run["outcome"] != "running":
+        raise HTTPException(409, f"run {run_id} is closed ({run['outcome']})")
+    outcome = p.get("outcome")
+    if outcome not in SUBMIT_STEP_OUTCOMES:
+        raise HTTPException(400, f"step outcome must be one of {SUBMIT_STEP_OUTCOMES}")
+    sha = p.get("sha256")
+    if sha is not None and not re.fullmatch(r"[0-9a-f]{64}", str(sha)):
+        raise HTTPException(400, "sha256 must be 64 lowercase hex characters")
+    try:
+        con.execute(
+            "INSERT INTO submit_step(run_id, n, name, at, outcome, detail, screenshot_path, sha256) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (int(run_id), int(p["n"]), str(p["name"])[:80], now(), outcome,
+             str(p.get("detail") or "")[:4000] or None,
+             str(p.get("screenshot_path") or "")[:400] or None, sha))
+    except (KeyError, ValueError, TypeError):
+        raise HTTPException(400, "a step needs n (int) and name")
+    except Exception as e:
+        if "unique" in str(e).lower():
+            raise HTTPException(409, f"step {p.get('n')} already recorded for run {run_id}")
+        raise
+
+
+def _submit_close(con, run_id: int, p: dict) -> None:
+    outcome = p.get("outcome")
+    if outcome not in SUBMIT_OUTCOMES:
+        raise HTTPException(400, f"outcome must be one of {SUBMIT_OUTCOMES}")
+    n = con.execute(
+        "UPDATE submit_run SET outcome=?, ended_at=?, stop_step=?, stop_reason=? "
+        "WHERE id=? AND outcome='running'",
+        (outcome, now(), (str(p.get("stop_step") or "")[:80] or None),
+         (str(p.get("stop_reason") or "")[:2000] or None), int(run_id))).rowcount
+    if not n:
+        _submit_run_row(con, run_id)             # 404 if absent
+        raise HTTPException(409, f"run {run_id} is already closed")
+
+
+@app.get("/submit/next")
+def submit_next(request: Request, authorization: str | None = Header(None), app_id: int | None = None):
+    require_submit(authorization, request)
+    with db() as con:
+        return {"next": _submit_eligible(con, app_id)}
+
+
+@app.post("/submit/run")
+async def submit_run_open(request: Request, authorization: str | None = Header(None)):
+    require_submit(authorization, request)
+    p = await request.json()
+    with db() as con:
+        rid = _submit_open(con, p)
+        log_event(con, "submit_run_open", f"run {rid} app {p.get('application_id')} "
+                  f"mode {p.get('mode') or 'shadow'}", client_ip(request))
+    return {"ok": True, "run_id": rid}
+
+
+@app.post("/submit/run/{run_id}/step")
+async def submit_run_step(run_id: int, request: Request, authorization: str | None = Header(None)):
+    require_submit(authorization, request)
+    p = await request.json()
+    with db() as con:
+        _submit_step(con, run_id, p)
+    return {"ok": True}
+
+
+@app.post("/submit/run/{run_id}/close")
+async def submit_run_close(run_id: int, request: Request, authorization: str | None = Header(None)):
+    require_submit(authorization, request)
+    p = await request.json()
+    with db() as con:
+        _submit_close(con, run_id, p)
+        log_event(con, "submit_run_close", f"run {run_id} {p.get('outcome')} "
+                  f"{(p.get('stop_step') or '')}".strip(), client_ip(request))
+    return {"ok": True}
 
 
 @app.post("/mcp")

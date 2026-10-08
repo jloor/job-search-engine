@@ -904,3 +904,46 @@ CREATE TABLE IF NOT EXISTS ai_spend (
          cache_read    INTEGER NOT NULL DEFAULT 0
        );
 CREATE INDEX IF NOT EXISTS idx_ai_spend_purpose ON ai_spend(purpose, at DESC);
+
+-- ════════════════════════════════════════════════════════════════════════════════════════
+-- The browser submitter's record (2026-10-07). One submit_run per attempt at one application,
+-- one submit_step per step inside it. The submitter runs on a separate host user, OUTSIDE this
+-- container, and reaches these tables only through the /submit/* routes with SUBMIT_TOKEN.
+--
+-- ⭐ WHY A RECORD AND NOT A STATUS FLIP. The submitter fills a third party's form. What it
+-- claims it did and what the page held are different facts, so every step stores its outcome
+-- and the path + sha256 of the screenshot taken at that step. The image bytes stay on the
+-- submitter host; this table says what exists and where.
+--
+-- 📌 mode is 'shadow' only for now: a shadow run stops at the review screenshot and never
+-- clicks submit. The routes refuse any other mode until a live mode is built.
+-- ⚠️ A run that never closes stays 'running'. /submit/next treats a running run older than
+-- SUBMIT_RUN_STALE_S as abandoned rather than blocking that application for ever.
+CREATE TABLE IF NOT EXISTS submit_run (
+  id             INTEGER PRIMARY KEY,
+  application_id INTEGER NOT NULL REFERENCES application(id),
+  started_at     TEXT NOT NULL,
+  ended_at       TEXT,
+  mode           TEXT NOT NULL DEFAULT 'shadow',
+  ats            TEXT,                 -- greenhouse | lever | workday | ashby
+  outcome        TEXT NOT NULL DEFAULT 'running',  -- running | shadow_complete | stopped | error
+  stop_step      TEXT,                 -- the step name that stopped the run
+  stop_reason    TEXT,                 -- why, in words a person can act on
+  engine_version TEXT,
+  host           TEXT,
+  evidence_dir   TEXT                  -- where the screenshots are, on the submitter host
+);
+CREATE INDEX IF NOT EXISTS idx_submit_run_app ON submit_run(application_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS submit_step (
+  id              INTEGER PRIMARY KEY,
+  run_id          INTEGER NOT NULL REFERENCES submit_run(id),
+  n               INTEGER NOT NULL,
+  name            TEXT NOT NULL,
+  at              TEXT NOT NULL,
+  outcome         TEXT NOT NULL,       -- ok | stop | error
+  detail          TEXT,
+  screenshot_path TEXT,
+  sha256          TEXT,
+  UNIQUE(run_id, n)
+);

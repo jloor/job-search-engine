@@ -89,6 +89,9 @@ jobs:
       # Added 2026-10-07: mail approval by passkey. Here only the pure helpers run; the
       # ceremony needs webauthn and runs in the drift job with --strict.
       - run: python3 tests/test_passkey.py
+      # Added 2026-10-07: the browser submitter's narrow routes. Guards token isolation in
+      # both directions and that no submit route can change application.status.
+      - run: python3 tests/test_submit_routes.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #
@@ -134,3 +137,4 @@ jobs:
         run: pip install webauthn==2.8.0
       - name: mail approval by passkey
         run: python3 tests/test_passkey.py --strict
+
