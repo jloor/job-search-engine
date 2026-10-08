@@ -313,12 +313,46 @@ check("🚨 the code appears in NO step detail and NO alert",
       and all("AbCd1234" not in json.dumps(a) for a in alerts))
 check("…while the step names the message the code came from",
       any("message 557" in (s.get("detail") or "") for s in relay.steps))
-silent = Relay()
-silent.code_after = None
-r, relay, br, alerts, _ = run(item=LIVE, browser=FakeBrowser(proof="code_step"), relay=silent)
-check("🚨 no code within the wait: UNKNOWN, nothing typed, never retried",
-      r["outcome"] == "unknown" and "enter_code" not in br.sent and relay.closed["outcome"] == "unknown"
-      and relay.code_polls == S.CODE_WAIT_S // S.CODE_POLL_S)
+WAIT = S.CODE_WAIT_S // S.CODE_POLL_S
+
+
+class ResendBrowser(FakeBrowser):
+    """A page with (or without) a resend control; a resend makes the relay's code 'arrive'."""
+    def __init__(self, relay, has_control=True, delivers=True, **kw):
+        super().__init__(proof="code_step", **kw)
+        self.relay, self.has_control, self.delivers = relay, has_control, delivers
+
+    def __call__(self, cmd, **kw):
+        if cmd == "resend_code":
+            self.sent.append(cmd)
+            if not self.has_control:
+                raise RuntimeError("form.js resend_code: no resend control on the page")
+            if self.delivers:
+                self.relay.code_after = self.relay.code_polls       # the next poll finds it
+            return {"ok": True, "resent": True}
+        return super().__call__(cmd, **kw)
+
+
+rl = Relay()
+rl.code_after = None
+r, relay, br, alerts, _ = run(item=LIVE, browser=ResendBrowser(rl), relay=rl)
+check("⭐ no code after one wait: the run asks the board to RESEND, then enters the new code",
+      r["outcome"] == "submitted" and br.sent.count("resend_code") == 1 and br.sent.count("enter_code") == 1
+      and relay.code_polls == WAIT + 1)
+check("…and the step says it asked for a resend",
+      any("asked the board to resend" in (s.get("detail") or "") for s in relay.steps))
+rl = Relay()
+rl.code_after = None
+r, relay, br, alerts, _ = run(item=LIVE, browser=ResendBrowser(rl, delivers=False), relay=rl)
+check("🚨 two resends and still no code: UNKNOWN after three waits, nothing typed, never retried",
+      r["outcome"] == "unknown" and br.sent.count("resend_code") == S.CODE_RESENDS
+      and "enter_code" not in br.sent and relay.code_polls == WAIT * (S.CODE_RESENDS + 1))
+rl = Relay()
+rl.code_after = None
+r, relay, br, alerts, _ = run(item=LIVE, browser=ResendBrowser(rl, has_control=False), relay=rl)
+check("a page with no resend control: UNKNOWN after one wait, and the step says why",
+      r["outcome"] == "unknown" and relay.code_polls == WAIT
+      and any("no resend" in (s.get("detail") or "") for s in relay.steps))
 
 print("\na submit attempt on the page:")
 r, relay, _, _, _ = run(browser=FakeBrowser(blocked={"submit_events": 1, "submit_calls": 0,

@@ -48,6 +48,7 @@
        8-character code to confirm you're a human.</p>
     <label>Security code</label>
     <div id="code-boxes"></div>
+    <button type="button" id="resend">Resend code</button>
   </div>
   <button type="submit">Submit application</button>
 </form>
@@ -131,6 +132,7 @@
       b.addEventListener('input', () => { if (b.value && b.nextElementSibling) b.nextElementSibling.focus(); });
       boxes.appendChild(b);
     }
+    document.getElementById('resend').addEventListener('click', () => fetch('/resend-code', { method: 'POST' }));
     form.addEventListener('submit', (e) => {
       if (step.hidden) {
         e.preventDefault();

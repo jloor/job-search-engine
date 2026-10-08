@@ -262,8 +262,9 @@ def required_empty(page: list, fields: list) -> list:
 
 
 # ── one run ───────────────────────────────────────────────────────────────────────────────
-CODE_WAIT_S = 180                      # how long a run waits for the emailed security code
+CODE_WAIT_S = 90                       # each wait for the emailed security code
 CODE_POLL_S = 5
+CODE_RESENDS = 2                       # resend requests after a wait with no code (3 waits in all)
 
 
 class Run:
@@ -406,12 +407,25 @@ class Run:
                 # relay releases this run's ONE code; it is never written to a step or an alert.
                 shot = self._shot(br, "code-step")
                 self._step(step, "ok", "the board asked for its emailed security code", shot)
+                # Wait; if no code came, ask the board to resend it (a board may send none for a
+                # second attempt at one application, and a code sent before this run armed is never
+                # accepted), then wait again. At most CODE_RESENDS times.
                 got = None
-                for _ in range(int(CODE_WAIT_S / CODE_POLL_S)):
-                    got = self.relay.code(self.run_id)
-                    if got:
+                for attempt in range(CODE_RESENDS + 1):
+                    for _ in range(int(CODE_WAIT_S / CODE_POLL_S)):
+                        got = self.relay.code(self.run_id)
+                        if got:
+                            break
+                        self.sleep(CODE_POLL_S)
+                    if got or attempt == CODE_RESENDS:
                         break
-                    self.sleep(CODE_POLL_S)
+                    try:
+                        br("resend_code")
+                        self._step(step, "ok", f"no code after {CODE_WAIT_S} s; asked the board to "
+                                               f"resend it ({attempt + 1}/{CODE_RESENDS})")
+                    except RuntimeError as e:
+                        self._step(step, "ok", f"no code after {CODE_WAIT_S} s, and no resend: {e}")
+                        break
                 if not got:
                     r = {"status": "no_code"}
                 else:

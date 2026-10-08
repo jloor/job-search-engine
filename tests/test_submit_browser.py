@@ -234,11 +234,28 @@ try:
         check("enter_code before the approved click is refused", False)
     except RuntimeError as e:
         check("enter_code before the approved click is refused", "only once, after the approved click" in str(e))
+    try:
+        br("resend_code")
+        check("resend_code before the approved click is refused", False)
+    except RuntimeError as e:
+        check("resend_code before the approved click is refused", "only at the code step" in str(e))
     br("arm", nonce=NONCE)
     r = br("final_submit", nonce=NONCE, wait_s=10)
     check("the approved click reaches the code step (not proof, not a timeout)", r["status"] == "code_step")
     check("…after exactly one background request, and no application POST yet",
           posts[before:] == ["/request-code"])
+    sub_before = br("readback")["blocked_submits"]["submit_events"]
+    br("resend_code")
+    br("resend_code")
+    check("⭐ resend_code presses the board's resend control (twice allowed), and it is not a submit",
+          posts[before:] == ["/request-code", "/resend-code", "/resend-code"]
+          and br("readback")["blocked_submits"]["submit_events"] == sub_before)
+    try:
+        br("resend_code")
+        check("a third resend is refused", False)
+    except RuntimeError as e:
+        check("a third resend is refused", "twice" in str(e))
+    del posts[before + 1:]                      # keep the rest of this case's POST counts unchanged
     try:
         br("enter_code", code="AbCd123")
         check("a 7-character code for 8 boxes is refused, nothing typed or sent", False)

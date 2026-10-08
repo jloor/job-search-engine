@@ -50,7 +50,7 @@ async function open(c) {
   // a person can watch or take over. Headless is for tests.
   browser = await chromium.launch({ headless: !c.headed });
   page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-  blocked = fresh(); armed = null; openUntil = 0; stage = 'idle';
+  blocked = fresh(); armed = null; openUntil = 0; stage = 'idle'; resends = 0;
   secret = crypto.randomBytes(16).toString('hex');
   await page.exposeFunction('__submitBlocked', (kind) => { blocked[kind] += 1; });
   await page.addInitScript((SECRET) => {
@@ -313,6 +313,23 @@ async function codePrompt() {
   return CODE_PROMPT.test(text) && (await codeBoxes().count()) >= 6;
 }
 
+// Ask the board to send the code again, when none has arrived. Only at the code step, before a
+// code is entered, at most twice per page. It is an ordinary button or link, never a submit, so the
+// submit guard stays exactly as it is (a control that tried to submit would be blocked and counted).
+const RESEND = /resend|send (?:a |the )?(?:new )?code|request (?:a )?new code|didn['’]?t (?:get|receive)/i;
+let resends = 0;
+async function resendCode() {
+  if (stage !== 'clicked') throw new Error('resend_code is allowed only at the code step, before a code is entered');
+  if (!(await codePrompt())) throw new Error('no security-code prompt on the page');
+  if (resends >= 2) throw new Error('the code was already requested twice');
+  const ctl = page.getByRole('button', { name: RESEND }).or(page.getByRole('link', { name: RESEND })).first();
+  if (await ctl.count() === 0) throw new Error('no resend control on the page');
+  resends += 1;
+  await ctl.click();
+  await page.waitForTimeout(1500);
+  return { resent: true, count: resends };
+}
+
 async function watchProof(waitS, allowCode = true) {
   const until = Date.now() + Math.min(600, Math.max(1, waitS || 60)) * 1000;
   let excerpt = '';
@@ -383,6 +400,7 @@ async function enterCode(c) {
 const handlers = { open, harvest, fill, readback, shot, arm,
                    final_submit: finalSubmit,
                    enter_code: enterCode,
+                   resend_code: resendCode,
                    await_proof: async (c) => watchProof(c.wait_s || 600),
                    close: async () => { if (browser) await browser.close(); browser = null; return {}; } };
 
