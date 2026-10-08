@@ -259,6 +259,7 @@ Admin is a superset, so driving by hand needs one token rather than two. Verifie
 | `POST /send` | **403** | 400 (field validation, past auth) | 401 |
 | `/submit/*` | **403** | **403** | 401 (503 when `SUBMIT_TOKEN` is unset) |
 | `POST /submit/clear/{app}` | **403** | 200 | 401. ⚠️ **Admin only, and the submit token is refused:** a stopped run waits for a person, so the runner must not be able to clear its own stops. |
+| `/submit/approve/{token}` (page, options, verify) | no token: the link plus an active **passkey** | | the passkey is the gate; the link alone shows the record and cannot approve it |
 
 📌 **`SUBMIT_TOKEN` is not on the read/admin ladder.** It opens nothing else, and neither
 other token opens its routes. Tested both ways in `tests/test_submit_routes.py`.
@@ -453,14 +454,45 @@ form in a real browser, fills it from the candidate's config and package, reads 
 back, and records each step with a screenshot. It is the one component that drives a browser
 through pages the operator does not control.
 
-**Phase 2 is shadow only, and that is enforced in code, not configuration.** The runner stops at
-the filled form and takes a review screenshot. There is no code path that clicks submit, the
-routes accept only `mode: shadow`, and no `/submit/*` route can change `application.status`.
+**A shadow run cannot submit, and that is enforced in code, not configuration.** The page blocks
+every submission (a capture-phase submit listener, a replaced `form.submit()`, and an abort of any
+non-GET top-level navigation), and the run stops at a review screenshot.
+
+**A live run submits only a record a person approved with a passkey (added 2026-10-08).**
+1. A complete shadow run posts its record (every field as read back, plus the SHA-256 of each
+   attached file). The relay recomputes the fingerprint from its own copy of the posting URL and
+   refuses a mismatch, then stores a `submit_approval` and sends the approval link by ntfy.
+2. The person approves on `/submit/approve/{token}` with an ACTIVE passkey, the same ceremony and
+   refusals as mail approval: the challenge embeds the record fingerprint, three fingerprints must
+   agree (stored, recomputed from the stored record, inside the signed challenge), user
+   verification, sign count, single-use challenge, burned nonce. **Approving submits nothing.**
+3. A live run must carry the approved fingerprint to open, must find the package files hashing as
+   approved, and must read back from the freshly filled page a record with the SAME fingerprint.
+   Any difference stops it before step 4.
+4. `POST /submit/run/{id}/arm` consumes the approval (one row, one time) and returns a nonce.
+   `form.js` then allows exactly ONE submit event, from the real submit button it tagged with a
+   per-browser secret, and opens the network guard for 15 seconds. The page's own submit attempts
+   stay blocked and counted throughout.
+5. Only `POST /submit/run/{id}/submitted`, for a live run that consumed an approval, changes
+   `application.status` (draft to submitted, `status_source='submitter'`). A later confirmation
+   mail upgrades the source to `mail`.
+
+🚨 **The approval is consumed BEFORE the click.** A click with no proof, or any failure after
+arming, closes the run `unknown`. It is never retried: the confirmation mail decides, not a second
+click. That is what makes a duplicate application impossible by retry.
 
 **Blast radius, by design:**
 - The runner holds `SUBMIT_TOKEN`, never the database token. A compromised runner can read the
   next eligible draft (id, package path, alias, posting URL) and write run and step records.
-  It cannot read mail, send mail, or change any application's status.
+  It cannot read mail or send mail, cannot approve (approval needs the operator's passkey), and
+  can mark an application submitted only through a run that consumed a person's approval.
+- ⚠️ **What the approval does NOT stop: a compromised runner.** The runner computes the record
+  from the page it drives; the relay cannot see that page. A runner that lies can submit
+  something other than the approved record, because it holds a browser. The approval protects
+  against an honest runner's mistakes (a changed answer, a changed file, a page that reads back
+  differently) and makes every submission traceable to a person's decision. Containing a
+  compromised runner is the job of the separate host user, the narrow token, and the
+  root-owned control command on the host.
 - The runner host user holds no approval key and cannot read the harness's vault.
 - ATS account passwords (where an ATS needs an account) live in a vault only that user can read.
   🚨 A password field is never read back, printed, or captured: screenshots of pages with a

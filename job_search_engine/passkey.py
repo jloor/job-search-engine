@@ -166,6 +166,32 @@ def approve_page(token: str, item: dict) -> str:
     return _page("Approve email", head + card + tail)
 
 
+def submit_approve_page(token: str, item: dict) -> str:
+    """One exact submit record: every field value as the page read it back, the files by hash.
+    Approving it lets ONE live run submit exactly this, once. Nothing is submitted here."""
+    e = html.escape
+    rec = json.loads(item.get("record_json") or "{}")
+    status = item.get("status")
+    head = (f"<h1>Approve this application?</h1><p class='mut'>{e(item.get('company_raw') or '')} · "
+            f"{e(item.get('role_raw') or '')}. A shadow run filled the form and read every field back. "
+            f"If you approve, one live run fills it again and submits only if every value below matches. "
+            f"Recorded {e(item.get('created_at') or '')}.</p>")
+    rows = "".join(f"<dt>{e(f.get('label') or f.get('id') or '')}</dt><dd>{e(str(f.get('value') or ''))}</dd>"
+                   for f in rec.get("fields") or [])
+    files = "".join(f"<dt>{e(n)}</dt><dd><code>{e(h[:16])}…</code></dd>"
+                    for n, h in sorted((rec.get("files") or {}).items()))
+    card = (f"<div class='card'><dl><dt>Posting</dt><dd>{e(rec.get('url') or '')}</dd>{rows}</dl></div>"
+            f"<div class='card'><dl>{files}<dt>Record</dt><dd><code>{e(item['record_fp'][:16])}…</code>"
+            f"</dd></dl></div>")
+    if status != "pending":
+        tail = f"<p id='msg' class='bad'>This record is {e(status or 'unknown')}. Nothing more can be done here.</p>"
+    else:
+        tail = (f"<button id='go' data-mode='approve' data-base='/submit/approve/' "
+                f"data-done='Approved. One live run may now submit exactly this.' "
+                f"data-token='{e(token)}'>Approve this submission</button><p id='msg'></p>")
+    return _page("Approve application", head + card + tail)
+
+
 def enroll_page(token: str) -> str:
     e = html.escape
     inner = ("<h1>Register a passkey for mail approval</h1>"
@@ -184,6 +210,9 @@ SCRIPT = r"""
 (function(){
 const b=document.getElementById('go'); if(!b) return;
 const msg=document.getElementById('msg'), mode=b.dataset.mode, tok=b.dataset.token;
+// The URL prefix of the approval being made: '/approve/' for mail, '/submit/approve/' for a
+// submit record. Same ceremony, same credentials; only the endpoint and the final words differ.
+const base=b.dataset.base||'/approve/', done=b.dataset.done||'Sent.';
 const d=s=>Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')+'==='.slice((s.length+3)%4)),c=>c.charCodeAt(0));
 const e=a=>btoa(String.fromCharCode(...new Uint8Array(a))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 const say=(t,c)=>{msg.textContent=t;msg.className=c||'';};
@@ -192,13 +221,13 @@ async function post(u,body){const r=await fetch(u,{method:'POST',headers:{'Conte
 b.onclick=async()=>{b.disabled=true; say('Waiting for your passkey or YubiKey...');
  try{
   if(mode==='approve'){
-   const o=await post('/approve/'+tok+'/options'); o.challenge=d(o.challenge);
+   const o=await post(base+tok+'/options'); o.challenge=d(o.challenge);
    (o.allowCredentials||[]).forEach(c=>c.id=d(c.id));
    const a=await navigator.credentials.get({publicKey:o});
-   const r=await post('/approve/'+tok+'/verify',{id:a.id,rawId:e(a.rawId),type:a.type,
+   const r=await post(base+tok+'/verify',{id:a.id,rawId:e(a.rawId),type:a.type,
      response:{clientDataJSON:e(a.response.clientDataJSON),authenticatorData:e(a.response.authenticatorData),
      signature:e(a.response.signature),userHandle:a.response.userHandle?e(a.response.userHandle):null},clientExtensionResults:{}});
-   say('Sent. '+(r.transport?('via '+r.transport):''),'ok'); b.remove();
+   say(done+' '+(r.transport?('via '+r.transport):''),'ok'); b.remove();
   } else {
    const label=(document.getElementById('label').value||'').trim();
    const o=await post('/passkey/enroll/'+tok+'/options'); o.challenge=d(o.challenge); o.user.id=d(o.user.id);

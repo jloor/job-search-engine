@@ -98,6 +98,9 @@ jobs:
       - run: python3 tests/test_submit_answers.py
       - run: python3 tests/test_submit_runner.py
       - run: python3 tests/test_submit_browser.py
+      # Added 2026-10-08: the passkey approval of a submit record. The record fingerprint runs
+      # here; the ceremony needs webauthn and runs in the drift job with --strict.
+      - run: python3 tests/test_submit_approval.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #
@@ -143,6 +146,8 @@ jobs:
         run: pip install webauthn==2.8.0
       - name: mail approval by passkey
         run: python3 tests/test_passkey.py --strict
+      - name: submit approval by passkey, and the one armed submission
+        run: python3 tests/test_submit_approval.py --strict
 
   # Added 2026-10-07: the submitter's browser driver in a real Chromium, against a synthetic form.
   # --strict, so a missing Playwright is a failure and not a quiet skip. Node comes with the

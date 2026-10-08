@@ -71,6 +71,7 @@ def opener_for(job, board_ok=True):
 class Relay:
     def __init__(self):
         self.steps, self.closed, self.opened = [], None, None
+        self.armed, self.reported = [], []
 
     def open(self, **kw):
         self.opened = kw
@@ -81,6 +82,15 @@ class Relay:
 
     def close(self, run_id, **kw):
         self.closed = kw
+        return {"ok": True, "approval_url": "https://relay.example/submit/approve/T"} \
+            if kw.get("outcome") == "shadow_complete" else {"ok": True}
+
+    def arm(self, run_id, record_fp):
+        self.armed.append(record_fp)
+        return "ab" * 16
+
+    def submitted(self, run_id, **kw):
+        self.reported.append(kw)
 
 
 FIELDS = [{"id": "first_name", "name": "", "kind": "text", "label": "First Name", "required": True, "visible": True},
@@ -91,8 +101,10 @@ FIELDS = [{"id": "first_name", "name": "", "kind": "text", "label": "First Name"
 
 
 class FakeBrowser:
-    def __init__(self, page_edit=None, blocked=None, captcha=False, fields=None):
+    def __init__(self, page_edit=None, blocked=None, captcha=False, fields=None, proof="proof",
+                 crash_on=None):
         self.page_edit, self.blocked, self.captcha = page_edit or {}, blocked, captcha
+        self.proof, self.crash_on = proof, crash_on
         self.fields = fields or FIELDS
         self.sent, self.quit_called, self.filled = [], False, {}
 
@@ -127,6 +139,13 @@ class FakeBrowser:
             return {"ok": True, "fields": out,
                     "blocked_submits": self.blocked or {"submit_events": 0, "submit_calls": 0,
                                                         "post_navigations": 0}}
+        if cmd == self.crash_on:
+            raise RuntimeError(f"form.js {cmd}: the browser died")
+        if cmd == "arm":
+            return {"ok": True, "armed": True}
+        if cmd in ("final_submit", "await_proof"):
+            return {"ok": True, "status": self.proof, "url": "https://job-boards.greenhouse.io/acme/jobs/1001/confirmation",
+                    "excerpt": "Thank you for applying"}
         raise RuntimeError(f"unexpected command {cmd}")
 
     def quit(self):
@@ -146,12 +165,12 @@ ITEM = {"application_id": 42, "package_path": "applications/acme/role", "alias_u
         "url": "https://job-boards.greenhouse.io/acme/jobs/1001"}
 
 
-def run(browser=None, job=JOB, board_ok=True, cfg=CFG):
+def run(browser=None, job=JOB, board_ok=True, cfg=CFG, item=None):
     relay, alerts = Relay(), []
     br = browser or FakeBrowser()
     ev = pathlib.Path(tempfile.mkdtemp())
     r = S.Run(relay, lambda: br, cfg, repo, ev, headed=False, opener=opener_for(job, board_ok),
-              version="test", notify=alerts.append).go(dict(ITEM))
+              version="test", notify=alerts.append).go(dict(item or ITEM))
     return r, relay, br, alerts, ev
 
 
@@ -174,7 +193,17 @@ check("fields.json holds what the PAGE read back, with the file by name",
                                                 "Will you require sponsorship?": "No"})
 check("🚨 no command named submit was ever sent to the browser", "submit" not in br.sent)
 check("the browser is closed at the end", br.quit_called)
-check("one phone alert", len(alerts) == 1 and "shadow_complete" in alerts[0]["title"])
+check("one phone alert, carrying the approval link",
+      len(alerts) == 1 and "shadow_complete" in alerts[0]["title"] and "/submit/approve/" in alerts[0]["message"])
+import record as RR                                              # noqa: E402
+posted = relay.closed
+check("the shadow close posts the record and its fingerprint, computed as the relay will",
+      posted.get("record_fp") == RR.fingerprint(42, ITEM["url"], posted["record"]["fields"],
+                                                posted["record"]["files"])
+      and posted["record"]["files"] == {"resume.pdf": RR.file_sha(pkg / "resume.pdf")})
+check("🚨 a shadow run never arms and never reports a submission", not relay.armed and not relay.reported)
+APPROVED_FP = posted["record_fp"]
+LIVE = dict(ITEM, mode="live", record_fp=APPROVED_FP, files=dict(posted["record"]["files"]))
 
 print("\nstops, each recorded where it happened:")
 
@@ -232,6 +261,34 @@ stopped_at("a required field left empty on the page", "readback",
            browser=FakeBrowser(fields=FIELDS + [{"id": "q9", "name": "", "kind": "text", "label": "Optional?",
                                                  "required": True, "visible": False}]))
 
+print("\na LIVE run:")
+r, relay, br, alerts, ev = run(item=LIVE)
+check("the approved record, read back exactly, is submitted", r["outcome"] == "submitted")
+check("…it armed once with the approved fingerprint, then clicked once",
+      relay.armed == [APPROVED_FP] and br.sent.count("final_submit") == 1 and br.sent.count("arm") == 1)
+check("…and reported the proof", relay.reported and "/confirmation" in relay.reported[0]["url"])
+r, relay, br, _, _ = run(item=LIVE, browser=FakeBrowser(page_edit={"first_name": {"value": "Alexander"}}))
+check("🚨 a page that reads back differently stops BEFORE arming",
+      r["outcome"] == "stopped" and not relay.armed and "final_submit" not in br.sent)
+r, relay, br, _, _ = run(item=LIVE, cfg=dict(CFG, identity={"first_name": "Alexa"}))
+check("🚨 an answer that changed since approval (the page reads back what was decided, but it is "
+      "not what was approved) stops at 'match', BEFORE arming",
+      r["outcome"] == "stopped" and relay.closed["stop_step"] == "match" and not relay.armed
+      and "final_submit" not in br.sent)
+r, relay, br, _, _ = run(item=dict(LIVE, files={"resume.pdf": "0" * 64}))
+check("🚨 a package file changed after approval stops before the browser opens",
+      r["outcome"] == "stopped" and relay.closed["stop_step"] == "package" and not relay.armed)
+r, relay, br, alerts, _ = run(item=LIVE, browser=FakeBrowser(proof="no_proof"))
+check("🚨 a click with no proof closes UNKNOWN, never error, and is not reported submitted",
+      r["outcome"] == "unknown" and relay.closed["outcome"] == "unknown" and not relay.reported)
+check("…with an urgent alert", alerts and alerts[-1]["priority"] == 5)
+r, relay, br, _, _ = run(item=LIVE, browser=FakeBrowser(crash_on="final_submit"))
+check("🚨 a crash after arming also closes UNKNOWN (the click may have happened)",
+      r["outcome"] == "unknown" and relay.closed["outcome"] == "unknown")
+r, relay, br, _, _ = run(item=LIVE, browser=FakeBrowser(proof="human_step"))
+check("a CAPTCHA after the click waits for a person, then takes the proof, without clicking again",
+      br.sent.count("final_submit") == 1 and "await_proof" in br.sent and br.sent.count("arm") == 1)
+
 print("\na submit attempt on the page:")
 r, relay, _, _, _ = run(browser=FakeBrowser(blocked={"submit_events": 1, "submit_calls": 0,
                                                       "post_navigations": 0}))
@@ -266,7 +323,10 @@ def rop(req, timeout=0):
 
 S.Relay("https://relay.example.com/", "tok", rop).next(5)
 check("the client sends the submit token as a bearer, to /submit/next with the app id",
-      seen[-1] == ("GET", "https://relay.example.com/submit/next?app_id=5", "Bearer tok"))
+      seen[-1] == ("GET", "https://relay.example.com/submit/next?mode=shadow&app_id=5", "Bearer tok"))
+S.Relay("https://relay.example.com/", "tok", rop).next(5, "live")
+check("…and asks for a LIVE item only when told to",
+      seen[-1][1] == "https://relay.example.com/submit/next?mode=live&app_id=5")
 try:
     S.Relay("", "tok")
     check("a relay client without a URL refuses to start", False)

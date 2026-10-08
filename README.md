@@ -169,7 +169,8 @@ eligible.
 | `job_search_engine/comp.py` | Reads a pay band off a board field or out of prose, with no model call. |
 | `job_search_engine/candidate.py` | Loads the operator profile. Returns `{}` rather than raising. |
 | `job_search_engine/approve.py` | Operator CLI. Signs one outgoing message. Never runs in the container. |
-| `job_search_engine/submit.py` | The browser submitter, shadow mode: fills one form, reads it back, stops before submit. Runs on its own host user, never in the container. See SECURITY.md. |
+| `job_search_engine/submit.py` | The browser submitter. Shadow: fills one form, reads it back, stops before submit, and asks a person to approve the record. Live: submits only a passkey-approved record, once. Runs on its own host user, never in the container. See SECURITY.md. |
+| `job_search_engine/record.py` | The submit record's fingerprint. One implementation, shared by the runner and the relay. |
 | `job_search_engine/answers.py` | Decides each form answer from the package and the candidate config, or stops the run. Never guesses. |
 | `job_search_engine/greenhouse.py` | Greenhouse's public board API: liveness, questions, options. |
 | `job_search_engine/browser/form.js` | The submitter's Playwright driver. No submit command; blocks submission on the page. |

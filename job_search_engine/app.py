@@ -580,7 +580,7 @@ MIGRATIONS = [
     # confirmation at all, and that gap is real: an application sat reading `draft` for two days
     # while the operator correctly remembered having sent it. Recording the SOURCE lets a later
     # confirmation UPGRADE a self-report rather than being the only path to `submitted`.
-    #   mail | self_report | human | import
+    #   mail | self_report | human | import | submitter (passkey-approved automated submit)
     "ALTER TABLE application ADD COLUMN status_source TEXT",
     # ⭐ 2026-08-27. THE IDEMPOTENCY KEY FOR THE INTERACTION LOG. The table shipped with no
     # unique constraint at all, so any job that re-read the mailbox would have doubled every
@@ -895,6 +895,14 @@ MIGRATIONS = [
      "id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES submit_run(id), "
      "n INTEGER NOT NULL, name TEXT NOT NULL, at TEXT NOT NULL, outcome TEXT NOT NULL, "
      "detail TEXT, screenshot_path TEXT, sha256 TEXT, UNIQUE(run_id, n))"),
+    # 2026-10-08: a passkey approval of one exact submit record. See schema.sql.
+    ("CREATE TABLE IF NOT EXISTS submit_approval ("
+     "id INTEGER PRIMARY KEY, application_id INTEGER NOT NULL REFERENCES application(id), "
+     "run_id INTEGER REFERENCES submit_run(id), token TEXT NOT NULL UNIQUE, record_fp TEXT NOT NULL, "
+     "record_json TEXT NOT NULL, created_at TEXT NOT NULL, expires_at INTEGER NOT NULL, "
+     "status TEXT NOT NULL DEFAULT 'pending', challenge TEXT, challenge_expires INTEGER, "
+     "approved_by TEXT, approved_at TEXT, consumed_at TEXT, consumed_run_id INTEGER)"),
+    "CREATE INDEX IF NOT EXISTS idx_submit_approval_app ON submit_approval(application_id, id DESC)",
 ]
 
 
@@ -3185,15 +3193,18 @@ def job_track() -> str:
                             src = con.execute(
                                 "SELECT status_source FROM application WHERE id=?",
                                 (app_row["id"],)).fetchone()
-                            if src is not None and (dict(src)["status_source"] or "") == "self_report":
+                            # 'submitter' (2026-10-08): a passkey-approved automated submit
+                            # is a self-report made by a machine; the employer's mail outranks it.
+                            prior = (dict(src)["status_source"] or "") if src is not None else ""
+                            if prior in ("self_report", "submitter"):
                                 con.execute(
                                     "UPDATE application SET status_source='mail' "
                                     " WHERE id=? AND status='submitted' "
-                                    "   AND status_source='self_report'",
+                                    "   AND status_source IN ('self_report','submitter')",
                                     (app_row["id"],))
                                 upgraded.append(
                                     f"app {app_row['id']} ({app_row['company_raw']}) "
-                                    f"self_report -> mail on msg {m['id']}")
+                                    f"{prior} -> mail on msg {m['id']}")
                                 audit("track_source_upgraded",
                                       f"application {app_row['id']} "
                                       f"({app_row['company_raw']}) was submitted by hand and "
@@ -11657,11 +11668,19 @@ def _mcp_call(name: str, args: dict) -> str:
 #
 # 🚨 NARROW BY DESIGN. The submitter host holds SUBMIT_TOKEN and never the database token, so
 # these routes are everything it can do: read the next eligible draft, open and close a run,
-# and append steps. NO ROUTE HERE CHANGES application.status. Shadow mode cannot record a
-# submission, because nothing it can reach writes one.
+# append steps, and, for a LIVE run only, arm and report a submission.
+#
+# ⭐ THE ONE WRITE TO application.status (2026-10-08) is POST /submit/run/{id}/submitted, and it
+# only works for a live run that CONSUMED a passkey approval of the exact record it filled. The
+# approval is a person's: /submit/approve/{token} with an active passkey, the same ceremony as a
+# mail approval. The submit token can neither approve nor clear.
 # ════════════════════════════════════════════════════════════════════════════════════════
-SUBMIT_MODES = ("shadow",)                       # a live mode is a future, separate decision
-SUBMIT_OUTCOMES = ("shadow_complete", "stopped", "error")
+SUBMIT_MODES = ("shadow", "live")
+# What a runner may close a run with. 'submitted' is NOT here: only the submitted route sets it.
+# 'unknown' is a live run that clicked and saw no proof; it is never retried (the approval is spent).
+SUBMIT_OUTCOMES = ("shadow_complete", "stopped", "error", "unknown")
+SUBMIT_APPROVAL_TTL_S = 24 * 3600
+SUBMIT_ARM_WINDOW_S = 300                        # arm to proof: one form, one click
 SUBMIT_STEP_OUTCOMES = ("ok", "stop", "error")
 SUBMIT_RUN_STALE_S = 2 * 3600                    # a run still 'running' after this is abandoned
 SUBMIT_ERROR_RETRIES = 3                         # 'error' runs allowed before a draft is skipped
@@ -11671,8 +11690,11 @@ _SUBMIT_ATS_SQL = ("(p.canonical_url LIKE '%greenhouse.io/%' "
                    "OR p.canonical_url LIKE '%gh_jid=%')")
 
 
-def _submit_eligible(con, app_id: int | None = None) -> dict | None:
+def _submit_eligible(con, app_id: int | None = None, mode: str = "shadow") -> dict | None:
     """The oldest draft the submitter may take, or the named one if it qualifies.
+
+    LIVE: a draft with an approved, unexpired, unconsumed passkey approval and no run in progress.
+    The approved record_fp and file hashes come back with it, so the run can prove it matches.
 
     Eligible: status 'draft', a package path, an alias, a Greenhouse URL, no run in progress,
     and no earlier run that ended in anything other than 'error'. A run that STOPPED waits for
@@ -11682,6 +11704,8 @@ def _submit_eligible(con, app_id: int | None = None) -> dict | None:
     # Same format as now(), so the text comparison in SQL orders correctly.
     stale = (datetime.now(timezone.utc) - timedelta(seconds=SUBMIT_RUN_STALE_S)).isoformat(
         timespec="seconds")
+    if mode == "live":
+        return _submit_eligible_live(con, app_id, stale)
     sql = (
         "SELECT a.id, a.package_path, a.alias_used, p.canonical_url AS url "
         "FROM application a JOIN posting p ON p.id = a.posting_id "
@@ -11689,7 +11713,7 @@ def _submit_eligible(con, app_id: int | None = None) -> dict | None:
         "AND coalesce(a.alias_used,'') <> '' AND " + _SUBMIT_ATS_SQL + " "
         "AND NOT EXISTS (SELECT 1 FROM submit_run r WHERE r.application_id = a.id "
         "  AND ((r.outcome = 'running' AND r.started_at > ?) "
-        "    OR r.outcome IN ('shadow_complete','stopped'))) "
+        "    OR r.outcome IN ('shadow_complete','stopped','unknown','submitted'))) "
         "AND (SELECT count(*) FROM submit_run r WHERE r.application_id = a.id "
         "  AND r.outcome = 'error') < ? ")
     params: list = [stale, SUBMIT_ERROR_RETRIES]
@@ -11704,13 +11728,42 @@ def _submit_eligible(con, app_id: int | None = None) -> dict | None:
             "alias_used": row["alias_used"], "url": row["url"], "ats": "greenhouse"}
 
 
+def _submit_eligible_live(con, app_id, stale) -> dict | None:
+    sql = (
+        "SELECT a.id, a.package_path, a.alias_used, p.canonical_url AS url, "
+        "  s.id AS approval_id, s.record_fp, s.record_json "
+        "FROM application a JOIN posting p ON p.id = a.posting_id "
+        "JOIN submit_approval s ON s.application_id = a.id "
+        "WHERE a.status = 'draft' AND s.status = 'approved' AND s.expires_at > ? "
+        "AND coalesce(a.package_path,'') <> '' AND coalesce(a.alias_used,'') <> '' "
+        "AND " + _SUBMIT_ATS_SQL + " "
+        "AND NOT EXISTS (SELECT 1 FROM submit_run r WHERE r.application_id = a.id "
+        "  AND r.outcome = 'running' AND r.started_at > ?) ")
+    params: list = [int(time.time()), stale]
+    if app_id is not None:
+        sql += "AND a.id = ? "
+        params.append(int(app_id))
+    sql += "ORDER BY s.id DESC LIMIT 1"
+    row = con.execute(sql, tuple(params)).fetchone()
+    if row is None:
+        return None
+    rec = json.loads(row["record_json"])
+    return {"application_id": row["id"], "package_path": row["package_path"],
+            "alias_used": row["alias_used"], "url": row["url"], "ats": "greenhouse",
+            "mode": "live", "approval_id": row["approval_id"], "record_fp": row["record_fp"],
+            "files": rec.get("files") or {}}
+
+
 def _submit_open(con, p: dict) -> int:
     mode = p.get("mode") or "shadow"
     if mode not in SUBMIT_MODES:
         raise HTTPException(400, f"mode {mode!r} is not allowed; only {SUBMIT_MODES}")
     app_id = int(p.get("application_id") or 0)
-    if _submit_eligible(con, app_id) is None:
-        raise HTTPException(409, f"application {app_id} is not eligible for a submit run")
+    item = _submit_eligible(con, app_id, mode)
+    if item is None:
+        raise HTTPException(409, f"application {app_id} is not eligible for a {mode} run")
+    if mode == "live" and p.get("record_fp") != item["record_fp"]:
+        raise HTTPException(409, "the run does not carry the approved record")
     cur = con.execute(
         "INSERT INTO submit_run(application_id, started_at, mode, ats, engine_version, host, "
         "evidence_dir) VALUES (?,?,?,?,?,?,?)",
@@ -11751,18 +11804,61 @@ def _submit_step(con, run_id: int, p: dict) -> None:
         raise
 
 
-def _submit_close(con, run_id: int, p: dict) -> None:
+def _submit_record_fp(con, app_id: int, record: dict) -> str:
+    """Recompute the record fingerprint on the relay's side, from the relay's own URL."""
+    import record as _R
+    row = con.execute("SELECT p.canonical_url AS url FROM application a JOIN posting p "
+                      "ON p.id=a.posting_id WHERE a.id=?", (int(app_id),)).fetchone()
+    try:
+        return _R.fingerprint(int(app_id), row["url"] if row else "", record.get("fields") or [],
+                              record.get("files") or {})
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, f"bad record: {e}")
+
+
+def _submit_approval_create(con, run: dict, record: dict, record_fp: str) -> str:
+    """The approval a complete shadow run produces. Returns its page token."""
+    import passkey as _P
+    fp = _submit_record_fp(con, run["application_id"], record)
+    if fp != record_fp:
+        raise HTTPException(400, "the record does not match its fingerprint")
+    # One live approval per application: a newer shadow record replaces an unapproved one.
+    con.execute("UPDATE submit_approval SET status='expired' WHERE application_id=? AND status='pending'",
+                (run["application_id"],))
+    token = secrets.token_urlsafe(24)
+    url_row = con.execute("SELECT p.canonical_url AS url FROM application a JOIN posting p "
+                          "ON p.id=a.posting_id WHERE a.id=?", (run["application_id"],)).fetchone()
+    body = {"url": url_row["url"] if url_row else "", "fields": record.get("fields") or [],
+            "files": record.get("files") or {}}
+    con.execute(
+        "INSERT INTO submit_approval(application_id, run_id, token, record_fp, record_json, "
+        "created_at, expires_at) VALUES (?,?,?,?,?,?,?)",
+        (run["application_id"], run["id"], token, fp, json.dumps(body, ensure_ascii=False),
+         now(), int(time.time()) + SUBMIT_APPROVAL_TTL_S))
+    _P.challenge_for(fp)                                      # raises unless 32 bytes of hex
+    return token
+
+
+def _submit_close(con, run_id: int, p: dict) -> str | None:
     outcome = p.get("outcome")
     if outcome not in SUBMIT_OUTCOMES:
         raise HTTPException(400, f"outcome must be one of {SUBMIT_OUTCOMES}")
+    run = _submit_run_row(con, run_id)
+    if outcome == "shadow_complete" and run["mode"] != "shadow":
+        raise HTTPException(400, "only a shadow run closes shadow_complete")
+    if outcome == "unknown" and run["mode"] != "live":
+        raise HTTPException(400, "only a live run closes unknown")
+    token = None
+    if outcome == "shadow_complete" and p.get("record") is not None and run["outcome"] == "running":
+        token = _submit_approval_create(con, run, p["record"], str(p.get("record_fp") or ""))
     n = con.execute(
         "UPDATE submit_run SET outcome=?, ended_at=?, stop_step=?, stop_reason=? "
         "WHERE id=? AND outcome='running'",
         (outcome, now(), (str(p.get("stop_step") or "")[:80] or None),
          (str(p.get("stop_reason") or "")[:2000] or None), int(run_id))).rowcount
     if not n:
-        _submit_run_row(con, run_id)             # 404 if absent
         raise HTTPException(409, f"run {run_id} is already closed")
+    return token
 
 
 def _submit_clear(con, app_id: int, note: str) -> int:
@@ -11795,10 +11891,13 @@ async def submit_clear(app_id: int, request: Request, authorization: str | None 
 
 
 @app.get("/submit/next")
-def submit_next(request: Request, authorization: str | None = Header(None), app_id: int | None = None):
+def submit_next(request: Request, authorization: str | None = Header(None), app_id: int | None = None,
+                mode: str = "shadow"):
     require_submit(authorization, request)
+    if mode not in SUBMIT_MODES:
+        raise HTTPException(400, f"mode must be one of {SUBMIT_MODES}")
     with db() as con:
-        return {"next": _submit_eligible(con, app_id)}
+        return {"next": _submit_eligible(con, app_id, mode)}
 
 
 @app.post("/submit/run")
@@ -11826,9 +11925,171 @@ async def submit_run_close(run_id: int, request: Request, authorization: str | N
     require_submit(authorization, request)
     p = await request.json()
     with db() as con:
-        _submit_close(con, run_id, p)
+        token = _submit_close(con, run_id, p)
         log_event(con, "submit_run_close", f"run {run_id} {p.get('outcome')} "
                   f"{(p.get('stop_step') or '')}".strip(), client_ip(request))
+    out = {"ok": True}
+    if token:
+        url = f"{PUBLIC_URL}/submit/approve/{token}"
+        out["approval_url"] = url
+        if NTFY_URL:
+            import notify as _N
+            ok, detail = _N.send(NTFY_URL, NTFY_TOKEN, {
+                "title": "Approve an application submit"[:200],
+                "message": "A shadow run filled the form and read every field back. "
+                           "Tap to review the exact record and approve it with your passkey.",
+                "priority": 4, "tags": ["robot", "key"], "click": url})
+            out["alert"] = "sent" if ok else f"failed: {detail}"
+    return out
+
+
+# ── the approval page: a person's passkey over one exact record ──────────────────────────────
+def _approval_item(con, token: str) -> dict:
+    row = con.execute(
+        "SELECT s.*, a.company_raw, a.role_raw FROM submit_approval s "
+        "JOIN application a ON a.id = s.application_id WHERE s.token=?", (token,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "not found")
+    item = dict(row)
+    if item["status"] in ("pending", "approved") and time.time() > item["expires_at"]:
+        con.execute("UPDATE submit_approval SET status='expired' WHERE id=? AND status IN "
+                    "('pending','approved')", (item["id"],))
+        item["status"] = "expired"
+    return item
+
+
+@app.get("/submit/approve/{token}")
+def submit_approve_page(token: str):
+    import passkey as _P
+    _pk_cfg()
+    with db() as con:
+        try:
+            item = _approval_item(con, token)
+        except HTTPException:
+            return _pk_page(_P._page("Not found", "<h1>Not found</h1>"), 404)
+    return _pk_page(_P.submit_approve_page(token, item))
+
+
+@app.post("/submit/approve/{token}/options")
+def submit_approve_options(token: str, request: Request):
+    import passkey as _P
+    rp_id, _ = _pk_cfg()
+    with db() as con:
+        item = _approval_item(con, token)
+        if item["status"] != "pending":
+            raise HTTPException(409, f"this record is {item['status']}")
+        creds = _pk_active(con)
+        if not creds:
+            raise HTTPException(409, "no active passkey")
+        ch = _P.challenge_for(item["record_fp"])
+        con.execute("UPDATE submit_approval SET challenge=?, challenge_expires=? WHERE id=?",
+                    (_P.b64u(ch), int(time.time()) + _P.CHALLENGE_TTL_S, item["id"]))
+    return JSONResponse(json.loads(_P.authentication_options(
+        rp_id, ch, [_P.unb64u(c["credential_id"]) for c in creds])))
+
+
+@app.post("/submit/approve/{token}/verify")
+async def submit_approve_verify(token: str, request: Request):
+    """The approval. It approves; it never submits. A live run consumes it later."""
+    import passkey as _P
+    rp_id, origin = _pk_cfg()
+    ip = client_ip(request)
+    body = await request.json()
+    with db() as con:
+        item = _approval_item(con, token)
+        if item["status"] != "pending":
+            raise HTTPException(409, f"this record is {item['status']}")
+        ch_b64 = item["challenge"]
+        cur = con.execute("UPDATE submit_approval SET challenge=NULL WHERE id=? AND challenge=?",
+                          (item["id"], ch_b64))
+        if not ch_b64 or not (cur.rowcount or 0):
+            raise HTTPException(409, "no open challenge: press the button again")
+        if time.time() > (item["challenge_expires"] or 0):
+            raise HTTPException(409, "the challenge expired: press the button again")
+        cred = con.execute("SELECT * FROM passkey_credential WHERE credential_id=? AND status='active'",
+                           (str(body.get("rawId") or body.get("id") or ""),)).fetchone()
+        rec_fp = _submit_record_fp(con, item["application_id"], json.loads(item["record_json"]))
+    if cred is None:
+        audit("submit_refused", "approval from an unknown or inactive credential", ip)
+        raise HTTPException(403, "refused: approval does not match this record")
+    cred = dict(cred)
+    challenge = _P.unb64u(ch_b64)
+    # ⭐ THREE FINGERPRINTS MUST AGREE: recomputed from the stored record, stored when the shadow
+    # run closed, and carried inside the challenge the authenticator signed.
+    if not (rec_fp == item["record_fp"] == _P.fp_in_challenge(challenge)):
+        audit("submit_refused", f"approval {item['id']}: record fingerprint mismatch", ip)
+        raise HTTPException(403, "refused: approval does not match this record")
+    try:
+        new_count = _P.verify_authentication(body, challenge, rp_id, origin,
+                                             _P.unb64u(cred["public_key"]), cred["sign_count"])
+    except Exception as e:                                    # noqa: BLE001
+        audit("submit_refused", f"passkey verification failed: {type(e).__name__}: {e}"[:400], ip)
+        raise HTTPException(403, "refused: approval does not match this record")
+    if not _P.sign_count_ok(cred["sign_count"], new_count):
+        audit("submit_refused", f"passkey sign count did not grow ({cred['sign_count']} -> {new_count})", ip)
+        raise HTTPException(403, "refused: approval does not match this record")
+    by = f"passkey:{cred.get('label') or cred['credential_id'][:12]}"
+    with db() as con:
+        con.execute("UPDATE passkey_credential SET sign_count=?, last_used_at=? WHERE credential_id=?",
+                    (new_count, now(), cred["credential_id"]))
+        burn_nonce(con, "sa." + challenge[:16].hex(), rec_fp)
+        cur = con.execute("UPDATE submit_approval SET status='approved', approved_by=?, approved_at=? "
+                          "WHERE id=? AND status='pending'", (by, now(), item["id"]))
+        if not (cur.rowcount or 0):
+            raise HTTPException(409, "this record was already decided")
+        log_event(con, "submit_approved_passkey", f"approval {item['id']} app {item['application_id']} "
+                  f"by {by} fp {rec_fp[:16]}", ip)
+    return {"ok": True, "approved": True, "application_id": item["application_id"]}
+
+
+# ── a live run: arm (consume the approval, once), then report the submission ─────────────────
+@app.post("/submit/run/{run_id}/arm")
+async def submit_run_arm(run_id: int, request: Request, authorization: str | None = Header(None)):
+    """Consume the approval BEFORE the click. A spent approval cannot be retried into a duplicate."""
+    require_submit(authorization, request)
+    p = await request.json()
+    with db() as con:
+        run = _submit_run_row(con, run_id)
+        if run["mode"] != "live" or run["outcome"] != "running":
+            raise HTTPException(409, "only a running live run can arm")
+        cur = con.execute(
+            "UPDATE submit_approval SET status='consumed', consumed_at=?, consumed_run_id=? "
+            "WHERE application_id=? AND status='approved' AND record_fp=? AND expires_at > ?",
+            (now(), run_id, run["application_id"], str(p.get("record_fp") or ""), int(time.time())))
+        if not (cur.rowcount or 0):
+            raise HTTPException(409, "no approved record matches this run")
+        nonce = secrets.token_hex(16)
+        log_event(con, "submit_armed", f"run {run_id} app {run['application_id']}", client_ip(request))
+    return {"ok": True, "nonce": nonce, "window_s": SUBMIT_ARM_WINDOW_S}
+
+
+@app.post("/submit/run/{run_id}/submitted")
+async def submit_run_submitted(run_id: int, request: Request, authorization: str | None = Header(None)):
+    """The one route that writes application.status: draft -> submitted, for a run that consumed
+    an approval. The proof (URL, page text) is kept on the run."""
+    require_submit(authorization, request)
+    p = await request.json()
+    with db() as con:
+        run = _submit_run_row(con, run_id)
+        if run["mode"] != "live" or run["outcome"] != "running":
+            raise HTTPException(409, "only a running live run can report a submission")
+        appr = con.execute("SELECT id FROM submit_approval WHERE consumed_run_id=? AND status='consumed'",
+                           (run_id,)).fetchone()
+        if appr is None:
+            raise HTTPException(409, "this run consumed no approval")
+        proof = (f"proof: {str(p.get('url') or '')[:300]} | {str(p.get('excerpt') or '')[:400]}").strip()
+        cur = con.execute(
+            "UPDATE application SET status='submitted', submitted_at=?, applied_raw=?, status_raw=?, "
+            "source_row=NULL, status_source='submitter' WHERE id=? AND status='draft'",
+            (now(), now()[:10], "submitted by the submitter after a passkey approval",
+             run["application_id"]))
+        if not (cur.rowcount or 0):
+            raise HTTPException(409, "the application is no longer a draft")
+        _floor_release(con, run["application_id"])
+        con.execute("UPDATE submit_run SET outcome='submitted', ended_at=?, stop_reason=? "
+                    "WHERE id=? AND outcome='running'", (now(), proof[:2000], run_id))
+        log_event(con, "submit_submitted", f"run {run_id} app {run['application_id']} {proof[:200]}",
+                  client_ip(request))
     return {"ok": True}
 
 

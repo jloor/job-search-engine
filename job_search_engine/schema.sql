@@ -947,3 +947,33 @@ CREATE TABLE IF NOT EXISTS submit_step (
   sha256          TEXT,
   UNIQUE(run_id, n)
 );
+
+-- ════════════════════════════════════════════════════════════════════════════════════════
+-- A person's passkey approval of ONE exact submit record (2026-10-08). Written when a shadow run
+-- closes complete; approved on /submit/approve/{token}; CONSUMED, once, when a live run arms the
+-- one sanctioned click. Modelled on send_queue.
+--
+-- 🚨 record_fp binds the approval to the field values and the file hashes (record.py). The relay
+-- recomputes it from record_json at three points: when the row is written, when the passkey
+-- assertion arrives (it must also equal the hash inside the signed challenge), and when a live
+-- run arms (it must equal the run's own read-back). A record edited after approval approves nothing.
+-- ⚠️ An approval is consumed BEFORE the click, never after. A click with no proof leaves the
+-- approval spent, so an uncertain submit can never be retried into a duplicate application.
+CREATE TABLE IF NOT EXISTS submit_approval (
+  id                INTEGER PRIMARY KEY,
+  application_id    INTEGER NOT NULL REFERENCES application(id),
+  run_id            INTEGER REFERENCES submit_run(id),     -- the shadow run that produced it
+  token             TEXT NOT NULL UNIQUE,                  -- the approval page's link
+  record_fp         TEXT NOT NULL,
+  record_json       TEXT NOT NULL,                         -- {"url", "fields": [...], "files": {...}}
+  created_at        TEXT NOT NULL,
+  expires_at        INTEGER NOT NULL,
+  status            TEXT NOT NULL DEFAULT 'pending',       -- pending | approved | consumed | expired
+  challenge         TEXT,
+  challenge_expires INTEGER,
+  approved_by       TEXT,
+  approved_at       TEXT,
+  consumed_at       TEXT,
+  consumed_run_id   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_submit_approval_app ON submit_approval(application_id, id DESC);

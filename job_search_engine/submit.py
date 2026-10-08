@@ -1,7 +1,7 @@
 """The browser submitter's runner, SHADOW MODE: fill one application form, prove what it holds,
 and stop before submit. Runs on the submitter's own host user, never in the container.
 
-    python -m job_search_engine.submit once [--app N]
+    python -m job_search_engine.submit once [--app N] [--live]
 
 One run, start to finish (each step is recorded through the relay, with its screenshot):
    1 claim      the next eligible draft from /submit/next (or the one named by --app)
@@ -16,9 +16,15 @@ One run, start to finish (each step is recorded through the relay, with its scre
    9 review     a full-page screenshot of the filled form. THE RUN ENDS HERE.
   10 record     fields.json for the submission record, the run closed, one phone alert
 
-🚨 THIS BUILD CANNOT SUBMIT. form.js has no submit command and blocks submission on the page;
-the relay accepts only mode "shadow" and no submit route changes an application's status. A live
-mode is a separate, later change.
+🚨 A SHADOW RUN CANNOT SUBMIT: the page blocks every submission, and step 10 posts the record to
+the relay, which turns it into a passkey approval link for a person.
+⭐ A LIVE RUN (--live, 2026-10-08) submits ONE application, once, and only when:
+  - a person approved this exact record with a passkey (/submit/approve/{token});
+  - the package files hash exactly as approved;
+  - the page, filled again, reads back exactly the approved record (same fingerprint);
+  - the relay consumed the approval and returned a nonce (arm), before the single click.
+After arming, any failure closes the run 'unknown' and it is never retried: a click with no proof
+is resolved from the confirmation mail, not by clicking again.
 
 Environment (from the submitter host's env file, never from the repository):
   SUBMIT_RELAY_URL      the relay, e.g. https://relay.example.com
@@ -54,6 +60,7 @@ if str(HERE) not in sys.path:
 
 import answers as A                                             # noqa: E402
 import greenhouse as GH                                         # noqa: E402
+import record as R                                              # noqa: E402
 
 FORM_JS = HERE / "browser" / "form.js"
 
@@ -82,8 +89,8 @@ class Relay:
         except urllib.error.HTTPError as e:
             raise RuntimeError(f"relay {method} {path}: {e.code} {e.read()[:300]!r}") from e
 
-    def next(self, app_id: int | None = None) -> dict | None:
-        q = f"?app_id={int(app_id)}" if app_id is not None else ""
+    def next(self, app_id: int | None = None, mode: str = "shadow") -> dict | None:
+        q = f"?mode={mode}" + (f"&app_id={int(app_id)}" if app_id is not None else "")
         return self._call("GET", "/submit/next" + q).get("next")
 
     def open(self, **kw) -> int:
@@ -92,8 +99,14 @@ class Relay:
     def step(self, run_id: int, **kw) -> None:
         self._call("POST", f"/submit/run/{run_id}/step", kw)
 
-    def close(self, run_id: int, **kw) -> None:
-        self._call("POST", f"/submit/run/{run_id}/close", kw)
+    def close(self, run_id: int, **kw) -> dict:
+        return self._call("POST", f"/submit/run/{run_id}/close", kw)
+
+    def arm(self, run_id: int, record_fp: str) -> str:
+        return self._call("POST", f"/submit/run/{run_id}/arm", {"record_fp": record_fp})["nonce"]
+
+    def submitted(self, run_id: int, **kw) -> None:
+        self._call("POST", f"/submit/run/{run_id}/submitted", kw)
 
 
 # ── the browser ───────────────────────────────────────────────────────────────────────────
@@ -263,13 +276,16 @@ class Run:
         app_id = item["application_id"]
         alias = item["alias_used"]
         pkg = self.repo / item["package_path"]
-        self.run_id = self.relay.open(application_id=app_id, ats="greenhouse", mode="shadow",
+        self.mode = item.get("mode") or "shadow"
+        live = self.mode == "live"
+        self.run_id = self.relay.open(application_id=app_id, ats="greenhouse", mode=self.mode,
+                                      record_fp=item.get("record_fp"),
                                       engine_version=self.version, host=socket.gethostname(),
                                       evidence_dir="")
         self.dir = self.evidence / str(app_id) / str(self.run_id)
         self.dir.mkdir(parents=True, exist_ok=True)
         self._step("claim", "ok", f"application {app_id} {item['url']} evidence {self.dir}")
-        br, step = None, "liveness"
+        br, step, armed = None, "liveness", False
         try:
             token, jid = GH.resolve(item["url"], self.opener)
             try:
@@ -290,7 +306,11 @@ class Run:
             letter_slot = "cover_letter" in api_q
             needs_letter = letter_slot and api_q["cover_letter"]["required"]
             files = check_package(pkg, alias, needs_letter=needs_letter)
-            self._step(step, "ok", ", ".join(f.name for f in files))
+            hashes = {f.name: R.file_sha(f) for f in files}
+            if live and hashes != (item.get("files") or {}):
+                raise Stop(f"the package files differ from the approved record: {sorted(hashes)} "
+                           f"vs {sorted(item.get('files') or {})} (a file was edited after approval)")
+            self._step(step, "ok", ", ".join(f"{n} {h[:12]}" for n, h in sorted(hashes.items())))
 
             step = "open"
             br = self.browser_factory()
@@ -327,11 +347,12 @@ class Run:
 
             step = "review"
             shot = self._shot(br, "review")
-            self._step(step, "ok", "the filled form, as it would be submitted. NOT submitted.", shot)
+            self._step(step, "ok", "the filled form, as it would be submitted."
+                       + ("" if live else " NOT submitted."), shot)
 
             step = "record"
             by_id = {f["id"]: f for f in rb["fields"]}
-            record = [{"label": d.label or d.id,
+            record = [{"id": d.id, "label": d.label or d.id,
                        "value": Path(d.value).name if d.kind == "file" else (
                            by_id.get(d.id, {}).get("value") or ""),
                        "verified_len": len(by_id.get(d.id, {}).get("value") or "")
@@ -339,17 +360,65 @@ class Run:
                        "source": d.source}
                       for d in decisions if d.answered]
             (self.dir / "fields.json").write_text(json.dumps(record, indent=1))
-            self._step(step, "ok", f"fields.json with {len(record)} fields")
-            self.relay.close(self.run_id, outcome="shadow_complete")
-            return self._done(app_id, "shadow_complete", "")
+            rec = {"fields": [{"id": r["id"], "label": r["label"], "value": r["value"]} for r in record],
+                   "files": hashes}
+            record_fp = R.fingerprint(app_id, item["url"], rec["fields"], rec["files"])
+            self._step(step, "ok", f"fields.json with {len(record)} fields; record {record_fp[:16]}")
+
+            if not live:
+                try:
+                    out = self.relay.close(self.run_id, outcome="shadow_complete", record=rec,
+                                           record_fp=record_fp) or {}
+                except RuntimeError as e:
+                    # The relay refused the record: close the run, so the draft is not left busy.
+                    raise RuntimeError(f"the relay refused the record: {e}") from e
+                return self._done(app_id, "shadow_complete", out.get("approval_url") or "")
+
+            # ── LIVE: the approved record, exactly, or nothing ─────────────────────────────
+            step = "match"
+            if record_fp != item.get("record_fp"):
+                raise Stop(f"the form now reads differently from the approved record "
+                           f"({record_fp[:16]} vs {str(item.get('record_fp'))[:16]}); nothing was sent. "
+                           f"Compare fields.json with the approved record.")
+            self._step(step, "ok", f"the page holds the approved record {record_fp[:16]}")
+
+            step = "submit"
+            nonce = self.relay.arm(self.run_id, record_fp)
+            armed = True                       # from here on, a failure is 'unknown', never retried
+            br("arm", nonce=nonce)
+            r = br("final_submit", nonce=nonce, wait_s=60)
+            if r.get("status") == "human_step":
+                shot = self._shot(br, "human-step")
+                self._step(step, "ok", "a CAPTCHA appeared after the click; waiting for a person", shot)
+                if self.notify:
+                    self.notify({"title": f"Submitter: APP {app_id} needs you (CAPTCHA)"[:200],
+                                 "message": "Solve it in the viewer. The run waits 10 minutes and "
+                                            "never clicks Submit again.", "priority": 5,
+                                 "tags": ["robot", "warning"]})
+                r = br("await_proof", wait_s=600)
+            shot = self._shot(br, "after-submit")
+            if r.get("status") != "proof":
+                self._step(step, "error", f"no proof of submission: {json.dumps(r)[:1500]}", shot)
+                self.relay.close(self.run_id, outcome="unknown", stop_step=step,
+                                 stop_reason="clicked Submit, no proof seen; check the alias's mail")
+                return self._done(app_id, "unknown", "clicked Submit and saw no proof. NOT retried: "
+                                  "check the mail at the alias before doing anything.")
+            self._step(step, "ok", f"proof: {r.get('url')} | {r.get('excerpt', '')[:300]}", shot)
+            self.relay.submitted(self.run_id, url=r.get("url"), excerpt=r.get("excerpt"))
+            return self._done(app_id, "submitted", f"{r.get('url')}")
         except Stop as e:
             self._safe_step(step, "stop", str(e), br)
             self.relay.close(self.run_id, outcome="stopped", stop_step=step, stop_reason=str(e))
             return self._done(app_id, "stopped", f"{step}: {e}")
         except Exception as e:                                        # noqa: BLE001
             self._safe_step(step, "error", repr(e), br)
-            self.relay.close(self.run_id, outcome="error", stop_step=step, stop_reason=repr(e)[:2000])
-            return self._done(app_id, "error", f"{step}: {e!r}")
+            # 🚨 After arming, the click may have happened. 'unknown' is never retried; 'error' is.
+            outcome = "unknown" if armed else "error"
+            try:
+                self.relay.close(self.run_id, outcome=outcome, stop_step=step, stop_reason=repr(e)[:2000])
+            except Exception as e2:                                   # noqa: BLE001
+                print(f"could not close run {self.run_id}: {e2}", file=sys.stderr)
+            return self._done(app_id, outcome, f"{step}: {e!r}")
         finally:
             if br is not None:
                 # 📌 Keep the filled form on the virtual screen for a person to inspect in the
@@ -373,9 +442,10 @@ class Run:
 
     def _done(self, app_id, outcome, why) -> dict:
         if self.notify:
-            self.notify({"title": f"Submitter (shadow): APP {app_id} {outcome}"[:200],
+            self.notify({"title": f"Submitter ({getattr(self, 'mode', 'shadow')}): APP {app_id} {outcome}"[:200],
                          "message": (why or "filled to review, not submitted")[:400],
-                         "priority": 3 if outcome == "shadow_complete" else 4,
+                         "priority": 5 if outcome == "unknown" else
+                                     3 if outcome in ("shadow_complete", "submitted") else 4,
                          "tags": ["robot"]})
         return {"application_id": app_id, "run_id": self.run_id, "outcome": outcome, "why": why}
 
@@ -416,7 +486,7 @@ def cmd_once(a) -> int:
         print("another run holds the lock; no run")
         return 0
     relay = Relay(os.environ.get("SUBMIT_RELAY_URL", ""), os.environ.get("SUBMIT_TOKEN", ""))
-    item = relay.next(a.app)
+    item = relay.next(a.app, "live" if a.live else "shadow")
     if not item:
         print("nothing eligible")
         return 0
@@ -431,7 +501,7 @@ def cmd_once(a) -> int:
     r = Run(relay, lambda: Browser(node), cfg, repo, evidence, headed,
             version=version, notify=notify).go(item)
     print(json.dumps(r))
-    return 0 if r["outcome"] == "shadow_complete" else 3
+    return 0 if r["outcome"] in ("shadow_complete", "submitted") else 3
 
 
 def main(argv=None) -> int:
@@ -440,6 +510,9 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     o = sub.add_parser("once", help="take one eligible draft and run it to the review screenshot")
     o.add_argument("--app", type=int, help="this application only (it must still be eligible)")
+    o.add_argument("--live", action="store_true",
+                   help="a LIVE run: only a draft whose exact record a person approved by passkey; "
+                        "it fills, proves the page holds that record, and clicks Submit once")
     o.set_defaults(fn=cmd_once)
     a = ap.parse_args(argv)
     return a.fn(a)

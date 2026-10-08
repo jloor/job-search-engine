@@ -4208,14 +4208,16 @@ On Wed, Aug 12, 2026 the candidate wrote:
     # must be untouched, and the WHERE clause repeats both conditions so a second run is a
     # no-op rather than a rewrite.
     check("...only on submitted + self_report",
-          ("status='submitted'" in _tsrc, "status_source='self_report'" in _tsrc), (True, True))
+          ("status='submitted'" in _tsrc, "status_source IN ('self_report','submitter')" in _tsrc),
+          (True, True))
     # ⚠️ ONE COLUMN. Not status, not status_raw, not applied_raw. An evidence upgrade that
     # rewrites the row's history is not an upgrade, it is a different bug.
     # ⚠️ Match on the UPGRADE's own WHERE clause, not on "status_source='mail'". The
     # draft -> submitted UPDATE sets that too and SHOULD also set status_raw and
     # applied_raw, so a looser match failed against correct code and would have sent
     # someone to fix a statement that was right.
-    _upd = [l for l in _tsrc.splitlines() if "status_source='self_report'" in l and "UPDATE" in l]
+    _upd = [l for l in _tsrc.splitlines() if "status_source IN ('self_report','submitter')" in l
+            and "UPDATE" in l]
     check("...and changes nothing else",
           (len(_upd) == 1,
            all("status_raw" not in l and "applied_raw" not in l for l in _upd)), (True, True))

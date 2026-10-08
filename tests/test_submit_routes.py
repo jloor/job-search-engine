@@ -124,8 +124,10 @@ for i, why in ((3, "Lever is not handed out yet"), (4, "a SUSPENDED package is n
     check(why, call(app.submit_next, auth=S, app_id=i)["next"] is None)
 
 print("\nopening a run:")
-check("only shadow mode is accepted",
-      code_of(app.submit_run_open, Req({"application_id": 1, "mode": "live"}), authorization=S) == 400)
+check("an unknown mode is refused",
+      code_of(app.submit_run_open, Req({"application_id": 1, "mode": "turbo"}), authorization=S) == 400)
+check("a LIVE run needs an approved record (none exists here): refused",
+      code_of(app.submit_run_open, Req({"application_id": 1, "mode": "live"}), authorization=S) == 409)
 check("an ineligible application is refused (409)",
       code_of(app.submit_run_open, Req({"application_id": 4}), authorization=S) == 409)
 r = call(app.submit_run_open, auth=S, body={"application_id": 1, "ats": "greenhouse",

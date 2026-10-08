@@ -11,11 +11,16 @@
 //   {"cmd":"close"}                                      -> {ok}
 // A failure is {ok:false,error}. The process never exits on a bad command.
 //
-// 🚨 THERE IS NO SUBMIT COMMAND, AND SUBMISSION IS BLOCKED ON THE PAGE. This build is shadow
-// only: it stops at a filled form. Three guards, each counted and reported by `readback`, so a
-// submit attempt is visible rather than silent: a capture-phase listener cancels every submit
+// 🚨 SUBMISSION IS BLOCKED ON THE PAGE. Three guards, each counted and reported by `readback`, so
+// a submit attempt is visible rather than silent: a capture-phase listener cancels every submit
 // event; form.submit(), which fires no event, is replaced; and any non-GET request that would
 // navigate the top document is aborted at the network layer.
+//
+// ⭐ ONE SANCTIONED CLICK (2026-10-08). `final_submit` is the only way through, and only after
+// `arm` with the nonce the relay returned when it CONSUMED a person's passkey approval of this
+// exact record. It tags the real submit button with a per-browser secret and clicks it; the
+// listener lets through exactly one submit event from that button, once, and the network guard
+// opens for 15 seconds. form.submit() stays replaced. Every pass-through is counted.
 //
 // The rules below are each a way a filler reports success and does the wrong thing:
 //   - Address fields by attribute ([id="..."]), never '#id': ids can start with a digit.
@@ -30,8 +35,10 @@
 const readline = require('readline');
 const { chromium } = require('playwright');
 
-const fresh = () => ({ submit_events: 0, submit_calls: 0, post_navigations: 0 });
+const crypto = require('crypto');
+const fresh = () => ({ submit_events: 0, submit_calls: 0, post_navigations: 0, sanctioned: 0 });
 let browser = null, page = null, blocked = fresh();
+let secret = '', armed = null, openUntil = 0;              // the one sanctioned click
 
 const attr = (id) => `[id=${JSON.stringify(id)}]`;
 const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
@@ -42,11 +49,20 @@ async function open(c) {
   // a person can watch or take over. Headless is for tests.
   browser = await chromium.launch({ headless: !c.headed });
   page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-  blocked = fresh();
+  blocked = fresh(); armed = null; openUntil = 0;
+  secret = crypto.randomBytes(16).toString('hex');
   await page.exposeFunction('__submitBlocked', (kind) => { blocked[kind] += 1; });
-  await page.addInitScript(() => {
-    // A submit event (button click, Enter, requestSubmit) is cancelled before the page sees it.
+  await page.addInitScript((SECRET) => {
+    let used = false;
+    // A submit event (button click, Enter, requestSubmit) is cancelled before the page sees it,
+    // EXCEPT once: the event whose submitter is the button final_submit tagged with the secret.
     document.addEventListener('submit', (e) => {
+      const s = e.submitter;
+      if (!used && s && s.getAttribute && s.getAttribute('data-sanctioned') === SECRET) {
+        used = true;
+        try { window.__submitBlocked('sanctioned'); } catch (_) { /* page closing */ }
+        return;
+      }
       e.preventDefault(); e.stopImmediatePropagation();
       try { window.__submitBlocked('submit_events'); } catch (_) { /* page closing */ }
     }, true);
@@ -54,10 +70,11 @@ async function open(c) {
     HTMLFormElement.prototype.submit = function () {
       try { window.__submitBlocked('submit_calls'); } catch (_) { /* page closing */ }
     };
-  });
+  }, secret);
   await page.route('**/*', (route) => {
     const r = route.request();
     if (r.method() !== 'GET' && r.isNavigationRequest() && r.frame() === page.mainFrame()) {
+      if (Date.now() < openUntil) { blocked.sanctioned += 1; return route.continue(); }
       blocked.post_navigations += 1;
       return route.abort('blockedbyclient');
     }
@@ -275,7 +292,52 @@ async function shot(c) {
   return { path: c.path };
 }
 
-const handlers = { open, harvest, fill, readback, shot,
+// ── the last mile ────────────────────────────────────────────────────────────────────────
+const PROOF = /thank you for (applying|your application|your interest)|application (has been |was )?(submitted|received)|we(?:'|’)ve received your application/i;
+
+async function arm(c) {
+  if (!/^[0-9a-f]{32}$/.test(String(c.nonce || ''))) throw new Error('arm needs the relay nonce');
+  armed = { nonce: c.nonce, until: Date.now() + 5000 };
+  return { armed: true };
+}
+
+async function watchProof(waitS) {
+  const until = Date.now() + Math.min(600, Math.max(1, waitS || 60)) * 1000;
+  let excerpt = '';
+  while (Date.now() < until) {
+    const url = page.url();
+    const text = await page.evaluate(() => document.body ? document.body.innerText : '').catch(() => '');
+    const m = text.match(PROOF);
+    if (/\/confirmation\b/.test(url) || m) {
+      excerpt = m ? text.slice(Math.max(0, m.index - 80), m.index + 160).replace(/\s+/g, ' ').trim() : '';
+      return { status: 'proof', url, excerpt };
+    }
+    // A CAPTCHA challenge a person must solve: the reCAPTCHA or hCaptcha challenge frame, visible.
+    const challenge = await page.evaluate(() => [...document.querySelectorAll(
+      'iframe[src*="recaptcha"][src*="bframe"], iframe[src*="hcaptcha"][src*="challenge"]')]
+      .some((f) => { const r = f.getBoundingClientRect(); return r.width > 50 && r.height > 50; })).catch(() => false);
+    if (challenge) return { status: 'human_step', url };
+    await page.waitForTimeout(1000);
+  }
+  return { status: 'no_proof', url: page.url(),
+           excerpt: (await page.evaluate(() => document.body ? document.body.innerText : '').catch(() => '')).replace(/\s+/g, ' ').slice(0, 300) };
+}
+
+async function finalSubmit(c) {
+  // One shot: the arm is spent whether the click succeeds or not.
+  const a = armed; armed = null;
+  if (!a || a.nonce !== c.nonce || Date.now() > a.until) throw new Error('not armed for this nonce');
+  const btn = page.locator(c.selector || 'button[type="submit"]').filter({ hasText: c.text ? new RegExp(c.text, 'i') : /submit/i }).first();
+  if (await btn.count() === 0) throw new Error('no submit button matched');
+  await btn.evaluate((el, s) => el.setAttribute('data-sanctioned', s), secret);
+  openUntil = Date.now() + 15000;
+  await btn.click();
+  return { clicked: true, ...(await watchProof(c.wait_s || 60)) };
+}
+
+const handlers = { open, harvest, fill, readback, shot, arm,
+                   final_submit: finalSubmit,
+                   await_proof: async (c) => watchProof(c.wait_s || 600),
                    close: async () => { if (browser) await browser.close(); browser = null; return {}; } };
 
 const rl = readline.createInterface({ input: process.stdin });

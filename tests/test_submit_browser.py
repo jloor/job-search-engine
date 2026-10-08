@@ -171,6 +171,57 @@ finally:
     br.quit()
 check("🚨 no POST ever reached the server", not posts)
 
+print("\nthe one sanctioned click:")
+NONCE = "ab" * 16
+br = S.Browser("node")
+try:
+    br("open", url=URL, headed=False, settle=300)
+    before = len(posts)
+    for label, cmds in (("final_submit without arm is refused", [("final_submit", {"nonce": NONCE})]),
+                        ("final_submit with another nonce is refused",
+                         [("arm", {"nonce": NONCE}), ("final_submit", {"nonce": "cd" * 16})]),
+                        ("the arm is spent by a refused attempt",
+                         [("final_submit", {"nonce": NONCE})])):
+        try:
+            for c, kw in cmds:
+                br(c, **kw)
+            check(label, False)
+        except RuntimeError as e:
+            check(label, "not armed" in str(e))
+    check("…and none of that posted anything", len(posts) == before)
+    try:
+        br("arm", nonce="not-a-nonce")
+        check("arm refuses anything but a 32-hex relay nonce", False)
+    except RuntimeError:
+        check("arm refuses anything but a 32-hex relay nonce", True)
+    br("fill", texts=[{"id": "first_name", "value": "Alex"}])
+    br("arm", nonce=NONCE)
+    r = br("final_submit", nonce=NONCE, wait_s=10)
+    check("🚨 an armed final_submit posts EXACTLY ONCE", len(posts) == before + 1)
+    check("…and the thank-you page is the proof", r["status"] == "proof" and "Thank you" in r["excerpt"])
+    rb = br("readback")
+    check("the pass-through is counted as sanctioned", rb["blocked_submits"]["sanctioned"] >= 1)
+    try:
+        br("final_submit", nonce=NONCE)
+        check("a second final_submit is refused (the arm was one shot)", False)
+    except RuntimeError as e:
+        check("a second final_submit is refused (the arm was one shot)", "not armed" in str(e))
+finally:
+    br.quit()
+br = S.Browser("node")
+try:
+    br("open", url=URL, headed=False, settle=300)
+    before = len(posts)
+    br("arm", nonce=NONCE)
+    br("fill", texts=[{"id": "question_101", "value": "submit-me"}])
+    br("fill", texts=[{"id": "question_101", "value": "post-me"}])
+    rb = br("readback")
+    check("🚨 while armed, the page's OWN submit attempts are still blocked",
+          rb["blocked_submits"]["submit_events"] >= 1 and rb["blocked_submits"]["submit_calls"] >= 1
+          and len(posts) == before)
+finally:
+    br.quit()
+
 print("\nthe protocol:")
 br = S.Browser("node")
 try:
