@@ -104,6 +104,8 @@ jobs:
       # Added 2026-10-08: root operations approved by passkey. The op list and the canonical hash run
       # here; the ceremony runs in the drift job with --strict.
       - run: python3 tests/test_root_request.py
+      # Added 2026-10-08: the backup retry buffer, after a full volume shipped truncated snapshots.
+      - run: python3 tests/test_backup_buffer.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #

@@ -2833,16 +2833,54 @@ def job_backup() -> str:
         raise RuntimeError(f"refusing to ship: dump contains no rows for {missing}, "
                            f"though the database has {[(t, must[t]) for t in missing]}")
     blob = backup.seal(sql.encode(), BACKUP_PUBKEY)
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     name = f"relay-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.sql.age"
-    (BACKUP_DIR / name).write_bytes(blob)
+    shipped, failed, dropped = _backup_buffer(name, blob)
+    note = (f"{name} sealed {len(blob)}B from {len(sql)}B plain; uploaded {len(shipped)}; "
+            f"verified " + ",".join(f"{t}={n}" for t, n in must.items() if n is not None))
+    if dropped:
+        note += f"; DROPPED unusable {dropped}"
+    return note + (f"; UPLOAD FAILED {failed}" if failed else "; local buffer clean")
 
-    # Upload this snapshot and any earlier ones a previous run failed to ship. Retrying
-    # the backlog is the difference between a transient outage costing one snapshot and
-    # costing every snapshot taken during it.
-    pending = sorted(BACKUP_DIR.glob("relay-*.sql.age"))
-    shipped, failed = [], []
-    for p in pending:
+
+def _backup_buffer(name: str, blob: bytes, put=None, keep: int | None = None,
+                   d: Path | None = None) -> tuple[list, list, list]:
+    """Write one snapshot into the retry buffer, upload what is not yet shipped, prune.
+
+    🚨 2026-10-08, THE VOLUME FILLED AND THREE BAD SNAPSHOTS WERE UPLOADED. A write that
+    failed part way (no space left) left a truncated file under the final name, and a later
+    run uploaded it as a snapshot: 182 MB of a 301 MB snapshot, and two of 0 bytes. And every
+    run uploaded EVERY kept file again, about 4 GB per run once a snapshot reached 300 MB.
+    So, each a rule:
+      1. A snapshot is written to `<name>.part`, flushed to disk, and renamed only when
+         complete. A file under its final name is complete.
+      2. A file shorter than a sealed empty snapshot, or without the backup.MAGIC header, is
+         never uploaded: it is dropped and named in the result.
+      3. A `<name>.shipped` marker records an upload; a shipped file is not uploaded again.
+      4. Only shipped files are pruned, the oldest first, down to `keep`. An unshipped file is
+         the only copy and stays.
+    """
+    import backup as _bk
+    put = put or _storage_put
+    keep = BACKUP_KEEP if keep is None else keep
+    d = d or BACKUP_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    for stale in d.glob("relay-*.sql.age.part"):            # left by a write that died
+        stale.unlink(missing_ok=True)
+    part = d / (name + ".part")
+    try:
+        with open(part, "wb") as f:
+            f.write(blob)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(part, d / name)
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
+
+    shipped, failed, dropped = [], [], []
+    for p in sorted(d.glob("relay-*.sql.age")):
+        if (d / (p.name + ".shipped")).exists():
+            continue
         try:
             data = p.read_bytes()
         except FileNotFoundError:
@@ -2851,19 +2889,26 @@ def job_backup() -> str:
             # backup that crashes because someone else already shipped that snapshot is
             # failing on success. The lock makes this rare; this makes it harmless.
             continue
+        if len(data) < len(_bk.MAGIC) + 32 + 12 + 16 or not data.startswith(_bk.MAGIC):
+            dropped.append(f"{p.name} ({len(data)}B)")
+            p.unlink(missing_ok=True)
+            continue
         try:
-            _storage_put(p.name, data)
+            put(p.name, data)
+            (d / (p.name + ".shipped")).touch()
             shipped.append(p.name)
         except Exception as e:
             failed.append(f"{p.name}: {type(e).__name__}: {e}")
 
     # Only prune what is confirmed uploaded. A local file is the only copy until then.
-    for p in pending[:-BACKUP_KEEP]:
-        if p.name in shipped:
-            p.unlink(missing_ok=True)
-    note = (f"{name} sealed {len(blob)}B from {len(sql)}B plain; uploaded {len(shipped)}; "
-            f"verified " + ",".join(f"{t}={n}" for t, n in must.items() if n is not None))
-    return note + (f"; UPLOAD FAILED {failed}" if failed else "; local buffer clean")
+    done = [p for p in sorted(d.glob("relay-*.sql.age")) if (d / (p.name + ".shipped")).exists()]
+    for p in done[:max(0, len(done) - keep)]:
+        p.unlink(missing_ok=True)
+        (d / (p.name + ".shipped")).unlink(missing_ok=True)
+    for m in d.glob("relay-*.sql.age.shipped"):              # a marker whose snapshot is gone
+        if not (d / m.name[:-len(".shipped")]).exists():
+            m.unlink(missing_ok=True)
+    return shipped, failed, dropped
 
 
 def _storage_put(name: str, data: bytes) -> None:
