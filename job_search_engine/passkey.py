@@ -135,6 +135,9 @@ main{max-width:640px;margin:0 auto;padding:20px 16px 40px}
 h1{font-size:20px;margin:0 0 4px} p.mut{color:var(--mut);margin:0 0 16px;font-size:14px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin:12px 0}
 dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 12px;margin:0} dt{color:var(--mut)} dd{margin:0;overflow-wrap:anywhere}
+dl.rec{display:block} dl.rec dt{font-size:13px;line-height:1.35;margin-top:12px;overflow-wrap:anywhere}
+dl.rec dt:first-child{margin-top:0} dl.rec dd{margin:2px 0 0;font-weight:600;white-space:pre-wrap}
+code{font:13px ui-monospace,monospace;overflow-wrap:anywhere}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0;font:15px/1.5 ui-monospace,monospace}
 button{width:100%;padding:16px;font-size:18px;border-radius:10px;border:0;background:var(--ok);color:#fff;margin-top:8px}
 button:disabled{opacity:.5} input{width:100%;box-sizing:border-box;padding:12px;font-size:16px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg)}
@@ -172,16 +175,20 @@ def submit_approve_page(token: str, item: dict) -> str:
     e = html.escape
     rec = json.loads(item.get("record_json") or "{}")
     status = item.get("status")
-    head = (f"<h1>Approve this application?</h1><p class='mut'>{e(item.get('company_raw') or '')} · "
-            f"{e(item.get('role_raw') or '')}. A shadow run filled the form and read every field back. "
-            f"If you approve, one live run fills it again and submits only if every value below matches. "
-            f"Recorded {e(item.get('created_at') or '')}.</p>")
+    # ⚠️ STACKED, NOT A GRID. The mail page's two-column <dl> sizes the label column to its longest
+    # label; here a label is a whole form question, and on a phone it pushed every value off the
+    # screen (2026-10-08, seen on the first real record). Label above value, both wrapping.
+    when = (item.get("created_at") or "").replace("T", " ")[:16]
+    head = (f"<h1>Approve this application?</h1><p class='mut'><b>{e(item.get('company_raw') or '')}</b> · "
+            f"{e(item.get('role_raw') or '')}<br>A shadow run filled the form and read every field back "
+            f"({e(when)} UTC). If you approve, one live run fills it again and submits only if every "
+            f"value below still matches.</p>")
     rows = "".join(f"<dt>{e(f.get('label') or f.get('id') or '')}</dt><dd>{e(str(f.get('value') or ''))}</dd>"
                    for f in rec.get("fields") or [])
     files = "".join(f"<dt>{e(n)}</dt><dd><code>{e(h[:16])}…</code></dd>"
                     for n, h in sorted((rec.get("files") or {}).items()))
-    card = (f"<div class='card'><dl><dt>Posting</dt><dd>{e(rec.get('url') or '')}</dd>{rows}</dl></div>"
-            f"<div class='card'><dl>{files}<dt>Record</dt><dd><code>{e(item['record_fp'][:16])}…</code>"
+    card = (f"<div class='card'><dl class='rec'><dt>Posting</dt><dd>{e(rec.get('url') or '')}</dd>{rows}</dl></div>"
+            f"<div class='card'><dl class='rec'>{files}<dt>Record</dt><dd><code>{e(item['record_fp'][:16])}…</code>"
             f"</dd></dl></div>")
     if status != "pending":
         tail = f"<p id='msg' class='bad'>This record is {e(status or 'unknown')}. Nothing more can be done here.</p>"
