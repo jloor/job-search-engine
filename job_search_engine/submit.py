@@ -185,9 +185,10 @@ def _digits(s: str) -> str:
     return re.sub(r"\D", "", s or "")
 
 
-def compare(decisions: list, fill_results: list, page: list) -> list:
+def compare(decisions: list, fill_results: list, page: list, uploads: dict | None = None) -> list:
     """What the page holds against what was decided. Returns the mismatches as sentences."""
     got = {f["id"]: f for f in page}
+    uploads = uploads or {}
     chosen = {r["id"]: r for r in fill_results}
     bad = []
     for d in decisions:
@@ -198,12 +199,17 @@ def compare(decisions: list, fill_results: list, page: list) -> list:
             extra = f" (options: {r.get('options')})" if r.get("options") else ""
             bad.append(f"{d.label or d.id}: fill reported {r.get('status', 'nothing')}{extra}")
             continue
-        if f is None:
-            bad.append(f"{d.label or d.id}: the field is gone from the page after the fill")
-        elif d.kind == "file":
+        if d.kind == "file":
+            # The input itself when it still exists; otherwise the filename the page shows in its
+            # place (a board that swaps the input for a chip after the upload).
             name = Path(d.value).name
-            if not any(x["name"] == name and x["size"] > 0 for x in f.get("files") or []):
+            up = uploads.get(d.id) or {}
+            held = (f or {}).get("files") or up.get("held") or []
+            if not (any(x["name"] == name and x["size"] > 0 for x in held)
+                    or (f is None and up.get("shown"))):
                 bad.append(f"{d.label or d.id}: the page does not hold {name}")
+        elif f is None:
+            bad.append(f"{d.label or d.id}: the field is gone from the page after the fill")
         elif d.kind in ("select", "native_select"):
             if (f.get("value") or "") != r.get("chosen"):
                 bad.append(f"{d.label or d.id}: reads {f.get('value')!r}, chose {r.get('chosen')!r}")
@@ -305,10 +311,11 @@ class Run:
             self._step(step, "ok", json.dumps(fr["results"])[:3900], shot)
 
             step = "readback"
-            rb = br("readback")
+            fc = A.fill_command(decisions)
+            rb = br("readback", files=[{"id": x["id"], "name": Path(x["path"]).name} for x in fc["files"]])
             if any(rb["blocked_submits"].values()):
                 raise RuntimeError(f"a submit was attempted and blocked: {rb['blocked_submits']}")
-            bad = compare(decisions, fr["results"], rb["fields"]) + [
+            bad = compare(decisions, fr["results"], rb["fields"], rb.get("uploads")) + [
                 f"{x}: required and still empty" for x in required_empty(rb["fields"], h["fields"])]
             if bad:
                 raise Stop("; ".join(bad))

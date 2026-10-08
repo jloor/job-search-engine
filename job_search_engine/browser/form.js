@@ -163,14 +163,20 @@ async function fill(c) {
     if (await el.count() === 0) { results.push({ id: f.id, kind: 'file', status: 'not_found' }); continue; }
     await el.setInputFiles(f.path);
     const name = f.path.split('/').pop();
-    let ok = false;
+    // ⚠️ THE INPUT MAY BE GONE AFTER THE UPLOAD. Greenhouse replaces it with a filename chip once
+    // the file is accepted (found on the first real shadow run, 2026-10-08: the next read of the
+    // input waited 30 s for an element that no longer existed). Read the input only while it
+    // exists; after that, the filename on the page is the proof.
+    let ok = false, via = '';
     for (let i = 0; i < 40 && !ok; i++) {                   // wait for the name, not a clock
-      const held = await el.evaluate((n) => [...(n.files || [])].map((x) => x.name));
-      const shown = (await page.evaluate(() => document.body.innerText)).includes(name);
-      ok = held.includes(name) || shown;
-      if (!ok) await page.waitForTimeout(500);
+      if (await el.count()) {
+        const held = await el.evaluate((n) => [...(n.files || [])].map((x) => x.name), null, { timeout: 2000 }).catch(() => []);
+        if (held.includes(name)) { ok = true; via = 'input'; break; }
+      }
+      if ((await page.evaluate(() => document.body.innerText)).includes(name)) { ok = true; via = 'shown'; break; }
+      await page.waitForTimeout(500);
     }
-    results.push({ id: f.id, kind: 'file', status: ok ? 'set' : 'not_registered', file: name });
+    results.push({ id: f.id, kind: 'file', status: ok ? 'set' : 'not_registered', file: name, via });
   }
   for (const s of c.selects || []) {                        // 2. choices
     const r = await chooseOption(s.id, s.values || []);
@@ -198,7 +204,7 @@ async function fill(c) {
   return { results };
 }
 
-async function readback() {
+async function readback(c) {
   const fields = await page.evaluate(() => {
     const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
     const out = [];
@@ -229,7 +235,18 @@ async function readback() {
     });
     return out;
   });
-  return { fields, blocked_submits: blocked };
+  // For each uploaded file: what its input still holds, or, when the page replaced the input,
+  // whether the page shows the filename. submit.py accepts either as proof of the upload.
+  const uploads = {};
+  for (const f of (c && c.files) || []) {
+    const st = await page.evaluate(({ id, name }) => {
+      const el = document.getElementById(id);
+      const held = el && el.files ? [...el.files].map((x) => ({ name: x.name, size: x.size })) : null;
+      return { held, shown: document.body.innerText.includes(name) };
+    }, f);
+    uploads[f.id] = st;
+  }
+  return { fields, uploads, blocked_submits: blocked };
 }
 
 async function shot(c) {

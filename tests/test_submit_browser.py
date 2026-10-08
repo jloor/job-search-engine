@@ -117,16 +117,24 @@ try:
     p1 = shots / "filled.png"
     br("shot", path=str(p1))
     check("a screenshot is written, and it is a PNG", p1.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n")
-    rb = br("readback")
-    bad = S.compare(decisions, fr["results"], rb["fields"])
+    files = [{"id": x["id"], "name": pathlib.Path(x["path"]).name} for x in A.fill_command(decisions)["files"]]
+    rb = br("readback", files=files)
+    bad = S.compare(decisions, fr["results"], rb["fields"], rb["uploads"])
     check("🚨 the page's own edit to Website is caught by the read-back",
           len(bad) == 1 and "Website" in bad[0])
     check("the textarea is read back WHOLE, not truncated",
           next(f for f in rb["fields"] if f["id"] == "question_103")["value"]
           == "Because the work is interesting.")
-    check("both files are held by their inputs with a size",
-          all(next(f for f in rb["fields"] if f["id"] == i)["files"][0]["size"] > 0
-              for i in ("resume", "cover_letter")))
+    check("the upload that keeps its input is proved by the input (name and size)",
+          next(f for f in rb["fields"] if f["id"] == "cover_letter")["files"][0]["size"] > 0)
+    check("🚨 the upload whose input the page REPLACED reported set, not a timeout",
+          status["resume"]["status"] == "set" and status["resume"]["via"] in ("input", "shown"))
+    check("…its input is gone and the page shows the filename instead",
+          all(f["id"] != "resume" for f in rb["fields"]) and rb["uploads"]["resume"]["shown"])
+    nofile = [d for d in decisions if d.id == "resume"]
+    check("a replaced input whose filename the page does NOT show is still caught",
+          S.compare(nofile, [{"id": "resume", "status": "set"}], rb["fields"],
+                    {"resume": {"held": None, "shown": False}}))
     check("nothing required is left empty", not S.required_empty(rb["fields"], h["fields"]))
     check("no submit was attempted", not any(rb["blocked_submits"].values()))
 finally:

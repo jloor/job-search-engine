@@ -71,11 +71,18 @@
     input.addEventListener('input', render);
     input.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
   });
-  for (const [id, span] of [['resume', 'resume-name'], ['cover_letter', 'cover-name']]) {
-    document.getElementById(id).addEventListener('change', (e) => {
-      document.getElementById(span).textContent = [...e.target.files].map((f) => f.name).join(', ');
-    });
-  }
+  // The cover letter keeps its input and shows the name beside it. The resume behaves like a hosted
+  // Greenhouse form: once a file is chosen, the input is REMOVED and a filename chip takes its place.
+  document.getElementById('cover_letter').addEventListener('change', (e) => {
+    document.getElementById('cover-name').textContent = [...e.target.files].map((f) => f.name).join(', ');
+  });
+  document.getElementById('resume').addEventListener('change', (e) => {
+    const name = [...e.target.files].map((f) => f.name).join(', ');
+    setTimeout(() => {
+      const chip = document.createElement('span'); chip.className = 'chip'; chip.textContent = name + ' ×';
+      e.target.replaceWith(chip);
+    }, 200);
+  });
   // A page that edits a value after it is typed, so the read-back has something to catch.
   document.getElementById('question_104').addEventListener('input', (e) => {
     if (!e.target.value.endsWith('/edited')) e.target.value = e.target.value + '/edited';
