@@ -213,7 +213,9 @@ def compare(decisions: list, fill_results: list, page: list, uploads: dict | Non
         elif f is None:
             bad.append(f"{d.label or d.id}: the field is gone from the page after the fill")
         elif d.kind in ("select", "native_select"):
-            if (f.get("value") or "") != r.get("chosen"):
+            # Compared without whitespace: a board's two renderings of one option differ only in
+            # spacing ("United States +1" / "United States+1"), the same rule form.js chooses by.
+            if re.sub(r"\s+", "", (f.get("value") or "").lower()) != re.sub(r"\s+", "", (r.get("chosen") or "").lower()):
                 bad.append(f"{d.label or d.id}: reads {f.get('value')!r}, chose {r.get('chosen')!r}")
         elif d.kind == "tel":
             if not _digits(f.get("value")).endswith(_digits(d.value)[-10:]):

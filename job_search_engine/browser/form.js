@@ -105,17 +105,20 @@ async function harvest() {
 // The one option a wording names, or null. Tiers: exact, starts-with, whole word. A tier with
 // two hits is ambiguous and is no match. ⚠️ Whole words only: a substring test lets "No" match
 // "I am not a veteran". answers.py applies the same tiers before the browser opens.
+// ⚠️ OPTIONS ARE COMPARED ON A KEY WITHOUT WHITESPACE. Greenhouse renders each option twice (a
+// wrapper and an inner role="option" node) and the two copies differ in spacing: "United States +1"
+// and "United States+1" (2026-10-08). Removing exact duplicates left both, and the ambiguity rule
+// refused the country it should have chosen. Two options with the same key are one option.
+const optKey = (s) => String(s).toLowerCase().replace(/\s+/g, '');
 function pickOption(opts, want) {
-  // ⚠️ DEDUPLICATE FIRST. Greenhouse renders each option as a wrapper AND an inner role="option"
-  // node, and the option selector matches both, so every option text arrives twice. Without this,
-  // the ambiguity rule below refused "United States +1" for matching itself (2026-10-08, the
-  // phone-country picker). Two DIFFERENT options that match are still refused.
-  opts = [...new Set(opts)];
-  const w = String(want).trim().toLowerCase();
+  const seen = new Map();
+  for (const o of opts) if (!seen.has(optKey(o))) seen.set(optKey(o), o);
+  opts = [...seen.values()];
+  const w = String(want).trim().toLowerCase(), wk = optKey(want);
   const esc = w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const word = new RegExp('(?<![\\w])' + esc + '(?![\\w])');
-  const tiers = [opts.filter((o) => o.trim().toLowerCase() === w),
-                 opts.filter((o) => o.trim().toLowerCase().startsWith(w) && word.test(o.trim().toLowerCase().slice(0, w.length + 1))),
+  const tiers = [opts.filter((o) => optKey(o) === wk),
+                 opts.filter((o) => optKey(o).startsWith(wk) && word.test(o.trim().toLowerCase().slice(0, w.length + 1))),
                  opts.filter((o) => word.test(o.toLowerCase()))];
   for (const t of tiers) { if (t.length === 1) return t[0]; if (t.length > 1) return null; }
   return null;
@@ -227,6 +230,14 @@ async function readback(c) {
         const single = ctl && ctl.querySelector('[class*="single-value"], [class*="singleValue"]');
         const multi = ctl ? [...ctl.querySelectorAll('[class*="multi-value__label"]')].map((x) => clean(x.innerText)) : [];
         f.value = multi.length ? multi.join(' + ') : (single ? clean(single.innerText) : '');
+        // A country picker shows only a flag and a dial code ("+1" is the US AND Canada). The
+        // flag's class carries the ISO code (iti__us), so name the country from it.
+        const flag = single && single.querySelector('[class*="iti__flag"]');
+        const iso = flag && ((flag.className.match(/\biti__([a-z]{2})\b/) || [])[1]);
+        if (iso) {
+          try { f.value = clean(new Intl.DisplayNames(['en'], { type: 'region' }).of(iso.toUpperCase()) + ' ' + f.value); }
+          catch (_) { f.value = clean(iso.toUpperCase() + ' ' + f.value); }
+        }
       } else if (type === 'checkbox' || type === 'radio') {
         f.kind = type; f.checked = el.checked;
       } else if (el.tagName === 'SELECT') {

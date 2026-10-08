@@ -26,7 +26,7 @@
     <input type="tel" id="phone" aria-required="true"></div>
   <div class="field"><label for="country">Country*</label>
     <div class="select__control"><input class="select__input" id="country" aria-required="true"
-      data-options="Canada|United Kingdom|United States +1|Uruguay"></div></div>
+      data-options="Canada +1|United Kingdom +44|United States +1|Uruguay +598" data-flags="ca|gb|us|uy"></div></div>
   <div class="field"><label for="resume">Attach</label>
     <input type="file" id="resume" class="visually-hidden"><span id="resume-name"></span></div>
   <div class="field"><label for="cover_letter">Attach</label>
@@ -50,6 +50,7 @@
   document.querySelectorAll('.select__control').forEach((ctl) => {
     const input = ctl.querySelector('.select__input');
     const opts = input.dataset.options.split('|');
+    const flags = (input.dataset.flags || '').split('|');
     let menu = null, single = null;
     const close = () => { if (menu) { menu.remove(); menu = null; } };
     const render = () => {
@@ -57,17 +58,28 @@
       menu = document.createElement('div'); menu.className = 'select__menu';
       const q = input.value.toLowerCase();
       opts.filter((o) => o.toLowerCase().includes(q)).forEach((o) => {
+        const flag = flags[opts.indexOf(o)];
         // Like Greenhouse: a wrapper .select__option AND an inner role="option" per option, so a
         // selector for either finds every option text twice.
         const d = document.createElement('div'); d.className = 'select__option';
         const inner = document.createElement('div'); inner.setAttribute('role', 'option'); inner.textContent = o;
         d.appendChild(inner);
+        // ...and, for the country picker, a second copy whose spacing differs ("Canada+1"), as a
+        // separate node the option selector also matches.
+        let twin = null;
+        if (flag) { twin = document.createElement('div'); twin.setAttribute('role', 'option');
+                    twin.textContent = o.replace(' +', '+'); twin.style.height = '0'; twin.style.overflow = 'hidden'; }
         d.addEventListener('mousedown', (e) => {
           e.preventDefault();
           if (!single) { single = document.createElement('div'); single.className = 'select__single-value'; ctl.insertBefore(single, input); }
-          single.textContent = o; input.value = ''; close();
+          // A country picker, like Greenhouse's: the chosen value is a flag (ISO code in its
+          // class) and the dial code only.
+          if (flag) single.innerHTML = '<div class="iti__flag iti__' + flag + '"></div><span>' + o.split(' ').pop() + '</span>';
+          else single.textContent = o;
+          input.value = ''; close();
         });
         menu.appendChild(d);
+        if (twin) menu.appendChild(twin);
       });
       ctl.appendChild(menu);
     };

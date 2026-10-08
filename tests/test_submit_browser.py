@@ -114,8 +114,8 @@ try:
           all(r["status"] == "set" for r in fr["results"]), )
     check("the gender select chose the page's own wording (Woman), via [form_spellings]",
           status.get("gender", {}).get("chosen") == "Woman")
-    check("🚨 an option rendered twice (wrapper + role=option) is still chosen: 'United States +1'",
-          status.get("country", {}).get("chosen") == "United States +1")
+    check("🚨 an option rendered twice, with different spacing, is still chosen",
+          (status.get("country", {}).get("chosen") or "").replace(" ", "") == "UnitedStates+1")
     p1 = shots / "filled.png"
     br("shot", path=str(p1))
     check("a screenshot is written, and it is a PNG", p1.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n")
@@ -124,6 +124,8 @@ try:
     bad = S.compare(decisions, fr["results"], rb["fields"], rb["uploads"])
     check("🚨 the page's own edit to Website is caught by the read-back",
           len(bad) == 1 and "Website" in bad[0])
+    check("a flag-and-code country value reads back as the country name, not just '+1'",
+          next(f for f in rb["fields"] if f["id"] == "country")["value"] == "United States +1")
     check("the textarea is read back WHOLE, not truncated",
           next(f for f in rb["fields"] if f["id"] == "question_103")["value"]
           == "Because the work is interesting.")
