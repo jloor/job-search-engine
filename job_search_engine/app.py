@@ -903,6 +903,9 @@ MIGRATIONS = [
      "status TEXT NOT NULL DEFAULT 'pending', challenge TEXT, challenge_expires INTEGER, "
      "approved_by TEXT, approved_at TEXT, consumed_at TEXT, consumed_run_id INTEGER)"),
     "CREATE INDEX IF NOT EXISTS idx_submit_approval_app ON submit_approval(application_id, id DESC)",
+    # 2026-10-08: the one security code a live run may enter. See schema.sql.
+    ("CREATE TABLE IF NOT EXISTS submit_code_used (run_id INTEGER PRIMARY KEY REFERENCES submit_run(id), "
+     "message_id INTEGER NOT NULL REFERENCES message(id), at TEXT NOT NULL)"),
 ]
 
 
@@ -12068,6 +12071,64 @@ async def submit_run_arm(run_id: int, request: Request, authorization: str | Non
         nonce = secrets.token_hex(16)
         log_event(con, "submit_armed", f"run {run_id} app {run['application_id']}", client_ip(request))
     return {"ok": True, "nonce": nonce, "window_s": SUBMIT_ARM_WINDOW_S}
+
+
+# ── the emailed security code (2026-10-08, authorized explicitly by the operator) ─────────────
+# Greenhouse emails a code "to confirm you're a human" after the first Submit. The operator decided
+# the runner enters it, as a standard rule; the human confirmation for that application is the passkey
+# approval of the exact record. This route is the ONLY source of a code, and it answers once per
+# run, for the run that consumed the approval, from mail that arrived AFTER it armed, to that
+# application's alias, from Greenhouse, with DKIM or DMARC passing. CAPTCHAs stay with a person.
+SUBMIT_CODE_SENDERS = re.compile(r"@(?:[a-z0-9-]+\.)*greenhouse(?:-mail)?\.io$", re.I)
+SUBMIT_CODE_RE = re.compile(r"^[A-Za-z0-9]{8}$")
+
+
+def _submit_code(con, run_id: int) -> dict:
+    run = _submit_run_row(con, run_id)
+    if run["mode"] != "live" or run["outcome"] != "running":
+        raise HTTPException(409, "only a running live run may ask for a code")
+    appr = con.execute("SELECT consumed_at FROM submit_approval WHERE consumed_run_id=? "
+                       "AND status='consumed'", (run_id,)).fetchone()
+    if appr is None:
+        raise HTTPException(409, "this run consumed no approval")
+    if con.execute("SELECT 1 FROM submit_code_used WHERE run_id=?", (run_id,)).fetchone():
+        raise HTTPException(409, "this run already received its one code")
+    alias = con.execute("SELECT alias_used FROM application WHERE id=?",
+                        (run["application_id"],)).fetchone()["alias_used"]
+    rows = con.execute(
+        "SELECT id, otp_code, from_addr, subject, auth_dkim, auth_dmarc FROM message "
+        "WHERE lower(to_alias)=lower(?) AND classification='otp' AND received_at >= ? "
+        "ORDER BY received_at DESC, id DESC LIMIT 10", (alias or "", appr["consumed_at"])).fetchall()
+    for m in rows:
+        m = dict(m)
+        if not SUBMIT_CODE_SENDERS.search((m["from_addr"] or "").strip()):
+            continue
+        if "pass" not in ((m["auth_dkim"] or "").lower(), (m["auth_dmarc"] or "").lower()):
+            continue
+        if "security code" not in (m["subject"] or "").lower():
+            continue
+        if not SUBMIT_CODE_RE.fullmatch(m["otp_code"] or ""):
+            continue
+        try:
+            # The PRIMARY KEY is the second lock: two concurrent requests cannot both pass.
+            con.execute("INSERT INTO submit_code_used(run_id, message_id, at) VALUES (?,?,?)",
+                        (run_id, m["id"], now()))
+        except Exception as e:
+            if "unique" in str(e).lower() or "constraint" in str(e).lower():
+                raise HTTPException(409, "this run already received its one code")
+            raise
+        return {"code": m["otp_code"], "message_id": m["id"]}
+    raise HTTPException(404, "no qualifying code yet")
+
+
+@app.get("/submit/run/{run_id}/code")
+def submit_run_code(run_id: int, request: Request, authorization: str | None = Header(None)):
+    require_submit(authorization, request)
+    with db() as con:
+        out = _submit_code(con, run_id)
+        log_event(con, "submit_code_released", f"run {run_id} message {out['message_id']}",
+                  client_ip(request))
+    return out
 
 
 @app.post("/submit/run/{run_id}/submitted")

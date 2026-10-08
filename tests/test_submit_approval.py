@@ -280,5 +280,62 @@ with app.db() as con:
     st = con.execute("SELECT status FROM submit_approval WHERE application_id=1").fetchone()["status"]
 check("a clear expires the application's unused approval, so a stale record is never approved", st == "expired")
 
+print("\nthe emailed security code (one code, for the run that armed):")
+URL3 = URL + "3"
+with app.db() as con:
+    con.execute("INSERT INTO posting(id, company_id, title, canonical_url, captured_at) "
+                "VALUES (3, 1, 'Role', ?, '2026-10-01')", (URL3,))
+    con.execute("INSERT INTO application(id, posting_id, status, package_path, alias_used, company_raw, "
+                "role_raw) VALUES (3, 3, 'draft', 'applications/acme/c', 'acme3@jobs.example.com', 'Acme', 'Role')")
+s3 = call(app.submit_run_open, Req({"application_id": 3, "mode": "shadow"}), authorization=S)[0]["run_id"]
+fp3 = R.fingerprint(3, URL3, F, FILES)
+tok3 = call(app.submit_run_close, s3, Req({"outcome": "shadow_complete", "record_fp": fp3,
+                                           "record": {"fields": F, "files": FILES}}),
+            authorization=S)[0]["approval_url"].rsplit("/", 1)[1]
+o3, _ = call(app.submit_approve_options, tok3, Req())
+call(app.submit_approve_verify, tok3, Req(yk.get(o3, count=60)))
+live3 = call(app.submit_run_open, Req({"application_id": 3, "mode": "live", "record_fp": fp3}),
+             authorization=S)[0]["run_id"]
+
+
+def mail(mid, at, to="acme3@jobs.example.com", frm="no-reply@us.greenhouse-mail.io",
+         subj="Security code for your application to Acme", code="AbCd1234", dkim="pass", dmarc="pass",
+         cls="otp"):
+    with app.db() as con:
+        con.execute("INSERT INTO message(id, received_at, to_alias, from_addr, subject, raw_payload, "
+                    "classification, otp_code, auth_dkim, auth_dmarc) VALUES (?,?,?,?,?,'{}',?,?,?,?)",
+                    (mid, at, to, frm, subj, cls, code, dkim, dmarc))
+
+
+_, e = call(app.submit_run_code, live3, Req(), authorization=S)
+check("no code before the run has armed (409)", e == 409)
+_, e = call(app.submit_run_code, s3, Req(), authorization=S)
+check("a shadow run never gets a code", e == 409)
+mail(901, "2020-01-01T00:00:00+00:00")                         # before the arm: never
+call(app.submit_run_arm, live3, Req({"record_fp": fp3}), authorization=S)
+_, e = call(app.submit_run_code, live3, Req(), authorization="Bearer adm")
+check("the admin token cannot fetch a code (submit scope only)", e == 403)
+_, e = call(app.submit_run_code, live3, Req(), authorization=S)
+check("mail received BEFORE the run armed is never used (404, not yet)", e == 404)
+LATER = "2099-01-01T00:00:0{}+00:00"
+mail(902, LATER.format(1), to="someone@jobs.example.com")
+mail(903, LATER.format(2), frm="no-reply@greenhouse-mail.io.evil.example")
+mail(904, LATER.format(3), dkim="fail", dmarc="fail")
+mail(905, LATER.format(4), subj="Your interview next week")
+mail(906, LATER.format(5), code="AbCd123")
+mail(907, LATER.format(6), cls="confirmation")
+_, e = call(app.submit_run_code, live3, Req(), authorization=S)
+check("🚨 another alias, a look-alike sender domain, failed DKIM/DMARC, the wrong subject, a malformed "
+      "code, and a non-otp message are all refused", e == 404)
+mail(908, LATER.format(7))
+r, e = call(app.submit_run_code, live3, Req(), authorization=S)
+check("the one qualifying message releases its code", e is None and r == {"code": "AbCd1234", "message_id": 908})
+mail(909, LATER.format(8), code="ZzZz9999")
+_, e = call(app.submit_run_code, live3, Req(), authorization=S)
+check("🚨 a second code for the same run: refused (409), even for a newer message", e == 409)
+with app.db() as con:
+    ev = [r["detail"] for r in con.execute("SELECT detail FROM event WHERE kind='submit_code_released'")]
+check("the audit names the message, never the code", ev and all("AbCd1234" not in d for d in ev))
+
 print(f"\n{'FAILED: ' + str(len(fails)) if fails else 'all passed'}")
 sys.exit(1 if fails else 0)

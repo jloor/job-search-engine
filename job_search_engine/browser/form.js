@@ -39,6 +39,7 @@ const crypto = require('crypto');
 const fresh = () => ({ submit_events: 0, submit_calls: 0, post_navigations: 0, sanctioned: 0 });
 let browser = null, page = null, blocked = fresh();
 let secret = '', armed = null, openUntil = 0;              // the one sanctioned click
+let stage = 'idle';                                        // idle -> clicked -> code_done
 
 const attr = (id) => `[id=${JSON.stringify(id)}]`;
 const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
@@ -49,17 +50,20 @@ async function open(c) {
   // a person can watch or take over. Headless is for tests.
   browser = await chromium.launch({ headless: !c.headed });
   page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-  blocked = fresh(); armed = null; openUntil = 0;
+  blocked = fresh(); armed = null; openUntil = 0; stage = 'idle';
   secret = crypto.randomBytes(16).toString('hex');
   await page.exposeFunction('__submitBlocked', (kind) => { blocked[kind] += 1; });
   await page.addInitScript((SECRET) => {
-    let used = false;
+    const used = new Set();
     // A submit event (button click, Enter, requestSubmit) is cancelled before the page sees it,
-    // EXCEPT once: the event whose submitter is the button final_submit tagged with the secret.
+    // EXCEPT the events whose submitter carries a tag only Node can write: SECRET:1 for the
+    // approved click (final_submit) and SECRET:2 for the emailed security code (enter_code). Each
+    // tag passes ONCE; a page cannot mint a third.
     document.addEventListener('submit', (e) => {
       const s = e.submitter;
-      if (!used && s && s.getAttribute && s.getAttribute('data-sanctioned') === SECRET) {
-        used = true;
+      const tag = s && s.getAttribute ? s.getAttribute('data-sanctioned') : null;
+      if (tag && (tag === SECRET + ':1' || tag === SECRET + ':2') && !used.has(tag)) {
+        used.add(tag);
         try { window.__submitBlocked('sanctioned'); } catch (_) { /* page closing */ }
         return;
       }
@@ -301,7 +305,15 @@ async function arm(c) {
   return { armed: true };
 }
 
-async function watchProof(waitS) {
+// Greenhouse's emailed security code: the prompt text, and one single-character box per character.
+const CODE_PROMPT = /verification code was sent|enter the \d+-character code|security code/i;
+const codeBoxes = () => page.locator('input[maxlength="1"]:visible');
+async function codePrompt() {
+  const text = await page.evaluate(() => document.body ? document.body.innerText : '').catch(() => '');
+  return CODE_PROMPT.test(text) && (await codeBoxes().count()) >= 6;
+}
+
+async function watchProof(waitS, allowCode = true) {
   const until = Date.now() + Math.min(600, Math.max(1, waitS || 60)) * 1000;
   let excerpt = '';
   while (Date.now() < until) {
@@ -312,6 +324,7 @@ async function watchProof(waitS) {
       excerpt = m ? text.slice(Math.max(0, m.index - 80), m.index + 160).replace(/\s+/g, ' ').trim() : '';
       return { status: 'proof', url, excerpt };
     }
+    if (allowCode && stage === 'clicked' && await codePrompt()) return { status: 'code_step', url };
     // A CAPTCHA challenge a person must solve: the reCAPTCHA or hCaptcha challenge frame, visible.
     const challenge = await page.evaluate(() => [...document.querySelectorAll(
       'iframe[src*="recaptcha"][src*="bframe"], iframe[src*="hcaptcha"][src*="challenge"]')]
@@ -329,14 +342,47 @@ async function finalSubmit(c) {
   if (!a || a.nonce !== c.nonce || Date.now() > a.until) throw new Error('not armed for this nonce');
   const btn = page.locator(c.selector || 'button[type="submit"]').filter({ hasText: c.text ? new RegExp(c.text, 'i') : /submit/i }).first();
   if (await btn.count() === 0) throw new Error('no submit button matched');
-  await btn.evaluate((el, s) => el.setAttribute('data-sanctioned', s), secret);
+  await btn.evaluate((el, s) => el.setAttribute('data-sanctioned', s + ':1'), secret);
   openUntil = Date.now() + 15000;
+  stage = 'clicked';
   await btn.click();
   return { clicked: true, ...(await watchProof(c.wait_s || 60)) };
 }
 
+// The emailed security code (2026-10-08, authorized explicitly by the operator). Allowed only after the
+// approved click, only while the code prompt shows, once. The code comes from the relay (the run's
+// one released code); it is typed with real key events, read back, and only then is the ONE second
+// submit allowed. The code is never echoed in a reply.
+async function enterCode(c) {
+  if (stage !== 'clicked') throw new Error('enter_code is allowed only once, after the approved click');
+  const code = String(c.code || '');
+  if (!/^[A-Za-z0-9]{6,10}$/.test(code)) throw new Error('a code must be 6-10 letters or digits');
+  if (!(await codePrompt())) throw new Error('no security-code prompt on the page');
+  const boxes = codeBoxes();
+  const n = await boxes.count();
+  if (n !== code.length) throw new Error(`the page has ${n} code boxes for a ${code.length}-character code`);
+  stage = 'code_done';                                     // one attempt, whatever happens next
+  for (let i = 0; i < n; i++) {
+    await boxes.nth(i).click();
+    await boxes.nth(i).pressSequentially(code[i], { delay: 40 });
+  }
+  const held = (await boxes.evaluateAll((els) => els.map((e) => e.value))).join('');
+  if (held !== code) throw new Error('the code boxes do not read back the code; nothing submitted');
+  const btn = page.locator(c.selector || 'button[type="submit"]').filter({ hasText: /submit/i }).first();
+  if (await btn.count() === 0) throw new Error('no submit button matched');
+  await btn.evaluate((el, s) => el.setAttribute('data-sanctioned', s + ':2'), secret);
+  openUntil = Date.now() + 15000;
+  await btn.click();
+  const r = await watchProof(c.wait_s || 60, false);
+  // The reply becomes the run's proof record: a page or URL that repeats the code must not carry
+  // it into the relay's steps or the alerts.
+  const mask = (s) => (s || '').split(code).join(code.slice(0, 2) + '*'.repeat(code.length - 2));
+  return { entered: true, ...r, url: mask(r.url), excerpt: mask(r.excerpt) };
+}
+
 const handlers = { open, harvest, fill, readback, shot, arm,
                    final_submit: finalSubmit,
+                   enter_code: enterCode,
                    await_proof: async (c) => watchProof(c.wait_s || 600),
                    close: async () => { if (browser) await browser.close(); browser = null; return {}; } };
 

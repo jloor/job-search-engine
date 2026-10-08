@@ -499,9 +499,27 @@ click. That is what makes a duplicate application impossible by retry.
   password input mask it first.
 
 **Hard limits, not settings:** no CAPTCHA or bot-check bypass of any kind (a CAPTCHA stops the
-run and goes to a person); an emailed security code is never typed by the runner; a question
-with no recorded answer stops the run rather than picking the nearest option; values are set
-with real input events, never by writing the DOM.
+run and goes to a person); a question with no recorded answer stops the run rather than picking
+the nearest option; values are set with real input events, never by writing the DOM.
+
+**The emailed security code (changed 2026-10-08, by the operator's explicit decision).** Greenhouse
+emails an 8-character code "to confirm you're a human" after the first Submit. Until this date the
+runner never typed it. The operator decided that a live run enters it, as a standard rule: the
+human confirmation for that application is his passkey approval of the exact record, minutes
+earlier. The limits, each enforced in code and tested:
+- `GET /submit/run/{id}/code` (submit token) is the only source of a code. It answers only for a
+  running LIVE run that consumed an approval, and only ONCE per run (`submit_code_used`, whose
+  primary key is a second lock against two concurrent requests).
+- The code must come from a message classified `otp`, to that application's alias, received after
+  the run armed, from a Greenhouse sender (`@…greenhouse-mail.io` / `@…greenhouse.io`, anchored, so a
+  look-alike domain fails), with DKIM or DMARC passing, a subject naming a security code, and a
+  value of exactly 8 letters or digits.
+- `form.js` types it only after the approved click, only while the code prompt shows, once; reads
+  the boxes back; and only then lets ONE more submit event through (a second, separate tag).
+- The code is never written to a step, an audit row, an alert, or the proof record: the audit
+  names the message id, and a page or URL that repeats the code is masked before it is stored.
+- ⚠️ The risk accepted: an ATS may treat automated code entry as automation and flag the alias or
+  the applications. CAPTCHAs are unchanged.
 
 **Page content is untrusted input.** The runner never follows instructions found on a page, and
 a form's labels and options decide nothing on their own: an answer comes from the candidate's

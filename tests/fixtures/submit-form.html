@@ -43,6 +43,12 @@
   <div class="field"><label for="gender">Gender</label>
     <div class="select__control"><input class="select__input" id="gender"
       data-options="Man|Woman|Non-binary|Decline to self-identify"></div></div>
+  <div id="code-step" hidden>
+    <p>A verification code was sent to acme@jobs.example.com. To submit your application, enter the
+       8-character code to confirm you're a human.</p>
+    <label>Security code</label>
+    <div id="code-boxes"></div>
+  </div>
   <button type="submit">Submit application</button>
 </form>
 <script>
@@ -115,5 +121,27 @@
       fr.contentWindow.HTMLFormElement.prototype.submit.call(f);
     }
   });
+  // ?code=1: like Greenhouse, the FIRST submit sends a background request and shows an emailed
+  // security-code step with 8 one-character boxes; only a submit with all 8 filled posts the form.
+  if (new URLSearchParams(location.search).get('code') === '1') {
+    const form = document.getElementById('application');
+    const step = document.getElementById('code-step'), boxes = document.getElementById('code-boxes');
+    for (let i = 0; i < 8; i++) {
+      const b = document.createElement('input'); b.type = 'text'; b.maxLength = 1; b.size = 1;
+      b.addEventListener('input', () => { if (b.value && b.nextElementSibling) b.nextElementSibling.focus(); });
+      boxes.appendChild(b);
+    }
+    form.addEventListener('submit', (e) => {
+      if (step.hidden) {
+        e.preventDefault();
+        fetch('/request-code', { method: 'POST' });
+        step.hidden = false;
+        return;
+      }
+      const code = [...boxes.querySelectorAll('input')].map((b) => b.value).join('');
+      if (code.length !== 8) { e.preventDefault(); return; }
+      form.action = '/submitted?code=' + encodeURIComponent(code);
+    });
+  }
 </script>
 </body></html>

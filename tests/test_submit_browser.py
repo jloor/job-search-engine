@@ -14,6 +14,7 @@ Needs node and the browser/ dependencies (`npm ci` in job_search_engine/browser,
 Run:  python3 tests/test_submit_browser.py [--strict]
 """
 import http.server
+import json
 import pathlib
 import shutil
 import subprocess
@@ -219,6 +220,56 @@ try:
     check("🚨 while armed, the page's OWN submit attempts are still blocked",
           rb["blocked_submits"]["submit_events"] >= 1 and rb["blocked_submits"]["submit_calls"] >= 1
           and len(posts) == before)
+finally:
+    br.quit()
+
+print("\nthe emailed security code:")
+CODE = "AbCd1234"
+br = S.Browser("node")
+try:
+    br("open", url=URL + "?code=1", headed=False, settle=300)
+    before = len(posts)
+    try:
+        br("enter_code", code=CODE)
+        check("enter_code before the approved click is refused", False)
+    except RuntimeError as e:
+        check("enter_code before the approved click is refused", "only once, after the approved click" in str(e))
+    br("arm", nonce=NONCE)
+    r = br("final_submit", nonce=NONCE, wait_s=10)
+    check("the approved click reaches the code step (not proof, not a timeout)", r["status"] == "code_step")
+    check("…after exactly one background request, and no application POST yet",
+          posts[before:] == ["/request-code"])
+    try:
+        br("enter_code", code="AbCd123")
+        check("a 7-character code for 8 boxes is refused, nothing typed or sent", False)
+    except RuntimeError as e:
+        check("a 7-character code for 8 boxes is refused, nothing typed or sent",
+              "code boxes" in str(e) and posts[before:] == ["/request-code"])
+    r = br("enter_code", code=CODE)
+    check("🚨 the code is typed, read back, and the form posts ONCE more, with that code",
+          r["status"] == "proof" and posts[before:] == ["/request-code", f"/submitted?code={CODE}"])
+    check("the reply never echoes the code", CODE not in json.dumps(r))
+    try:
+        br("enter_code", code=CODE)
+        check("🚨 a second enter_code is refused (one code per run)", False)
+    except RuntimeError as e:
+        check("🚨 a second enter_code is refused (one code per run)", "only once" in str(e))
+    rb = br("readback")
+    check("both pass-throughs are counted as sanctioned", rb["blocked_submits"]["sanctioned"] >= 2)
+finally:
+    br.quit()
+br = S.Browser("node")
+try:
+    br("open", url=URL + "?code=1", headed=False, settle=300)
+    before = len(posts)
+    br("arm", nonce=NONCE)
+    br("final_submit", nonce=NONCE, wait_s=10)
+    for i, ch in enumerate(CODE):                               # the PAGE fills the boxes itself
+        br("fill", texts=[])
+    br("fill", texts=[{"id": "question_101", "value": "submit-me"}])
+    rb = br("readback")
+    check("🚨 at the code step, the page's own submit attempt is still blocked (no second tag minted)",
+          rb["blocked_submits"]["submit_events"] >= 1 and posts[before:] == ["/request-code"])
 finally:
     br.quit()
 

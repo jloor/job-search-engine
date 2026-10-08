@@ -977,3 +977,12 @@ CREATE TABLE IF NOT EXISTS submit_approval (
   consumed_run_id   INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_submit_approval_app ON submit_approval(application_id, id DESC);
+
+-- The ONE security code a live run may enter (2026-10-08, authorized explicitly by the operator). A row
+-- means the relay released message `message_id`'s code to run `run_id`; the PRIMARY KEY makes it
+-- once per run. The code itself is never copied here: it stays in message.otp_code.
+CREATE TABLE IF NOT EXISTS submit_code_used (
+  run_id      INTEGER PRIMARY KEY REFERENCES submit_run(id),
+  message_id  INTEGER NOT NULL REFERENCES message(id),
+  at          TEXT NOT NULL
+);

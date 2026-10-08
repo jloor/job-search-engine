@@ -108,6 +108,15 @@ class Relay:
     def submitted(self, run_id: int, **kw) -> None:
         self._call("POST", f"/submit/run/{run_id}/submitted", kw)
 
+    def code(self, run_id: int) -> dict | None:
+        """The run's ONE security code, or None while no qualifying mail has arrived (404)."""
+        try:
+            return self._call("GET", f"/submit/run/{run_id}/code")
+        except RuntimeError as e:
+            if f"/submit/run/{run_id}/code: 404" in str(e):
+                return None
+            raise
+
 
 # ── the browser ───────────────────────────────────────────────────────────────────────────
 class Browser:
@@ -253,12 +262,17 @@ def required_empty(page: list, fields: list) -> list:
 
 
 # ── one run ───────────────────────────────────────────────────────────────────────────────
+CODE_WAIT_S = 180                      # how long a run waits for the emailed security code
+CODE_POLL_S = 5
+
+
 class Run:
     def __init__(self, relay, browser_factory, cfg: dict, repo: Path, evidence: Path,
-                 headed: bool, opener=None, version: str = "", notify=None):
+                 headed: bool, opener=None, version: str = "", notify=None, sleep=time.sleep):
         self.relay, self.browser_factory, self.cfg = relay, browser_factory, cfg
         self.repo, self.evidence, self.headed = repo, evidence, headed
         self.opener, self.version, self.notify = opener, version, notify
+        self.sleep = sleep
         self.n = 0
 
     def _step(self, name: str, outcome: str, detail: str = "", shot: Path | None = None):
@@ -387,6 +401,22 @@ class Run:
             armed = True                       # from here on, a failure is 'unknown', never retried
             br("arm", nonce=nonce)
             r = br("final_submit", nonce=nonce, wait_s=60)
+            if r.get("status") == "code_step":
+                # The emailed security code (authorized explicitly by the operator, 2026-10-08): the
+                # relay releases this run's ONE code; it is never written to a step or an alert.
+                shot = self._shot(br, "code-step")
+                self._step(step, "ok", "the board asked for its emailed security code", shot)
+                got = None
+                for _ in range(int(CODE_WAIT_S / CODE_POLL_S)):
+                    got = self.relay.code(self.run_id)
+                    if got:
+                        break
+                    self.sleep(CODE_POLL_S)
+                if not got:
+                    r = {"status": "no_code"}
+                else:
+                    self._step(step, "ok", f"entering the code from message {got['message_id']}")
+                    r = br("enter_code", code=got["code"], wait_s=60)
             if r.get("status") == "human_step":
                 shot = self._shot(br, "human-step")
                 self._step(step, "ok", "a CAPTCHA appeared after the click; waiting for a person", shot)

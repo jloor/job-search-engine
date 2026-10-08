@@ -92,6 +92,15 @@ class Relay:
     def submitted(self, run_id, **kw):
         self.reported.append(kw)
 
+    code_after = 2                     # the qualifying mail "arrives" on the third poll
+    code_polls = 0
+
+    def code(self, run_id):
+        self.code_polls += 1
+        if self.code_after is None or self.code_polls <= self.code_after:
+            return None
+        return {"code": "AbCd1234", "message_id": 557}
+
 
 FIELDS = [{"id": "first_name", "name": "", "kind": "text", "label": "First Name", "required": True, "visible": True},
           {"id": "email", "name": "", "kind": "text", "label": "Email", "required": True, "visible": True},
@@ -143,6 +152,11 @@ class FakeBrowser:
             raise RuntimeError(f"form.js {cmd}: the browser died")
         if cmd == "arm":
             return {"ok": True, "armed": True}
+        if cmd == "enter_code":
+            self.code_given = kw.get("code")
+            return {"ok": True, "entered": True, "status": "proof",
+                    "url": "https://job-boards.greenhouse.io/acme/jobs/1001/confirmation",
+                    "excerpt": "Thank you for applying"}
         if cmd in ("final_submit", "await_proof"):
             return {"ok": True, "status": self.proof, "url": "https://job-boards.greenhouse.io/acme/jobs/1001/confirmation",
                     "excerpt": "Thank you for applying"}
@@ -165,12 +179,12 @@ ITEM = {"application_id": 42, "package_path": "applications/acme/role", "alias_u
         "url": "https://job-boards.greenhouse.io/acme/jobs/1001"}
 
 
-def run(browser=None, job=JOB, board_ok=True, cfg=CFG, item=None):
-    relay, alerts = Relay(), []
+def run(browser=None, job=JOB, board_ok=True, cfg=CFG, item=None, relay=None):
+    relay, alerts = relay or Relay(), []
     br = browser or FakeBrowser()
     ev = pathlib.Path(tempfile.mkdtemp())
     r = S.Run(relay, lambda: br, cfg, repo, ev, headed=False, opener=opener_for(job, board_ok),
-              version="test", notify=alerts.append).go(dict(item or ITEM))
+              version="test", notify=alerts.append, sleep=lambda s: None).go(dict(item or ITEM))
     return r, relay, br, alerts, ev
 
 
@@ -288,6 +302,23 @@ check("🚨 a crash after arming also closes UNKNOWN (the click may have happene
 r, relay, br, _, _ = run(item=LIVE, browser=FakeBrowser(proof="human_step"))
 check("a CAPTCHA after the click waits for a person, then takes the proof, without clicking again",
       br.sent.count("final_submit") == 1 and "await_proof" in br.sent and br.sent.count("arm") == 1)
+
+print("\nthe emailed security code:")
+r, relay, br, alerts, _ = run(item=LIVE, browser=FakeBrowser(proof="code_step"))
+check("a code step waits for the relay's code, enters it, and ends submitted",
+      r["outcome"] == "submitted" and relay.code_polls == 3 and br.code_given == "AbCd1234"
+      and br.sent.count("final_submit") == 1 and br.sent.count("enter_code") == 1)
+check("🚨 the code appears in NO step detail and NO alert",
+      all("AbCd1234" not in (s.get("detail") or "") for s in relay.steps)
+      and all("AbCd1234" not in json.dumps(a) for a in alerts))
+check("…while the step names the message the code came from",
+      any("message 557" in (s.get("detail") or "") for s in relay.steps))
+silent = Relay()
+silent.code_after = None
+r, relay, br, alerts, _ = run(item=LIVE, browser=FakeBrowser(proof="code_step"), relay=silent)
+check("🚨 no code within the wait: UNKNOWN, nothing typed, never retried",
+      r["outcome"] == "unknown" and "enter_code" not in br.sent and relay.closed["outcome"] == "unknown"
+      and relay.code_polls == S.CODE_WAIT_S // S.CODE_POLL_S)
 
 print("\na submit attempt on the page:")
 r, relay, _, _, _ = run(browser=FakeBrowser(blocked={"submit_events": 1, "submit_calls": 0,
