@@ -59,6 +59,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import answers as A                                             # noqa: E402
+import ashby as ASH                                             # noqa: E402
 import greenhouse as GH                                         # noqa: E402
 import record as R                                              # noqa: E402
 
@@ -92,6 +93,10 @@ class Relay:
     def next(self, app_id: int | None = None, mode: str = "shadow") -> dict | None:
         q = f"?mode={mode}" + (f"&app_id={int(app_id)}" if app_id is not None else "")
         return self._call("GET", "/submit/next" + q).get("next")
+
+    def next_all(self, ats: str) -> list:
+        """Every approved live item for one board, oldest approval first (a batch)."""
+        return self._call("GET", f"/submit/next?mode=live&ats={ats}&all=1").get("items") or []
 
     def open(self, **kw) -> int:
         return self._call("POST", "/submit/run", kw)["run_id"]
@@ -160,11 +165,14 @@ class Browser:
 COUNTRY_WIDE = re.compile(r"^(united states( of america)?|u\.?s\.?a?\.?)$", re.I)
 
 
-def check_gates(job_doc: dict, cfg: dict) -> None:
+def check_gates(job_doc: dict, cfg: dict, ats: str = "greenhouse") -> None:
     import comp as COMP
     import gates as G
-    desc = GH.description(job_doc)
-    loc = ((job_doc.get("location") or {}).get("name") or "").strip()
+    if ats == "ashby":
+        desc, loc = ASH.description(job_doc), ASH.location(job_doc)
+    else:
+        desc = GH.description(job_doc)
+        loc = ((job_doc.get("location") or {}).get("name") or "").strip()
     keep, why = G.gate({"location": loc, "title": job_doc.get("title") or "", "description": desc}, cfg)
     # ⚠️ THE RUNNER MUST NOT BE STRICTER THAN THE DECISION IT CARRIES OUT. gate() is the cheap
     # first filter: it keeps on evidence and leaves the rest to the remote reader, which an
@@ -243,6 +251,13 @@ def compare(decisions: list, fill_results: list, page: list, uploads: dict | Non
                 bad.append(f"{d.label or d.id}: the page does not hold {name}")
         elif f is None:
             bad.append(f"{d.label or d.id}: the field is gone from the page after the fill")
+        elif d.kind == "yesno":
+            if (f.get("value") or "") != d.value:
+                bad.append(f"{d.label or d.id}: reads {f.get('value') or 'nothing'!r}, wanted {d.value!r}")
+        elif d.kind == "checkgroup":
+            got_set = {x.strip().lower() for x in (f.get("value") or "").split("|") if x.strip()}
+            if got_set != {x.strip().lower() for x in d.spellings}:
+                bad.append(f"{d.label or d.id}: reads {f.get('value')!r}, wanted {' | '.join(d.spellings)!r}")
         elif d.kind in ("select", "native_select"):
             # Compared without whitespace: a board's two renderings of one option differ only in
             # spacing ("United States +1" / "United States+1"), the same rule form.js chooses by.
@@ -263,6 +278,7 @@ def required_empty(page: list, fields: list) -> list:
     for f in page:
         if f["id"] not in req:
             continue
+        # A yes/no or a checkbox group reads back as a value ("yes", "A | B"), so the value rule applies.
         empty = (not f.get("files")) if f.get("kind") == "file" else (
             not f.get("checked") if f.get("kind") in ("checkbox", "radio") else not (f.get("value") or "").strip())
         if empty:
@@ -276,15 +292,45 @@ CODE_POLL_S = 5
 CODE_RESENDS = 2                       # resend requests after a wait with no code (3 waits in all)
 CONFIRM_WAIT_S = 600                   # with no page proof, how long to watch for the confirmation email
 CONFIRM_POLL_S = 15
+HANDOFF_CLICKS = 3                     # a person's clicks the hand-off lets through (after a spam refusal)
+HANDOFF_ROUNDS = 2                     # further waits after a spam refusal or a CAPTCHA
+HANDOFF_AGAIN_S = 240                  # each of those waits
+
+
+def _handoff_seconds() -> int:
+    """SUBMIT_HANDOFF_SECONDS: how long a handed-off form waits for the person's click (30-600)."""
+    try:
+        return max(30, min(600, int(os.environ.get("SUBMIT_HANDOFF_SECONDS", "600") or 600)))
+    except ValueError:
+        return 600
+
+
+def VIEWER_URL() -> str:                                            # noqa: N802
+    """Where the person opens the virtual screen. Configuration of the host, never the engine's."""
+    return os.environ.get("SUBMIT_VIEWER_URL", "").strip()
+
+
+def ready_alert(items: list) -> dict:
+    n = len(items)
+    names = ", ".join(str(i.get("company") or f"APP {i['application_id']}") for i in items[:6])
+    return {"title": (f"Ready for your click: {n} application{'s' if n != 1 else ''}")[:200],
+            "message": (f"{names}. Each is filled and checked against the record you approved. "
+                        "Open the viewer and click Submit Application, once per form. Nothing is "
+                        "sent without your click.")[:400],
+            "priority": 5, "tags": ["robot", "point_right"],
+            **({"click": VIEWER_URL()} if VIEWER_URL() else {})}
 
 
 class Run:
     def __init__(self, relay, browser_factory, cfg: dict, repo: Path, evidence: Path,
-                 headed: bool, opener=None, version: str = "", notify=None, sleep=time.sleep):
+                 headed: bool, opener=None, version: str = "", notify=None, sleep=time.sleep,
+                 batch: bool = False):
         self.relay, self.browser_factory, self.cfg = relay, browser_factory, cfg
         self.repo, self.evidence, self.headed = repo, evidence, headed
         self.opener, self.version, self.notify = opener, version, notify
         self.sleep = sleep
+        self.batch = batch                   # a batch sends one "ready" alert for all its forms
+        self.handed_off = False
         self.n = 0
 
     def _step(self, name: str, outcome: str, detail: str = "", shot: Path | None = None):
@@ -304,7 +350,9 @@ class Run:
         pkg = self.repo / item["package_path"]
         self.mode = item.get("mode") or "shadow"
         live = self.mode == "live"
-        self.run_id = self.relay.open(application_id=app_id, ats="greenhouse", mode=self.mode,
+        ats = "ashby" if ASH.is_ashby(item["url"]) else "greenhouse"
+        self.handed_off = False
+        self.run_id = self.relay.open(application_id=app_id, ats=ats, mode=self.mode,
                                       record_fp=item.get("record_fp"),
                                       engine_version=self.version, host=socket.gethostname(),
                                       evidence_dir="")
@@ -313,21 +361,26 @@ class Run:
         self._step("claim", "ok", f"application {app_id} {item['url']} evidence {self.dir}")
         br, step, armed = None, "liveness", False
         try:
-            token, jid = GH.resolve(item["url"], self.opener)
+            M = ASH if ats == "ashby" else GH
+            if ats == "ashby":
+                token, jid = ASH.parse(item["url"])
+            else:
+                token, jid = GH.resolve(item["url"], self.opener)
             try:
-                job_doc = GH.job(token, jid, self.opener)
-            except GH.NotFound:
-                if GH.board_exists(token, self.opener):
+                job_doc = M.job(token, jid, self.opener)
+            except M.NotFound:
+                if M.board_exists(token, self.opener):
                     raise Stop(f"the job is gone from board {token!r} (the board answers)")
                 raise RuntimeError(f"board {token!r} does not answer; cannot judge liveness")
             self._step(step, "ok", f"{token}/{jid}: {job_doc.get('title')}")
 
             step = "gates"
-            check_gates(job_doc, self.cfg)
+            check_gates(job_doc, self.cfg, ats)
             self._step(step, "ok")
 
             step = "package"
-            api_q = GH.questions(job_doc)
+            # Ashby publishes no question API: the page alone describes the form.
+            api_q = GH.questions(job_doc) if ats == "greenhouse" else {}
             # The letter is checked when the form takes one: required, or offered and written.
             letter_slot = "cover_letter" in api_q
             needs_letter = letter_slot and api_q["cover_letter"]["required"]
@@ -340,7 +393,7 @@ class Run:
 
             step = "open"
             br = self.browser_factory()
-            o = br("open", url=GH.hosted_url(token, jid), headed=self.headed, settle=4500)
+            o = br("open", url=M.hosted_url(token, jid), headed=self.headed, settle=4500)
             h = br("harvest")
             if h.get("captcha"):
                 raise Stop("a CAPTCHA is on the page before any input; a person must solve it")
@@ -412,37 +465,17 @@ class Run:
             nonce = self.relay.arm(self.run_id, record_fp)
             armed = True                       # from here on, a failure is 'unknown', never retried
             br("arm", nonce=nonce)
-            r = br("final_submit", nonce=nonce, wait_s=60)
+            if ats == "ashby":
+                # ⭐ ASHBY: A PERSON CLICKS. Ashby refuses a scripted Submit as possible spam, and
+                # imitating a person to pass that check is evasion. The form is filled, proved to be
+                # the approved record, and handed to the operator for ONE real click in the viewer.
+                r = self._handoff(br, app_id, item, nonce, step)
+                if r.get("status") == "not_clicked":
+                    return r["done"]
+            else:
+                r = br("final_submit", nonce=nonce, wait_s=60)
             if r.get("status") == "code_step":
-                # The emailed security code (authorized explicitly by the operator, 2026-10-08): the
-                # relay releases this run's ONE code; it is never written to a step or an alert.
-                shot = self._shot(br, "code-step")
-                self._step(step, "ok", "the board asked for its emailed security code. The page: "
-                           f"{(r.get('excerpt') or '')[-400:]}", shot)
-                # Wait; if no code came, ask the board to resend it (a board may send none for a
-                # second attempt at one application, and a code sent before this run armed is never
-                # accepted), then wait again. At most CODE_RESENDS times.
-                got = None
-                for attempt in range(CODE_RESENDS + 1):
-                    for _ in range(int(CODE_WAIT_S / CODE_POLL_S)):
-                        got = self.relay.code(self.run_id)
-                        if got:
-                            break
-                        self.sleep(CODE_POLL_S)
-                    if got or attempt == CODE_RESENDS:
-                        break
-                    try:
-                        br("resend_code")
-                        self._step(step, "ok", f"no code after {CODE_WAIT_S} s; asked the board to "
-                                               f"resend it ({attempt + 1}/{CODE_RESENDS})")
-                    except RuntimeError as e:
-                        self._step(step, "ok", f"no code after {CODE_WAIT_S} s, and no resend: {e}")
-                        break
-                if not got:
-                    r = {"status": "no_code"}
-                else:
-                    self._step(step, "ok", f"entering the code from message {got['message_id']}")
-                    r = br("enter_code", code=got["code"], wait_s=60)
+                r = self._code(br, r, step)
             if r.get("status") == "human_step":
                 shot = self._shot(br, "human-step")
                 self._step(step, "ok", "a CAPTCHA appeared after the click; waiting for a person", shot)
@@ -500,10 +533,105 @@ class Run:
             if br is not None:
                 # 📌 Keep the filled form on the virtual screen for a person to inspect in the
                 # viewer. The run is already recorded and closed, and the page still cannot submit.
-                hold = _hold_seconds()
+                # A hand-off already held the form for the person, so it is not held twice.
+                hold = 0 if self.handed_off else _hold_seconds()
                 if hold:
                     time.sleep(hold)
                 br.quit()
+
+    def _code(self, br, r: dict, step: str) -> dict:
+        """The emailed security code (authorized explicitly by the operator, 2026-10-08, and for
+        Ashby the same day): the relay releases this run's ONE code; it is never written to a
+        step or an alert."""
+        shot = self._shot(br, "code-step")
+        self._step(step, "ok", "the board asked for its emailed security code. The page: "
+                   f"{(r.get('excerpt') or '')[-400:]}", shot)
+        # Wait; if no code came, ask the board to resend it (a board may send none for a second
+        # attempt at one application, and a code sent before this run armed is never accepted),
+        # then wait again. At most CODE_RESENDS times.
+        got = None
+        for attempt in range(CODE_RESENDS + 1):
+            for _ in range(int(CODE_WAIT_S / CODE_POLL_S)):
+                got = self.relay.code(self.run_id)
+                if got:
+                    break
+                self.sleep(CODE_POLL_S)
+            if got or attempt == CODE_RESENDS:
+                break
+            try:
+                br("resend_code")
+                self._step(step, "ok", f"no code after {CODE_WAIT_S} s; asked the board to "
+                                       f"resend it ({attempt + 1}/{CODE_RESENDS})")
+            except RuntimeError as e:
+                self._step(step, "ok", f"no code after {CODE_WAIT_S} s, and no resend: {e}")
+                break
+        if not got:
+            return {"status": "no_code"}
+        self._step(step, "ok", f"entering the code from message {got['message_id']}")
+        return br("enter_code", code=got["code"], wait_s=60)
+
+    def _handoff(self, br, app_id: int, item: dict, nonce: str, step: str) -> dict:
+        """Hand the filled, verified form to a person for ONE Submit click, and watch.
+
+        Returns the page state for the shared tail (proof, code_step, no_proof...), or
+        {"status": "not_clicked", "done": ...} when no click came and the page proves nothing
+        was attempted: then the relay keeps the approval for the next batch."""
+        hold = _handoff_seconds()
+        br("handoff", nonce=nonce, hold_s=hold, clicks=HANDOFF_CLICKS)
+        self.handed_off = True
+        shot = self._shot(br, "handed-off")
+        self._step(step, "ok", "filled, verified against the approved record, and handed to a "
+                               f"person for the Submit click; holding {hold} s", shot)
+        if self.notify and not self.batch:
+            self.notify(ready_alert([item]))
+        r = br("await_proof", wait_s=hold)
+        for _ in range(HANDOFF_ROUNDS):
+            st = r.get("status")
+            if st == "spam_refused":
+                shot = self._shot(br, "spam-refused")
+                self._step(step, "error", "Ashby refused the click as possible spam; NOTHING was sent. "
+                           "The form stays held for the person. The page: "
+                           f"{(r.get('excerpt') or '')[:300]}", shot)
+                if self.notify:
+                    self.notify({"title": f"Submitter: APP {app_id}: Ashby refused that click"[:200],
+                                 "message": "Ashby flagged the click as possible spam; nothing was sent. "
+                                            "You may click Submit Application once more in the viewer. "
+                                            "The runner never clicks.",
+                                 "priority": 5, "tags": ["robot", "warning"],
+                                 **({"click": VIEWER_URL()} if VIEWER_URL() else {})})
+            elif st == "human_step":
+                shot = self._shot(br, "human-step")
+                self._step(step, "ok", "a CAPTCHA appeared after the click; waiting for the person", shot)
+                if self.notify:
+                    self.notify({"title": f"Submitter: APP {app_id} needs you (CAPTCHA)"[:200],
+                                 "message": "Solve it in the viewer. The runner never clicks.",
+                                 "priority": 5, "tags": ["robot", "warning"],
+                                 **({"click": VIEWER_URL()} if VIEWER_URL() else {})})
+            else:
+                break
+            r = br("await_proof", wait_s=HANDOFF_AGAIN_S)
+        if r.get("status") == "no_proof":
+            c = br("readback").get("blocked_submits") or {}
+            if not any(c.get(k) for k in ("human_clicks", "sanctioned", "submit_events",
+                                          "submit_requests", "post_navigations", "submit_calls")):
+                shot = self._shot(br, "not-clicked")
+                self._step(step, "ok", f"no click within {hold} s; nothing was sent", shot)
+                out = self.relay.close(self.run_id, outcome="not_clicked", stop_step=step,
+                                       stop_reason=f"no click within {hold} s; nothing was sent",
+                                       counters=c) or {}
+                kept = bool(out.get("released"))
+                try:
+                    br("status", title="Not sent",
+                       text="No click came in time. Nothing was sent. "
+                            + ("Your approval is kept for the next batch." if kept else
+                               "The approval was NOT kept; approve the record again."))
+                except Exception:                                    # noqa: BLE001
+                    pass
+                return {"status": "not_clicked",
+                        "done": self._done(app_id, "not_clicked",
+                                           "no click; nothing sent; approval "
+                                           + ("kept for the next batch" if kept else "NOT kept"))}
+        return r
 
     def _safe_step(self, name, outcome, detail, br):
         shot = None
@@ -563,10 +691,6 @@ def cmd_once(a) -> int:
         print("another run holds the lock; no run")
         return 0
     relay = Relay(os.environ.get("SUBMIT_RELAY_URL", ""), os.environ.get("SUBMIT_TOKEN", ""))
-    item = relay.next(a.app, "live" if a.live else "shadow")
-    if not item:
-        print("nothing eligible")
-        return 0
     headed = os.environ.get("SUBMIT_HEADED", "1" if os.environ.get("DISPLAY") else "0") == "1"
     node = os.environ.get("SUBMIT_NODE", "node")
     notify = None
@@ -575,10 +699,47 @@ def cmd_once(a) -> int:
         notify = lambda payload: N.send(os.environ["NTFY_URL"], os.environ.get("NTFY_TOKEN", ""), payload)  # noqa: E731
     m = re.search(r'__version__\s*=\s*"([^"]+)"', (HERE / "__init__.py").read_text())
     version = m.group(1) if m else ""
+    if getattr(a, "batch", None):
+        return run_batch(relay, a.batch, lambda: Browser(node), cfg, repo, evidence, headed,
+                         version, notify)
+    item = relay.next(a.app, "live" if a.live else "shadow")
+    if not item:
+        print("nothing eligible")
+        return 0
     r = Run(relay, lambda: Browser(node), cfg, repo, evidence, headed,
             version=version, notify=notify).go(item)
     print(json.dumps(r))
     return 0 if r["outcome"] in ("shadow_complete", "submitted") else 3
+
+
+def run_batch(relay, ats: str, browser_factory, cfg, repo, evidence, headed, version, notify,
+              sleep=time.sleep) -> int:
+    """Every approved live item for one board, one after another, with ONE alert up front.
+
+    ⭐ WHY (2026-10-08). An Ashby form needs the operator's click. One alert and one viewer session
+    for several forms costs him seconds per application instead of a session each. The batch ends
+    at the first form nobody clicked: he has left, and the forms after it stay approved and
+    untouched (never armed)."""
+    if ats != "ashby":
+        raise SystemExit("a batch is for a board that needs a person's click: --batch ashby")
+    items = relay.next_all(ats)
+    if not items:
+        print("nothing approved for a batch")
+        return 0
+    if notify:
+        notify(ready_alert(items))
+    results = []
+    for item in items:
+        if killed():
+            print("kill switch: stopping the batch")
+            break
+        r = Run(relay, browser_factory, cfg, repo, evidence, headed, version=version,
+                notify=notify, sleep=sleep, batch=True).go(item)
+        results.append(r)
+        print(json.dumps(r))
+        if r["outcome"] == "not_clicked":
+            break
+    return 0 if all(r["outcome"] == "submitted" for r in results) else 3
 
 
 def main(argv=None) -> int:
@@ -590,6 +751,9 @@ def main(argv=None) -> int:
     o.add_argument("--live", action="store_true",
                    help="a LIVE run: only a draft whose exact record a person approved by passkey; "
                         "it fills, proves the page holds that record, and clicks Submit once")
+    o.add_argument("--batch", choices=["ashby"],
+                   help="every approved live application on this board, in turn; each form is "
+                        "handed to the operator for his own Submit click (one alert for all)")
     o.set_defaults(fn=cmd_once)
     a = ap.parse_args(argv)
     return a.fn(a)

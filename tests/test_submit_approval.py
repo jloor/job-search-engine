@@ -358,5 +358,72 @@ mail(925, "2099-01-01T00:02:00+00:00", cls="confirmation", subj="Thank you for a
 r, e = call(app.submit_run_confirmation, live3, Req(), authorization=S)
 check("the qualifying confirmation is proof", e is None and r["message_id"] == 925)
 
+print("\nAshby: eligibility, the batch, and the 'not_clicked' release (2026-10-08):")
+AURL = "https://jobs.ashbyhq.com/acme/11111111-2222-4333-8444-555555555555"
+with app.db() as con:
+    for i in (5, 6):
+        con.execute("INSERT INTO posting(id, company_id, title, canonical_url, captured_at) "
+                    "VALUES (?, 1, 'Role', ?, '2026-10-01')", (i, AURL + ("" if i == 5 else "6")))
+        con.execute("INSERT INTO application(id, posting_id, status, package_path, alias_used, company_raw, "
+                    "role_raw) VALUES (?, ?, 'draft', 'applications/acme/x', 'acme5@jobs.example.com', 'Acme', 'Role')",
+                    (i, i))
+nxt = call(app.submit_next, Req(), authorization=S, app_id=5)[0]["next"]
+check("an Ashby draft is eligible for a shadow run, marked ats=ashby", nxt and nxt["ats"] == "ashby")
+fp5, fp6 = R.fingerprint(5, AURL, F, FILES), R.fingerprint(6, AURL + "6", F, FILES)
+toks = {}
+for aid, fpx in ((5, fp5), (6, fp6)):
+    s = call(app.submit_run_open, Req({"application_id": aid, "mode": "shadow"}), authorization=S)[0]["run_id"]
+    toks[aid] = call(app.submit_run_close, s, Req({"outcome": "shadow_complete", "record_fp": fpx,
+                                                   "record": {"fields": F, "files": FILES}}),
+                     authorization=S)[0]["approval_url"].rsplit("/", 1)[1]
+    o, _ = call(app.submit_approve_options, toks[aid], Req())
+    call(app.submit_approve_verify, toks[aid], Req(yk.get(o, count=200 + aid)))
+b, e = call(app.submit_next, Req(), authorization=S, mode="live", ats="ashby", all=1)
+check("a batch lists every approved Ashby application, oldest approval first, with its company",
+      e is None and [i["application_id"] for i in b["items"]] == [5, 6] and b["items"][0]["company"] == "Acme")
+_, e = call(app.submit_next, Req(), authorization=S, mode="live", ats="greenhouse", all=1)
+check("a batch is refused for a board that needs no person's click (400)", e == 400)
+_, e = call(app.submit_next, Req(), authorization=S, mode="shadow", ats="ashby", all=1)
+check("a batch is live only (400)", e == 400)
+ZERO = {k: 0 for k in app.SUBMIT_CLICK_COUNTERS}
+
+
+def live_armed(aid, fpx):
+    rid = call(app.submit_run_open, Req({"application_id": aid, "mode": "live", "record_fp": fpx}),
+               authorization=S)[0]["run_id"]
+    call(app.submit_run_arm, rid, Req({"record_fp": fpx}), authorization=S)
+    return rid
+
+
+r5 = live_armed(5, fp5)
+for bad, why in ((dict(ZERO, human_clicks=1), "a person's click"), (dict(ZERO, sanctioned=1), "a request let through"),
+                 (dict(ZERO, submit_events=1), "a blocked attempt"), (None, "no counters at all")):
+    _, e = call(app.submit_run_close, r5, Req({"outcome": "not_clicked", **({"counters": bad} if bad is not None else {})}),
+                authorization=S)
+    check(f"🚨 'not_clicked' is refused when the page recorded {why} (400)", e == 400)
+r, e = call(app.submit_run_close, r5, Req({"outcome": "not_clicked", "counters": ZERO}), authorization=S)
+with app.db() as con:
+    st = con.execute("SELECT status, consumed_run_id FROM submit_approval WHERE application_id=5 "
+                     "ORDER BY id DESC LIMIT 1").fetchone()
+check("no click, zero counters: closed not_clicked and the approval is back to approved",
+      e is None and r.get("released") is True and dict(st) == {"status": "approved", "consumed_run_id": None})
+nxt = call(app.submit_next, Req(), authorization=S, app_id=5, mode="live")[0]["next"]
+check("…so the next live run is offered it again", nxt and nxt["record_fp"] == fp5)
+r6 = live_armed(6, fp6)
+with app.db() as con:
+    con.execute("INSERT INTO message(id, received_at, to_alias, from_addr, subject, raw_payload, classification, "
+                "otp_code, auth_dkim, auth_dmarc) VALUES (990, '2099-02-01T00:00:00+00:00', 'acme5@jobs.example.com', "
+                "'no-reply@ashbyhq.com', 'Your security code', '{}', 'otp', 'Zz12Yy34', 'pass', 'pass')")
+r, e = call(app.submit_run_code, r6, Req(), authorization=S)
+check("an Ashby sender's code is released to the run that armed (the operator's rule)", e is None and r["message_id"] == 990)
+_, e = call(app.submit_run_close, r6, Req({"outcome": "not_clicked", "counters": ZERO}), authorization=S)
+check("🚨 a run that was released a security code can never close not_clicked (400)", e == 400)
+with app.db() as con:
+    con.execute("INSERT INTO message(id, received_at, to_alias, from_addr, subject, raw_payload, classification, "
+                "otp_code, auth_dkim, auth_dmarc) VALUES (991, '2099-02-01T00:01:00+00:00', 'acme5@jobs.example.com', "
+                "'no-reply@ashbyhq.com.evil.example', 'Thank you for applying', '{}', 'confirmation', NULL, 'pass', 'pass')")
+_, e = call(app.submit_run_confirmation, r6, Req(), authorization=S)
+check("a look-alike Ashby sender is not proof", e == 404)
+
 print(f"\n{'FAILED: ' + str(len(fails)) if fails else 'all passed'}")
 sys.exit(1 if fails else 0)

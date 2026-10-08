@@ -11786,16 +11786,28 @@ def _mcp_call(name: str, args: dict) -> str:
 SUBMIT_MODES = ("shadow", "live")
 # What a runner may close a run with. 'submitted' is NOT here: only the submitted route sets it.
 # 'unknown' is a live run that clicked and saw no proof; it is never retried (the approval is spent).
-SUBMIT_OUTCOMES = ("shadow_complete", "stopped", "error", "unknown")
+SUBMIT_OUTCOMES = ("shadow_complete", "stopped", "error", "unknown", "not_clicked")
+# 'not_clicked' (2026-10-08, Ashby hand-off): the form was handed to the operator and no click came.
+# The page counted zero clicks and zero submit attempts, so nothing was sent, and the operator
+# decided the approval goes back to 'approved' for the next batch. Refused when any counter is
+# non-zero or the run was released a security code: then a click happened, and the run is 'unknown'.
+SUBMIT_CLICK_COUNTERS = ("human_clicks", "sanctioned", "submit_events", "submit_requests",
+                         "post_navigations", "submit_calls")
 SUBMIT_APPROVAL_TTL_S = 24 * 3600
 SUBMIT_ARM_WINDOW_S = 300                        # arm to proof: one form, one click
 SUBMIT_STEP_OUTCOMES = ("ok", "stop", "error")
 SUBMIT_RUN_STALE_S = 2 * 3600                    # a run still 'running' after this is abandoned
 SUBMIT_ERROR_RETRIES = 3                         # 'error' runs allowed before a draft is skipped
 
-# Greenhouse only for now: hosted boards and the gh_jid embed on an employer's own site.
+# Greenhouse (hosted boards and the gh_jid embed) and, since 2026-10-08, Ashby, whose live runs
+# hand the form to the operator for his own Submit click (see submit.py).
 _SUBMIT_ATS_SQL = ("(p.canonical_url LIKE '%greenhouse.io/%' "
-                   "OR p.canonical_url LIKE '%gh_jid=%')")
+                   "OR p.canonical_url LIKE '%gh_jid=%' "
+                   "OR p.canonical_url LIKE '%jobs.ashbyhq.com/%')")
+
+
+def _submit_ats(url: str | None) -> str:
+    return "ashby" if "jobs.ashbyhq.com/" in (url or "") else "greenhouse"
 
 
 def _submit_eligible(con, app_id: int | None = None, mode: str = "shadow") -> dict | None:
@@ -11833,12 +11845,19 @@ def _submit_eligible(con, app_id: int | None = None, mode: str = "shadow") -> di
     if row is None:
         return None
     return {"application_id": row["id"], "package_path": row["package_path"],
-            "alias_used": row["alias_used"], "url": row["url"], "ats": "greenhouse"}
+            "alias_used": row["alias_used"], "url": row["url"], "ats": _submit_ats(row["url"])}
 
 
 def _submit_eligible_live(con, app_id, stale) -> dict | None:
+    rows = _submit_live_items(con, app_id, stale, None, 1)
+    return rows[0] if rows else None
+
+
+def _submit_live_items(con, app_id, stale, ats: str | None, limit: int) -> list:
+    """Approved live items, newest approval first for one application, oldest first for a batch.
+    A batch (ats given) is one board's approved applications, each at most once."""
     sql = (
-        "SELECT a.id, a.package_path, a.alias_used, p.canonical_url AS url, "
+        "SELECT a.id, a.package_path, a.alias_used, a.company_raw, p.canonical_url AS url, "
         "  s.id AS approval_id, s.record_fp, s.record_json "
         "FROM application a JOIN posting p ON p.id = a.posting_id "
         "JOIN submit_approval s ON s.application_id = a.id "
@@ -11851,15 +11870,20 @@ def _submit_eligible_live(con, app_id, stale) -> dict | None:
     if app_id is not None:
         sql += "AND a.id = ? "
         params.append(int(app_id))
-    sql += "ORDER BY s.id DESC LIMIT 1"
-    row = con.execute(sql, tuple(params)).fetchone()
-    if row is None:
-        return None
-    rec = json.loads(row["record_json"])
-    return {"application_id": row["id"], "package_path": row["package_path"],
-            "alias_used": row["alias_used"], "url": row["url"], "ats": "greenhouse",
-            "mode": "live", "approval_id": row["approval_id"], "record_fp": row["record_fp"],
-            "files": rec.get("files") or {}}
+    sql += "ORDER BY s.id " + ("ASC" if ats else "DESC")
+    out, seen = [], set()
+    for row in con.execute(sql, tuple(params)).fetchall():
+        if row["id"] in seen or (ats and _submit_ats(row["url"]) != ats):
+            continue
+        seen.add(row["id"])
+        rec = json.loads(row["record_json"])
+        out.append({"application_id": row["id"], "package_path": row["package_path"],
+                    "alias_used": row["alias_used"], "url": row["url"], "ats": _submit_ats(row["url"]),
+                    "company": row["company_raw"], "mode": "live", "approval_id": row["approval_id"],
+                    "record_fp": row["record_fp"], "files": rec.get("files") or {}})
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _submit_open(con, p: dict) -> int:
@@ -11956,6 +11980,15 @@ def _submit_close(con, run_id: int, p: dict) -> str | None:
         raise HTTPException(400, "only a shadow run closes shadow_complete")
     if outcome == "unknown" and run["mode"] != "live":
         raise HTTPException(400, "only a live run closes unknown")
+    if outcome == "not_clicked":
+        if run["mode"] != "live":
+            raise HTTPException(400, "only a live run closes not_clicked")
+        c = p.get("counters")
+        if not isinstance(c, dict) or any(int(c.get(k) or 0) for k in SUBMIT_CLICK_COUNTERS):
+            raise HTTPException(400, "a click or a submit attempt was recorded (or none reported): "
+                                     "close the run 'unknown', never 'not_clicked'")
+        if con.execute("SELECT 1 FROM submit_code_used WHERE run_id=?", (int(run_id),)).fetchone():
+            raise HTTPException(400, "this run was released a security code: a click happened")
     token = None
     if outcome == "shadow_complete" and p.get("record") is not None and run["outcome"] == "running":
         token = _submit_approval_create(con, run, p["record"], str(p.get("record_fp") or ""))
@@ -11967,6 +12000,19 @@ def _submit_close(con, run_id: int, p: dict) -> str | None:
     if not n:
         raise HTTPException(409, f"run {run_id} is already closed")
     return token
+
+
+def _submit_release(con, run_id: int) -> bool:
+    """After a 'not_clicked' close: the approval this run consumed goes back to 'approved', once,
+    if it has not expired. Returns whether it was released."""
+    run = _submit_run_row(con, run_id)
+    if run["outcome"] != "not_clicked":
+        return False
+    n = con.execute(
+        "UPDATE submit_approval SET status='approved', consumed_at=NULL, consumed_run_id=NULL "
+        "WHERE consumed_run_id=? AND status='consumed' AND expires_at > ?",
+        (int(run_id), int(time.time()))).rowcount
+    return bool(n)
 
 
 def _submit_clear(con, app_id: int, note: str) -> int:
@@ -12007,11 +12053,17 @@ async def submit_clear(app_id: int, request: Request, authorization: str | None 
 
 @app.get("/submit/next")
 def submit_next(request: Request, authorization: str | None = Header(None), app_id: int | None = None,
-                mode: str = "shadow"):
+                mode: str = "shadow", ats: str | None = None, all: int = 0):  # noqa: A002
     require_submit(authorization, request)
     if mode not in SUBMIT_MODES:
         raise HTTPException(400, f"mode must be one of {SUBMIT_MODES}")
     with db() as con:
+        if all:
+            # A batch: every approved live item for one board (the operator clicks each).
+            if mode != "live" or ats not in ("ashby",):
+                raise HTTPException(400, "a batch is live and for one board that needs a person's click: ats=ashby")
+            stale = (datetime.now(timezone.utc) - timedelta(seconds=SUBMIT_RUN_STALE_S)).isoformat(timespec="seconds")
+            return {"items": _submit_live_items(con, None, stale, ats, 25)}
         return {"next": _submit_eligible(con, app_id, mode)}
 
 
@@ -12039,11 +12091,17 @@ async def submit_run_step(run_id: int, request: Request, authorization: str | No
 async def submit_run_close(run_id: int, request: Request, authorization: str | None = Header(None)):
     require_submit(authorization, request)
     p = await request.json()
+    released = False
     with db() as con:
         token = _submit_close(con, run_id, p)
         log_event(con, "submit_run_close", f"run {run_id} {p.get('outcome')} "
                   f"{(p.get('stop_step') or '')}".strip(), client_ip(request))
-    out = {"ok": True}
+        if p.get("outcome") == "not_clicked":
+            released = _submit_release(con, run_id)
+            log_event(con, "submit_approval_released" if released else "submit_approval_not_released",
+                      f"run {run_id}: no click, nothing sent; approval "
+                      f"{'back to approved' if released else 'not released (expired?)'}", client_ip(request))
+    out = {"ok": True, **({"released": released} if p.get("outcome") == "not_clicked" else {})}
     if token:
         url = f"{PUBLIC_URL}/submit/approve/{token}"
         out["approval_url"] = url
@@ -12184,7 +12242,9 @@ async def submit_run_arm(run_id: int, request: Request, authorization: str | Non
 # approval of the exact record. This route is the ONLY source of a code, and it answers once per
 # run, for the run that consumed the approval, from mail that arrived AFTER it armed, to that
 # application's alias, from Greenhouse, with DKIM or DMARC passing. CAPTCHAs stay with a person.
-SUBMIT_CODE_SENDERS = re.compile(r"@(?:[a-z0-9-]+\.)*greenhouse(?:-mail)?\.io$", re.I)
+# The operator extended the same rule to Ashby the same day (its hand-off: he clicks, the runner
+# enters the code). The senders are anchored, so a look-alike domain fails.
+SUBMIT_CODE_SENDERS = re.compile(r"@(?:[a-z0-9-]+\.)*(?:greenhouse(?:-mail)?\.io|ashbyhq\.com)$", re.I)
 SUBMIT_CODE_RE = re.compile(r"^[A-Za-z0-9]{8}$")
 
 

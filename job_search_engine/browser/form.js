@@ -8,6 +8,9 @@
 //   {"cmd":"fill","files":[],"selects":[],"checks":[],"texts":[]} -> {ok,results:[...]}
 //   {"cmd":"readback"}                                   -> {ok,fields:[...],blocked_submits}
 //   {"cmd":"shot","path":...}                            -> {ok,path}
+//   {"cmd":"handoff","nonce":..,"hold_s":n,"clicks":n}   -> {ok,handed_off}  (Ashby: a PERSON clicks)
+//   {"cmd":"status","title":..,"text":..}                -> {ok}   a status screen for the viewer
+//   {"cmd":"front"}                                      -> {ok}   the form back in front
 //   {"cmd":"close"}                                      -> {ok}
 // A failure is {ok:false,error}. The process never exits on a bad command.
 //
@@ -36,7 +39,10 @@ const readline = require('readline');
 const { chromium } = require('playwright');
 
 const crypto = require('crypto');
-const fresh = () => ({ submit_events: 0, submit_calls: 0, post_navigations: 0, sanctioned: 0 });
+// submit_requests: Ashby-style submit requests aborted at the network. human_clicks: trusted clicks
+// on the handed-off Submit button (a person's), which are the ONLY way an Ashby form submits.
+const fresh = () => ({ submit_events: 0, submit_calls: 0, post_navigations: 0, sanctioned: 0,
+                       submit_requests: 0, human_clicks: 0 });
 let browser = null, page = null, blocked = fresh();
 let secret = '', armed = null, openUntil = 0;              // the one sanctioned click
 let stage = 'idle';                                        // idle -> clicked -> code_done
@@ -51,10 +57,44 @@ async function open(c) {
   browser = await chromium.launch({ headless: !c.headed });
   page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   blocked = fresh(); armed = null; openUntil = 0; stage = 'idle'; resends = 0;
+  refusalShown = false; statusPage = null;
   secret = crypto.randomBytes(16).toString('hex');
-  await page.exposeFunction('__submitBlocked', (kind) => { blocked[kind] += 1; });
+  await page.exposeFunction('__submitBlocked', (kind) => {
+    blocked[kind] += 1;
+    if (kind === 'human_clicks' && stage === 'handed_off') stage = 'clicked';
+  });
   await page.addInitScript((SECRET) => {
     const used = new Set();
+    // ⭐ THE ASHBY HAND-OFF (2026-10-08). Ashby's buttons sit OUTSIDE any <form>, so its Submit
+    // fires no submit event and the listener below never sees it. A capture-phase CLICK guard
+    // covers a Submit-like button outside a form: every click on it is cancelled before the page
+    // sees it, EXCEPT a TRUSTED click (a person's real input; a page script's button.click() is
+    // untrusted) on the button Node tagged for the hand-off, while the hand-off budget lasts.
+    // The runner never clicks it. Imitating a person to pass Ashby's bot check is not done here.
+    let hand = { tag: null, budget: 0 };
+    window.__setHandoff = (s, tag, n) => { if (s !== SECRET) return false; hand = { tag, budget: n }; return true; };
+    const isLooseSubmit = (b) => b && b.tagName === 'BUTTON' && !b.closest('form')
+      && (b.classList.contains('ashby-application-form-submit-button')
+          || /^\s*submit(\s+application)?\s*$/i.test(b.innerText || ''));
+    window.addEventListener('click', (e) => {
+      const b = e.target && e.target.closest ? e.target.closest('button') : null;
+      if (!isLooseSubmit(b)) return;
+      // The runner's ONE click after it typed the emailed code (enter_code), counted as the
+      // runner's, never as the person's.
+      const t2 = b.getAttribute('data-sanctioned');
+      if (e.isTrusted && t2 === SECRET + ':2' && !used.has(t2)) {
+        used.add(t2);
+        try { window.__submitBlocked('sanctioned'); } catch (_) { /* page closing */ }
+        return;
+      }
+      if (e.isTrusted && hand.tag && b.getAttribute('data-handoff') === hand.tag && hand.budget > 0) {
+        hand.budget -= 1;
+        try { window.__submitBlocked('human_clicks'); } catch (_) { /* page closing */ }
+        return;
+      }
+      e.preventDefault(); e.stopImmediatePropagation();
+      try { window.__submitBlocked('submit_events'); } catch (_) { /* page closing */ }
+    }, true);
     // A submit event (button click, Enter, requestSubmit) is cancelled before the page sees it,
     // EXCEPT the events whose submitter carries a tag only Node can write: SECRET:1 for the
     // approved click (final_submit) and SECRET:2 for the emailed security code (enter_code). Each
@@ -77,6 +117,19 @@ async function open(c) {
   }, secret);
   await page.route('**/*', (route) => {
     const r = route.request();
+    // Ashby submits with a request, not a navigation: a non-GET XHR or fetch that names a submit
+    // operation is aborted unless a person's click was handed the form (defense in depth behind
+    // the click guard; uploads and other operations pass).
+    if (r.method() !== 'GET' && ['xhr', 'fetch'].includes(r.resourceType())) {
+      const body = r.postData() || '';
+      if (/[?&]op(?:erationName)?=[^&]*submit/i.test(r.url()) || /"operationName"\s*:\s*"[^"]*submit/i.test(body)) {
+        if (Date.now() < openUntil && ['handed_off', 'clicked', 'code_done'].includes(stage)) {
+          blocked.sanctioned += 1; return route.continue();
+        }
+        blocked.submit_requests += 1;
+        return route.abort('blockedbyclient');
+      }
+    }
     if (r.method() !== 'GET' && r.isNavigationRequest() && r.frame() === page.mainFrame()) {
       if (Date.now() < openUntil) { blocked.sanctioned += 1; return route.continue(); }
       blocked.post_navigations += 1;
@@ -99,9 +152,32 @@ async function harvest() {
       return clean(el.getAttribute('aria-label') || '');
     };
     const fields = [];
+    // ⭐ ASHBY WIDGETS (2026-10-08). A yes/no question is two buttons over a hidden checkbox whose
+    // NAME is the question id; a checkbox group is a fieldset of options. Each is ONE field here,
+    // keyed by the question id, labelled by its question title. "Required" is a class on the title,
+    // not an attribute.
+    const ashbyTitle = (qid) => document.querySelector(`label[for="${CSS.escape(qid)}"]`);
+    const ashbyReq = (lab) => !!lab && /_required/.test(lab.className || '');
+    document.querySelectorAll('.ashby-application-form-input-yesno').forEach((w) => {
+      const cb = w.querySelector('input[type=checkbox][name]');
+      if (!cb) return;
+      const lab = ashbyTitle(cb.name);
+      fields.push({ id: cb.name, name: cb.name, kind: 'yesno', label: clean(lab ? lab.innerText : ''),
+                    required: ashbyReq(lab), visible: true });
+    });
+    document.querySelectorAll('fieldset.ashby-application-form-input-checkbox-group').forEach((fs) => {
+      const lab = fs.querySelector('.ashby-application-form-question-title');
+      const qid = lab && lab.getAttribute('for');
+      if (!qid) return;
+      const options = [...fs.querySelectorAll('input[type=checkbox]')]
+        .map((i) => clean(i.labels && i.labels[0] ? i.labels[0].innerText : i.name)).filter(Boolean);
+      fields.push({ id: qid, name: qid, kind: 'checkgroup', label: clean(lab.innerText),
+                    required: ashbyReq(lab), options, visible: true });
+    });
     document.querySelectorAll('input, textarea, select').forEach((el) => {
       const type = (el.type || el.tagName).toLowerCase();
       if (['hidden', 'submit', 'button', 'search', 'password'].includes(type)) return;
+      if (el.closest('.ashby-application-form-input-yesno, fieldset.ashby-application-form-input-checkbox-group')) return;
       if (!el.id) return;                                   // nothing to address it by
       if (/^iti-/.test(el.id) || /recaptcha/i.test(el.id + ' ' + el.name)) return;
       let kind = type;
@@ -211,6 +287,33 @@ async function fill(c) {
     const r = await chooseOption(s.id, s.values || []);
     results.push({ id: s.id, kind: 'select', ...r });
   }
+  for (const y of c.yesnos || []) {                         // 2b. Ashby yes/no, by question id
+    const w = page.locator('.ashby-application-form-input-yesno').filter({ has: page.locator(`input[name=${JSON.stringify(y.id)}]`) }).first();
+    if (await w.count() === 0) { results.push({ id: y.id, kind: 'yesno', status: 'not_found' }); continue; }
+    const want = String(y.value).toLowerCase();
+    if (!['yes', 'no'].includes(want)) { results.push({ id: y.id, kind: 'yesno', status: 'bad_value' }); continue; }
+    await w.locator(`button[data-option="${want}"]`).click();
+    await page.waitForTimeout(300);
+    const on = await w.locator('button[aria-pressed="true"]').getAttribute('data-option').catch(() => null);
+    results.push({ id: y.id, kind: 'yesno', status: on === want ? 'set' : 'not_set', chosen: on || '' });
+  }
+  for (const g of c.groups || []) {                         // 2c. Ashby checkbox group, by question id
+    const fs = page.locator('fieldset.ashby-application-form-input-checkbox-group')
+      .filter({ has: page.locator(`label[for=${JSON.stringify(g.id)}]`) }).first();
+    if (await fs.count() === 0) { results.push({ id: g.id, kind: 'checkgroup', status: 'not_found' }); continue; }
+    const boxes = fs.locator('input[type=checkbox]');
+    const labels = (await boxes.evaluateAll((els) => els.map((e) => (e.labels && e.labels[0] ? e.labels[0].innerText : e.name).replace(/\s+/g, ' ').trim())));
+    let missing = null;
+    for (const want of g.values || []) {
+      const i = labels.findIndex((l) => l.toLowerCase() === String(want).trim().toLowerCase());
+      if (i < 0) { missing = want; break; }
+      if (!(await boxes.nth(i).isChecked())) await boxes.nth(i).check({ force: true });
+    }
+    const chosen = (await boxes.evaluateAll((els) => els.filter((e) => e.checked)
+      .map((e) => (e.labels && e.labels[0] ? e.labels[0].innerText : e.name).replace(/\s+/g, ' ').trim()))).join(' | ');
+    results.push({ id: g.id, kind: 'checkgroup', status: missing ? 'no_option' : 'set', chosen,
+                   ...(missing ? { options: labels } : {}) });
+  }
   for (const k of c.checks || []) {                         // 3. checkboxes and radios, by id
     const el = page.locator(attr(k.id)).first();
     if (await el.count() === 0) { results.push({ id: k.id, kind: 'check', status: 'not_found' }); continue; }
@@ -237,9 +340,26 @@ async function readback(c) {
   const fields = await page.evaluate(() => {
     const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
     const out = [];
+    // Ashby yes/no: the pressed button IS the answer (read state, not styling: aria-pressed).
+    document.querySelectorAll('.ashby-application-form-input-yesno').forEach((w) => {
+      const cb = w.querySelector('input[type=checkbox][name]');
+      if (!cb) return;
+      const on = w.querySelector('button[aria-pressed="true"]');
+      out.push({ id: cb.name, kind: 'yesno', label: '', value: on ? on.getAttribute('data-option') : '' });
+    });
+    // Ashby checkbox group: the ticked options, in page order.
+    document.querySelectorAll('fieldset.ashby-application-form-input-checkbox-group').forEach((fs) => {
+      const lab = fs.querySelector('.ashby-application-form-question-title');
+      const qid = lab && lab.getAttribute('for');
+      if (!qid) return;
+      const on = [...fs.querySelectorAll('input[type=checkbox]')].filter((i) => i.checked)
+        .map((i) => clean(i.labels && i.labels[0] ? i.labels[0].innerText : i.name));
+      out.push({ id: qid, kind: 'checkgroup', label: clean(lab.innerText), value: on.join(' | ') });
+    });
     document.querySelectorAll('input, textarea, select').forEach((el) => {
       const type = (el.type || el.tagName).toLowerCase();
       if (!el.id || ['hidden', 'submit', 'button', 'search', 'password'].includes(type)) return;
+      if (el.closest('.ashby-application-form-input-yesno, fieldset.ashby-application-form-input-checkbox-group')) return;
       if (/^iti-/.test(el.id) || /recaptcha/i.test(el.id + ' ' + el.name)) return;
       const label = clean(el.labels && el.labels[0] ? el.labels[0].innerText : '').replace(/\s*\*\s*$/, '');
       const f = { id: el.id, label };
@@ -297,7 +417,12 @@ async function shot(c) {
 }
 
 // ── the last mile ────────────────────────────────────────────────────────────────────────
-const PROOF = /thank you for (applying|your application|your interest)|application (has been |was )?(submitted|received)|we(?:'|’)ve received your application/i;
+// Ashby's own wording is "Your application was successfully submitted"; its URL does not change.
+const PROOF = /thank you for (applying|your application|your interest)|thanks for applying|application (has been |was )?(successfully )?(submitted|received)|successfully submitted|submission successful|we(?:'|’)ve received your application/i;
+// Ashby's refusal of a submit as possible spam. NOTHING was sent. Recorded and shown to the person;
+// the runner never clicks again and never follows the page's advice (other browser, VPN off).
+const SPAM = /flagged as possible spam|couldn.t submit|could not submit/i;
+let refusalShown = false;
 
 async function arm(c) {
   if (!/^[0-9a-f]{32}$/.test(String(c.nonce || ''))) throw new Error('arm needs the relay nonce');
@@ -342,6 +467,17 @@ async function watchProof(waitS, allowCode = true) {
       return { status: 'proof', url, excerpt };
     }
     if (allowCode && stage === 'clicked' && await codePrompt()) return { status: 'code_step', url, excerpt: await formTail() };
+    // A spam refusal after a person's click: reported once per appearance, so a second click by
+    // the person that is refused again is reported again.
+    if (stage === 'clicked') {
+      const sp = text.match(SPAM);
+      if (sp && !refusalShown) {
+        refusalShown = true;
+        return { status: 'spam_refused', url,
+                 excerpt: text.slice(Math.max(0, sp.index - 80), sp.index + 200).replace(/\s+/g, ' ').trim() };
+      }
+      if (!sp) refusalShown = false;
+    }
     // After the code was entered, a board that refuses it says so; that is an outcome to record,
     // not a timeout to wait out.
     if (stage === 'code_done') {
@@ -416,12 +552,63 @@ async function enterCode(c) {
   return { entered: true, ...r, url: mask(r.url), excerpt: mask(r.excerpt) };
 }
 
+// ⭐ THE HAND-OFF (2026-10-08, Ashby). After `arm` with the relay's nonce, the real Submit button is
+// tagged for a PERSON'S click and the form is brought to the front of the virtual screen. It does
+// NOT click. Only a trusted click on that button passes the click guard, at most `clicks` times
+// (a person may click again after a spam refusal; the runner never does), and the network guard
+// lets the submit request through while the hold lasts.
+async function handoff(c) {
+  const a = armed; armed = null;
+  if (!a || a.nonce !== c.nonce || Date.now() > a.until) throw new Error('not armed for this nonce');
+  const btn = page.locator(c.selector || '.ashby-application-form-submit-button, button').filter({ hasText: /submit/i }).first();
+  if (await btn.count() === 0) throw new Error('no submit button matched');
+  if (await btn.evaluate((el) => !!el.closest('form'))) throw new Error('the hand-off is for a Submit button outside a form (Ashby)');
+  const tag = secret + ':h';
+  await btn.evaluate((el, t) => el.setAttribute('data-handoff', t), tag);
+  const ok = await page.evaluate(({ s, t, n }) => (window.__setHandoff ? window.__setHandoff(s, t, n) : false),
+                                 { s: secret, t: tag, n: Math.min(5, Math.max(1, c.clicks || 3)) });
+  if (!ok) throw new Error('the page refused the hand-off');
+  const holdS = Math.min(600, Math.max(30, c.hold_s || 600));
+  openUntil = Date.now() + holdS * 1000;
+  stage = 'handed_off'; refusalShown = false;
+  await page.bringToFront();
+  await btn.scrollIntoViewIfNeeded().catch(() => {});
+  return { handed_off: true, hold_s: holdS };
+}
+
+// A plain status screen on the virtual screen, so the viewer is never a black page while the
+// runner works. A separate tab with no form in it; `front` brings the form back.
+let statusPage = null;
+const esc = (s) => String(s || '').replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[ch]);
+async function status(c) {
+  if (!statusPage || statusPage.isClosed()) statusPage = await page.context().newPage();
+  await statusPage.setContent('<!doctype html><html><body style="margin:0;height:100vh;display:flex;align-items:center;'
+    + 'justify-content:center;background:#123532;color:#e9f3f1;font:24px/1.4 sans-serif">'
+    + '<div style="max-width:960px;padding:24px;text-align:center"><div style="font-size:15px;letter-spacing:.08em;'
+    + 'text-transform:uppercase;opacity:.7">job-search submitter</div>'
+    + `<h1 style="font-size:34px;margin:.4em 0">${esc(c.title)}</h1><p>${esc(c.text)}</p></div></body></html>`);
+  if (!c.background) await statusPage.bringToFront();
+  return {};
+}
+
 const handlers = { open, harvest, fill, readback, shot, arm,
                    final_submit: finalSubmit,
                    enter_code: enterCode,
                    resend_code: resendCode,
+                   handoff,
+                   status,
+                   front: async () => { await page.bringToFront(); return {}; },
                    await_proof: async (c) => watchProof(c.wait_s || 600),
-                   close: async () => { if (browser) await browser.close(); browser = null; return {}; } };
+                   close: async () => { if (browser) await browser.close(); browser = null; statusPage = null; return {}; } };
+// 🚨 TESTS ONLY: stands in for the PERSON's click on the handed-off button, so the hand-off can be
+// tested end to end. It exists only when the test sets FORMJS_TEST_HUMAN_CLICK=1, which the
+// submitter host never does; without it the command does not exist and is refused as unknown.
+if (process.env.FORMJS_TEST_HUMAN_CLICK === '1') {
+  handlers.test_human_click = async () => {
+    await page.locator('[data-handoff]').first().click();
+    return { clicked: true };
+  };
+}
 
 const rl = readline.createInterface({ input: process.stdin });
 let chain = Promise.resolve();

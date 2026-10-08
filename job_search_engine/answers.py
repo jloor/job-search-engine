@@ -36,7 +36,16 @@ STANDARD = {
     "veteran_status": "eeo.veteran_status",
     "disability_status": "eeo.disability_status",
 }
-FILE_FIELDS = {"resume": "resume.pdf", "cover_letter": "cover-letter.pdf"}
+FILE_FIELDS = {"resume": "resume.pdf", "cover_letter": "cover-letter.pdf",
+               # Ashby's system fields (2026-10-08). Its "Autofill from resume" input is NOT one of
+               # these: uploading there runs their parser over typed fields.
+               "_systemfield_resume": "resume.pdf", "_systemfield_coverLetter": "cover-letter.pdf"}
+EMAIL_IDS = ("email", "_systemfield_email")
+# Fields a board names only by label (Ashby ids are per-posting UUIDs). Whole label, anchored.
+LABEL_STANDARD = [
+    (re.compile(r"^(phone|phone number|mobile( phone)?( number)?)$", re.I), "identity.phone"),
+]
+YESNO = ("yes", "no")
 
 
 @dataclass
@@ -97,7 +106,9 @@ def _kind_ok(rule_kind: str | None, field_kind: str) -> bool:
     if rule_kind == "text":
         return field_kind in TEXTLIKE
     if rule_kind == "select":
-        return field_kind in ("select", "native_select")
+        # An Ashby yes/no is a two-option choice: a select rule answering Yes or No applies. The
+        # answer itself is checked to be exactly yes or no in decide().
+        return field_kind in ("select", "native_select", "yesno")
     return rule_kind == field_kind
 
 
@@ -132,6 +143,24 @@ def decide(f: dict, api: dict | None, cfg: dict, pkg: Path, pkg_answers: dict,
     if kind in ("checkbox", "radio"):
         d.problem = "checkbox and radio questions are not filled by this runner yet"
         return d
+    if kind == "checkgroup":
+        # 🚨 ONLY AN EXPLICIT ANSWER. A group ("how did you hear", "which apply") is answered from
+        # this application's own form-answers.json, never from a rule: picking options from a
+        # question's wording is a guess. Options separated by " | ", each one the page offers.
+        raw = next((pkg_answers[k] for k in (f["id"], _norm(label)) if k in pkg_answers), None)
+        if raw in (None, ""):
+            if required:
+                d.problem = "a required checkbox group with no answer in form-answers.json"
+            return d
+        offered = {o.strip().lower(): o for o in f.get("options") or []}
+        picks = [p.strip() for p in str(raw).split("|") if p.strip()]
+        bad = [p for p in picks if p.lower() not in offered]
+        if bad or not picks:
+            d.problem = f"answer {bad or raw!r} is not among the options {list(offered.values())[:12]}"
+            return d
+        d.spellings = [offered[p.lower()] for p in picks]
+        d.value, d.source = " | ".join(d.spellings), "package form-answers.json"
+        return d
 
     # 1. this application's own answers
     for key in (f["id"], _norm(label)):
@@ -140,13 +169,18 @@ def decide(f: dict, api: dict | None, cfg: dict, pkg: Path, pkg_answers: dict,
             break
     # 2. standard fields
     if d.value is None:
-        if f["id"] == "email":
+        if f["id"] in EMAIL_IDS:
             d.value, d.source = alias or None, "the application's alias"
             if not alias:
                 d.problem = "no alias on the application"
         elif f["id"] in STANDARD:
             d.value = _lookup(cfg, STANDARD[f["id"]])
             d.source = f"candidate config {STANDARD[f['id']]}"
+        else:
+            for rx, dotted in LABEL_STANDARD:
+                if label and rx.match(label.strip()):
+                    d.value, d.source = _lookup(cfg, dotted), f"candidate config {dotted}"
+                    break
     # 3. rules over the question text
     extra: list = []
     if d.value is None and label:
@@ -173,6 +207,13 @@ def decide(f: dict, api: dict | None, cfg: dict, pkg: Path, pkg_answers: dict,
                                       "a required written answer that the package does not contain")
         return d
 
+    if kind == "yesno":
+        v = str(d.value).strip().lower()
+        if v not in YESNO:
+            d.problem = f"a yes/no question answered {d.value!r}; it must be exactly Yes or No"
+        else:
+            d.value = v
+        return d
     if kind in ("select", "native_select"):
         d.spellings = spellings_for(d.value, cfg, extra)
         options = (api or {}).get("options") or []
@@ -220,12 +261,16 @@ def plan(fields: list, api_q: dict, cfg: dict, pkg: Path, alias: str) -> tuple[l
 
 def fill_command(decisions: list) -> dict:
     """The `fill` command for form.js, from the answered decisions."""
-    cmd = {"cmd": "fill", "files": [], "selects": [], "checks": [], "texts": []}
+    cmd = {"cmd": "fill", "files": [], "selects": [], "yesnos": [], "groups": [], "checks": [], "texts": []}
     for d in decisions:
         if not d.answered:
             continue
         if d.kind == "file":
             cmd["files"].append({"id": d.id, "path": d.value})
+        elif d.kind == "yesno":
+            cmd["yesnos"].append({"id": d.id, "value": d.value})
+        elif d.kind == "checkgroup":
+            cmd["groups"].append({"id": d.id, "values": d.spellings})
         elif d.kind in ("select", "native_select"):
             cmd["selects"].append({"id": d.id, "values": d.spellings or [d.value]})
         else:

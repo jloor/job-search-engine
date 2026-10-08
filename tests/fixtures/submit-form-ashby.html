@@ -1,0 +1,95 @@
+<!doctype html>
+<!-- A SYNTHETIC Ashby-shaped application form for tests/test_submit_ashby_browser.py. It copies the
+     markup shapes of a hosted Ashby form (2026-10-08): NO <form> element, question titles as
+     label[for=<question id>] with a _required class, a yes/no widget of two buttons over a hidden
+     checkbox named by the question id, a checkbox-group fieldset, an "Autofill from resume" file
+     input before the real one, and a Submit button outside any form that sends a GraphQL-style
+     request. It belongs to no employer. Every value the test types is invented.
+     ?spam=1   the first submit is refused as possible spam, a second one succeeds
+     ?code=1   the first submit asks for an 8-character emailed code -->
+<html><head><meta charset="utf-8"><title>Apply: Example Role at Example Co (Ashby)</title>
+<style>
+  body { font: 14px sans-serif; max-width: 720px; margin: 20px auto; }
+  .field { margin: 12px 0; }
+  .ashby-application-form-input-yesno button[aria-pressed="true"] { background: #2a6; color: #fff; }
+</style></head>
+<body>
+<div id="root">
+  <h1>Example Role</h1>
+  <div class="field"><div>Autofill from resume</div><input type="file" id="autofill-upload"></div>
+  <div class="field"><label class="ashby-application-form-question-title _required_x1" for="_systemfield_name">Name</label>
+    <input type="text" id="_systemfield_name" name="_systemfield_name" required></div>
+  <div class="field"><label class="ashby-application-form-question-title _required_x1" for="_systemfield_email">Email</label>
+    <input type="email" id="_systemfield_email" name="_systemfield_email" required></div>
+  <div class="field"><label class="ashby-application-form-question-title _required_x1" for="_systemfield_resume">Resume</label>
+    <input type="file" id="_systemfield_resume" name="_systemfield_resume" required></div>
+  <div class="field"><label class="ashby-application-form-question-title _required_x1" for="1a2b3c4d-0000-4000-8000-000000000001">Phone Number</label>
+    <input type="tel" id="1a2b3c4d-0000-4000-8000-000000000001" name="1a2b3c4d-0000-4000-8000-000000000001" required></div>
+  <div class="field"><label class="ashby-application-form-question-title" for="1a2b3c4d-0000-4000-8000-000000000002">LinkedIn Profile</label>
+    <input type="text" id="1a2b3c4d-0000-4000-8000-000000000002" name="1a2b3c4d-0000-4000-8000-000000000002"></div>
+  <fieldset class="ashby-application-form-input-checkbox-group">
+    <label class="ashby-application-form-question-title _required_x1" for="1a2b3c4d-0000-4000-8000-000000000003">How did you hear about us?</label>
+    <input type="checkbox" id="g1_1a2b3c4d-0000-4000-8000-000000000003-labeled-checkbox-0" name="LinkedIn">
+    <label for="g1_1a2b3c4d-0000-4000-8000-000000000003-labeled-checkbox-0">LinkedIn</label>
+    <input type="checkbox" id="g1_1a2b3c4d-0000-4000-8000-000000000003-labeled-checkbox-1" name="Job board (e.g. Indeed)">
+    <label for="g1_1a2b3c4d-0000-4000-8000-000000000003-labeled-checkbox-1">Job board (e.g. Indeed)</label>
+    <input type="checkbox" id="g1_1a2b3c4d-0000-4000-8000-000000000003-labeled-checkbox-2" name="Other (please specify)">
+    <label for="g1_1a2b3c4d-0000-4000-8000-000000000003-labeled-checkbox-2">Other (please specify)</label>
+  </fieldset>
+  <div class="field"><label class="ashby-application-form-question-title _required_x1" for="1a2b3c4d-0000-4000-8000-000000000004">Are you legally authorized to work in the United States?</label>
+    <div class="ashby-application-form-input-yesno">
+      <button type="submit" class="ashby-application-form-input-yesno-option" aria-pressed="false" data-option="yes">Yes</button>
+      <button type="submit" class="ashby-application-form-input-yesno-option" aria-pressed="false" data-option="no">No</button>
+      <input type="checkbox" tabindex="-1" name="1a2b3c4d-0000-4000-8000-000000000004" style="display:none">
+    </div></div>
+  <div class="field"><label class="ashby-application-form-question-title _required_x1" for="1a2b3c4d-0000-4000-8000-000000000005">Why do you want to work here?</label>
+    <textarea id="1a2b3c4d-0000-4000-8000-000000000005" name="1a2b3c4d-0000-4000-8000-000000000005" required></textarea></div>
+  <div id="code-step" hidden>
+    <p>A verification code was sent to acme@jobs.example.com. Enter the 8-character code to confirm you're a human.</p>
+    <div id="code-boxes"></div>
+  </div>
+  <div id="status"></div>
+  <button type="submit" class="ashby-application-form-submit-button">Submit Application</button>
+</div>
+<script>
+  const params = new URLSearchParams(location.search);
+  const root = document.getElementById('root');
+  // Yes/no: a click presses one option, like Ashby's widget.
+  document.querySelectorAll('.ashby-application-form-input-yesno').forEach((w) => {
+    w.querySelectorAll('button').forEach((b) => b.addEventListener('click', () => {
+      w.querySelectorAll('button').forEach((x) => x.setAttribute('aria-pressed', 'false'));
+      b.setAttribute('aria-pressed', 'true');
+      w.querySelector('input[type=checkbox]').checked = b.dataset.option === 'yes';
+    }));
+  });
+  // The submit: a request, not a navigation. React-style, the handler sits on the app root.
+  let submits = 0;
+  const codeStep = document.getElementById('code-step'), boxes = document.getElementById('code-boxes');
+  for (let i = 0; i < 8; i++) { const b = document.createElement('input'); b.maxLength = 1; b.size = 1; boxes.appendChild(b); }
+  async function sendSubmit() {
+    submits += 1;
+    const code = [...boxes.querySelectorAll('input')].map((b) => b.value).join('');
+    const r = await fetch('/api/non-user-graphql?op=ApiSubmitSingleApplicationFormAction', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ operationName: 'ApiSubmitSingleApplicationFormAction', code }) });
+    const st = document.getElementById('status');
+    if (params.get('spam') === '1' && submits === 1) {
+      st.textContent = 'Your application submission was flagged as possible spam. Please try again.'; return;
+    }
+    if (params.get('code') === '1' && codeStep.hidden) { codeStep.hidden = false; return; }
+    if (r.ok) { root.innerHTML = '<h2>Your application was successfully submitted</h2>'; }
+  }
+  root.addEventListener('click', (e) => {
+    const b = e.target.closest('.ashby-application-form-submit-button');
+    if (b) sendSubmit();
+  });
+  // A page that tries to submit on its own, so the Ashby guards are tested:
+  //   'click-me'  clicks Submit from script (an UNTRUSTED click) - the click guard must stop it;
+  //   'fetch-me'  sends the submit request directly - the network guard must abort it.
+  document.getElementById('1a2b3c4d-0000-4000-8000-000000000002').addEventListener('input', (e) => {
+    if (e.target.value === 'click-me') document.querySelector('.ashby-application-form-submit-button').click();
+    if (e.target.value === 'fetch-me') fetch('/api/non-user-graphql?op=ApiSubmitSingleApplicationFormAction',
+      { method: 'POST', body: JSON.stringify({ operationName: 'ApiSubmitSingleApplicationFormAction' }) });
+  });
+</script>
+</body></html>

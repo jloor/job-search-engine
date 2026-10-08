@@ -525,6 +525,27 @@ earlier. The limits, each enforced in code and tested:
 a form's labels and options decide nothing on their own: an answer comes from the candidate's
 config or the run stops.
 
+**Ashby: the operator clicks (added 2026-10-08).** Ashby refuses a scripted Submit as "possible
+spam", and making automation look human to pass that check is bot-detection evasion, a hard
+limit. So an Ashby live run fills the form, proves it holds the approved record, consumes the
+approval (arm), and then HANDS the Submit button to the operator in the viewer. The runner never
+clicks it. What enforces that:
+- Ashby's buttons sit outside any `<form>`, so its Submit fires no submit event and the Greenhouse
+  guards do not see it. A capture-phase **click guard** cancels every click on a Submit-like
+  button outside a form, except a **trusted** click (real input; a page script's `button.click()`
+  is untrusted) on the button tagged for the hand-off, at most three times (the operator may click
+  again after a spam refusal). A **network guard** aborts any XHR or fetch naming a submit operation
+  unless the form was handed off and the hold has not ended.
+- The runner records the page's verdict: success text, a spam refusal (nothing sent; the operator
+  is told, the runner does nothing), a CAPTCHA (the operator solves it), or the emailed code, which
+  the runner enters under the same limits as Greenhouse (the operator's decision).
+- **No click:** when the hold ends and every counter reads zero (no click, no attempt, no request),
+  the run closes `not_clicked` and the relay puts the approval back to `approved` (the operator's
+  decision). The relay refuses `not_clicked` for a run with any counter above zero or a released
+  security code; such a run is `unknown` and never retried.
+- `test_human_click` in `form.js` stands in for the operator's click in the test suite only; it
+  exists only when `FORMJS_TEST_HUMAN_CLICK=1`, which the submitter host never sets.
+
 
 ## 🔐 Root operations approved by passkey, added 2026-10-08 with `rootops.py`
 

@@ -98,6 +98,9 @@ jobs:
       - run: python3 tests/test_submit_answers.py
       - run: python3 tests/test_submit_runner.py
       - run: python3 tests/test_submit_browser.py
+      # Added 2026-10-08: Ashby's hand-off (the operator clicks) and the batch, runner side.
+      - run: python3 tests/test_submit_ashby_runner.py
+      - run: python3 tests/test_submit_ashby_browser.py
       # Added 2026-10-08: the passkey approval of a submit record. The record fingerprint runs
       # here; the ceremony needs webauthn and runs in the drift job with --strict.
       - run: python3 tests/test_submit_approval.py
@@ -173,3 +176,5 @@ jobs:
           npx playwright install --with-deps chromium-headless-shell
       - name: the browser driver, where a skip is a failure
         run: python3 tests/test_submit_browser.py --strict
+      - name: the Ashby hand-off in a real Chromium (guards, a person's click, no click)
+        run: python3 tests/test_submit_ashby_browser.py --strict
