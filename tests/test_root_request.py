@@ -54,15 +54,28 @@ for label, op, args in [("an op not on the list", "shell", {"cmd": "id"}),
                         ("a tag with a shell suffix", "submitter-install", {"tag": "v1.2.3;id"}),
                         ("an extra argument", "submitter-install", {"tag": "v1.2.3", "x": "y"}),
                         ("a missing argument", "sudoers-level", {"level": "LIVE"}),
-                        ("a level not on the list (OPERATE)", "sudoers-level", {"level": "OPERATE", "state": "on"}),
-                        ("a non-string argument", "submitter-timer", {"state": True})]:
+                        ("a level not on the list (OPERATE)", "sudoers-level", {"level": "OPERATE", "state": "off"}),
+                        ("a non-string argument", "submitter-timer", {"state": True}),
+                        # 🚨 THE ESCALATING DIRECTIONS (2026-10-08): a tap may stop, never start or grant.
+                        ("🚨 timer ON (lifts a brake)", "submitter-timer", {"state": "on"}),
+                        ("🚨 kill switch OFF (lifts a brake)", "submitter-kill", {"state": "off"}),
+                        ("🚨 sudo level INSTALL ON (grants a right)", "sudoers-level", {"level": "INSTALL", "state": "on"}),
+                        ("🚨 sudo level RELEASE ON (grants a right)", "sudoers-level", {"level": "RELEASE", "state": "on"}),
+                        ("🚨 sudo level LIVE ON (grants a right)", "sudoers-level", {"level": "LIVE", "state": "on"})]:
     try:
         RO.validate(op, args, "host01")
         check(f"refused: {label}", False)
     except ValueError:
         check(f"refused: {label}", True)
+for op, args in [("submitter-install", {"tag": "v1.2.3"}), ("submitter-timer", {"state": "off"}),
+                 ("submitter-kill", {"state": "on"}), ("sudoers-level", {"level": "LIVE", "state": "off"})]:
+    try:
+        RO.validate(op, args, "host01")
+        check(f"allowed: {op} {args}", True)
+    except ValueError:
+        check(f"allowed: {op} {args}", False)
 try:
-    RO.validate("submitter-timer", {"state": "on"}, "Bad Host")
+    RO.validate("submitter-timer", {"state": "off"}, "Bad Host")
     check("refused: a malformed host", False)
 except ValueError:
     check("refused: a malformed host", True)
@@ -156,6 +169,9 @@ for tok, label in (("Bearer rd", "the read token"), ("Bearer sub", "the submit t
     check(f"{label} cannot queue a root request", e in (401, 403))
 _, e = call(app.root_request_create, Req(dict(REQ, op="shell", args={"cmd": "id"})), authorization=ADM)
 check("an op not on the list is refused (400)", e == 400)
+_, e = call(app.root_request_create, Req(dict(REQ, op="sudoers-level", args={"level": "LIVE", "state": "on"})),
+            authorization=ADM)
+check("🚨 a request to GRANT a sudo level is refused at the relay too (400)", e == 400)
 r, e = call(app.root_request_create, Req(REQ), authorization=ADM)
 check("the admin token queues one and gets an approval link", e is None and "/root/approve/" in r["approval_url"])
 rid, token = r["id"], r["approval_url"].rsplit("/", 1)[1]

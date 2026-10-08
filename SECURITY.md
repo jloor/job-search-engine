@@ -565,6 +565,14 @@ is not the reference; his own record is.
 file with new content. New root code cannot be reviewed on a phone, and a passkey tap would only
 make it look reviewed. That stays with the admin login.
 
+🚨 **Install or stop, never escalate (the operator's decision, 2026-10-08).** The list is
+`submitter-install` (a release tag), `submitter-timer` OFF, `submitter-kill` ON, and
+`sudoers-level` OFF. Turning the timer on, the kill switch off, or a sudo level on is NOT on the list.
+The passkey signs an opaque challenge, and the page that shows the operator what he approves is
+relay code the agent can change. So a tap must never lift a brake or grant a right; at worst it
+installs an engine tag. The broker refuses the escalating directions twice, in its list and again
+in the code that runs the operation, and its tests prove each is refused with a valid signature.
+
 ⚠️ **What the approval does not stop.** `submitter-install` installs a release tag that the agent
 can publish, into the runner's venv, where it runs as the runner user. The passkey approves the
 INSTALL; it cannot review the tag's code. That is the same trust the admin login gave this step

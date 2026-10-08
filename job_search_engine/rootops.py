@@ -23,12 +23,16 @@ TTL_S = 900                     # a request the operator does not approve in 15 
 MAX_TTL_S = 3600                # the broker refuses an expiry further out than this
 
 _TAG = r"v[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"
-_STATE = r"on|off"
+# 🚨 ONLY THE DIRECTIONS THAT INSTALL OR STOP (the operator's decision, 2026-10-08). The passkey
+# signs an opaque challenge, and the page that shows it is relay code the agent can change, so a
+# tap must never lift a brake or grant a right. At worst it installs an engine tag. Turning the
+# timer ON, the kill switch OFF, or a sudo level ON stays with the admin login. The argument
+# names stay, so the canonical form does not change; only the allowed values narrow.
 OPS = {
     "submitter-install": {"tag": _TAG},
-    "submitter-timer":   {"state": _STATE},
-    "submitter-kill":    {"state": _STATE},
-    "sudoers-level":     {"level": r"INSTALL|RELEASE|LIVE", "state": _STATE},
+    "submitter-timer":   {"state": r"off"},
+    "submitter-kill":    {"state": r"on"},
+    "sudoers-level":     {"level": r"INSTALL|RELEASE|LIVE", "state": r"off"},
 }
 _HOST = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 
@@ -61,13 +65,11 @@ def describe(op: str, args: dict) -> str:
     if op == "submitter-install":
         return f"Install engine {args['tag']} into the submitter (pip, npm, Playwright, as the submitter user)"
     if op == "submitter-timer":
-        return f"Turn the submitter's 15-minute timer {args['state'].upper()}"
+        return "Turn the submitter's 15-minute timer OFF"
     if op == "submitter-kill":
-        return ("Turn the submitter kill switch ON (stops all runs)" if args["state"] == "on"
-                else "Turn the submitter kill switch OFF (runs may start again)")
+        return "Turn the submitter kill switch ON (stops all runs)"
     if op == "sudoers-level":
-        return (f"{'Grant' if args['state'] == 'on' else 'Revoke'} the harness sudo level "
-                f"JOBSUBMIT_{args['level']}")
+        return f"Revoke the harness sudo level JOBSUBMIT_{args['level']}"
     return op
 
 
