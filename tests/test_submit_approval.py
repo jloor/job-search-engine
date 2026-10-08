@@ -178,8 +178,10 @@ page = P.submit_approve_page(token, item)
 check("the approval page shows the field values", "acme@jobs.example.com" in page)
 check("…and its button points the script at the submit approval endpoints",
       "data-base='/submit/approve/'" in page)
-check("the page escapes field values", "<b>" not in P.submit_approve_page(
-    token, dict(item, record_json=json.dumps({"fields": [{"id": "x", "label": "L", "value": "<b>v</b>"}]}))))
+_inj = P.submit_approve_page(token, dict(item, record_json=json.dumps(
+    {"fields": [{"id": "x", "label": "L", "value": "<b>v</b>"}]})))
+check("the page escapes field values (the value's own markup never renders)",
+      "<b>v</b>" not in _inj and "&lt;b&gt;v&lt;/b&gt;" in _inj)
 check("the live queue is empty until a person approves",
       call(app.submit_next, Req(), authorization=S, app_id=1, mode="live")[0]["next"] is None)
 
