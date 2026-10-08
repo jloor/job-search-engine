@@ -59,4 +59,7 @@ version = { attr = "job_search_engine.__version__" }
 packages = ["job_search_engine"]
 
 [tool.setuptools.package-data]
-job_search_engine = ["schema.sql"]
+# browser/: the submitter's driver. Shipped as data so the submitter host installs it from the
+# same pinned release as the relay; its node_modules are installed there, never in the image.
+job_search_engine = ["schema.sql", "browser/form.js", "browser/package.json",
+                     "browser/package-lock.json"]

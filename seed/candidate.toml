@@ -82,3 +82,40 @@ base_url = "https://openrouter.ai/api/v1"
 requests_per_minute = 9
 pack_size = 5
 cost_per_posting = 0.000678
+
+# ── The browser submitter (submit.py, answers.py). All invented. ──────────────────────────
+# Standard form fields read from here. The email is never set here: every application uses
+# its own alias, read from the application row.
+[identity]
+first_name = "Alex"
+last_name = "Rivera"
+phone = "555-010-0199"
+country = "United States"
+
+[eeo]
+gender = "Decline to self-identify"
+veteran_status = "I don't wish to answer"
+disability_status = "I do not want to answer"
+
+# One rule per question shape. `match` is a case-insensitive regex over the question text.
+# `answer` is the literal answer, or `from` points into this file ("section.key"). `kind`
+# limits the rule to "select" or "text" fields. Two rules that match one question with
+# different answers stop the run: the submitter never picks between them.
+[[form_rule]]
+match = "require.*(visa )?sponsorship"
+answer = "No"
+kind = "select"
+
+[[form_rule]]
+match = "legally authori[sz]ed to work"
+answer = "Yes"
+kind = "select"
+
+[[form_rule]]
+match = "linkedin"
+answer = "https://www.linkedin.com/in/example"
+kind = "text"
+
+# Other wordings of one answer, for boards that word it differently. Tried in order.
+[form_spellings]
+"Decline to self-identify" = ["Decline To Self Identify", "I don't wish to answer"]

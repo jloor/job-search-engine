@@ -1,0 +1,6 @@
+{
+  "name": "job-search-engine-browser",
+  "private": true,
+  "description": "The submitter's browser driver (form.js). Installed on the submitter host only, never in the container.",
+  "dependencies": { "playwright": "1.62.1" }
+}

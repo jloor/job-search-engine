@@ -1,0 +1,96 @@
+<!doctype html>
+<!-- A SYNTHETIC application form for tests/test_submit_browser.py. It copies the markup shapes
+     of a hosted Greenhouse form (labelled inputs, react-select style controls with a
+     .select__input inside .select__control, a hidden file input, a phone input) and belongs to
+     no employer. Every value the test types is invented. -->
+<html><head><meta charset="utf-8"><title>Apply: Example Role at Example Co</title>
+<style>
+  body { font: 14px sans-serif; max-width: 720px; margin: 20px auto; }
+  .field { margin: 12px 0; }
+  .select__control { border: 1px solid #888; padding: 6px; position: relative; cursor: pointer; }
+  .select__input { border: 0; outline: 0; width: 60%; }
+  .select__menu { position: absolute; left: 0; right: 0; top: 100%; background: #fff; border: 1px solid #888; z-index: 9; }
+  .select__option { padding: 4px 6px; }
+  .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+</style></head>
+<body>
+<h1>Example Role</h1>
+<form id="application" method="post" action="/submitted">
+  <div class="field"><label for="first_name">First Name*</label>
+    <input type="text" id="first_name" aria-required="true"></div>
+  <div class="field"><label for="last_name">Last Name*</label>
+    <input type="text" id="last_name" aria-required="true"></div>
+  <div class="field"><label for="email">Email*</label>
+    <input type="text" id="email" aria-required="true"></div>
+  <div class="field"><label for="phone">Phone*</label>
+    <input type="tel" id="phone" aria-required="true"></div>
+  <div class="field"><label for="country">Country*</label>
+    <div class="select__control"><input class="select__input" id="country" aria-required="true"
+      data-options="Canada|United Kingdom|United States|Uruguay"></div></div>
+  <div class="field"><label for="resume">Attach</label>
+    <input type="file" id="resume" class="visually-hidden"><span id="resume-name"></span></div>
+  <div class="field"><label for="cover_letter">Attach</label>
+    <input type="file" id="cover_letter" class="visually-hidden"><span id="cover-name"></span></div>
+  <div class="field"><label for="question_101">LinkedIn Profile</label>
+    <input type="text" id="question_101"></div>
+  <div class="field"><label for="question_102">Will you now or in the future require sponsorship?*</label>
+    <div class="select__control"><input class="select__input" id="question_102" aria-required="true"
+      data-options="Yes|No"></div></div>
+  <div class="field"><label for="question_103">Why do you want to work here?*</label>
+    <textarea id="question_103" aria-required="true"></textarea></div>
+  <div class="field"><label for="question_104">Website</label>
+    <input type="text" id="question_104"></div>
+  <div class="field"><label for="gender">Gender</label>
+    <div class="select__control"><input class="select__input" id="gender"
+      data-options="Man|Woman|Non-binary|Decline to self-identify"></div></div>
+  <button type="submit">Submit application</button>
+</form>
+<script>
+  // react-select imitation: open on click, filter on typing, commit only on an option click.
+  document.querySelectorAll('.select__control').forEach((ctl) => {
+    const input = ctl.querySelector('.select__input');
+    const opts = input.dataset.options.split('|');
+    let menu = null, single = null;
+    const close = () => { if (menu) { menu.remove(); menu = null; } };
+    const render = () => {
+      close();
+      menu = document.createElement('div'); menu.className = 'select__menu';
+      const q = input.value.toLowerCase();
+      opts.filter((o) => o.toLowerCase().includes(q)).forEach((o) => {
+        const d = document.createElement('div'); d.className = 'select__option'; d.textContent = o;
+        d.addEventListener('mousedown', (e) => {
+          e.preventDefault();
+          if (!single) { single = document.createElement('div'); single.className = 'select__single-value'; ctl.insertBefore(single, input); }
+          single.textContent = o; input.value = ''; close();
+        });
+        menu.appendChild(d);
+      });
+      ctl.appendChild(menu);
+    };
+    ctl.addEventListener('click', () => { input.focus(); render(); });
+    input.addEventListener('input', render);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+  });
+  for (const [id, span] of [['resume', 'resume-name'], ['cover_letter', 'cover-name']]) {
+    document.getElementById(id).addEventListener('change', (e) => {
+      document.getElementById(span).textContent = [...e.target.files].map((f) => f.name).join(', ');
+    });
+  }
+  // A page that edits a value after it is typed, so the read-back has something to catch.
+  document.getElementById('question_104').addEventListener('input', (e) => {
+    if (!e.target.value.endsWith('/edited')) e.target.value = e.target.value + '/edited';
+  });
+  // A page that tries to submit on its own, so both guards in form.js are tested:
+  // requestSubmit() fires a submit event; form.submit() skips the event and POSTs directly.
+  document.getElementById('question_101').addEventListener('input', (e) => {
+    const f = document.getElementById('application');
+    if (e.target.value === 'submit-me') f.requestSubmit();
+    if (e.target.value === 'post-me') f.submit();
+    // A submit() borrowed from a fresh frame, the usual way round a patched prototype.
+    if (e.target.value === 'bypass-me') {
+      const fr = document.createElement('iframe'); document.body.appendChild(fr);
+      fr.contentWindow.HTMLFormElement.prototype.submit.call(f);
+    }
+  });
+</script>
+</body></html>

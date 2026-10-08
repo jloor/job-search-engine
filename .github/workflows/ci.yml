@@ -92,6 +92,12 @@ jobs:
       # Added 2026-10-07: the browser submitter's narrow routes. Guards token isolation in
       # both directions and that no submit route can change application.status.
       - run: python3 tests/test_submit_routes.py
+      # Added 2026-10-07: the submitter's answer rules and its runner, with fakes for the relay,
+      # the browser and the Greenhouse API. The real browser test runs in the `browser` job; here
+      # it only proves it skips cleanly when node and Playwright are absent.
+      - run: python3 tests/test_submit_answers.py
+      - run: python3 tests/test_submit_runner.py
+      - run: python3 tests/test_submit_browser.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #
@@ -138,3 +144,20 @@ jobs:
       - name: mail approval by passkey
         run: python3 tests/test_passkey.py --strict
 
+  # Added 2026-10-07: the submitter's browser driver in a real Chromium, against a synthetic form.
+  # --strict, so a missing Playwright is a failure and not a quiet skip. Node comes with the
+  # runner image; the browser is installed from the same pinned package-lock the submitter uses.
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: install the driver's pinned dependencies and a headless Chromium
+        working-directory: job_search_engine/browser
+        run: |
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium-headless-shell
+      - name: the browser driver, where a skip is a failure
+        run: python3 tests/test_submit_browser.py --strict
