@@ -290,6 +290,23 @@ try:
 finally:
     br.quit()
 
+print("\nthe page's own words are the record:")
+br = S.Browser("node")
+try:
+    br("open", url=URL + "?code=1", headed=False, settle=300)
+    br("arm", nonce=NONCE)
+    r = br("final_submit", nonce=NONCE, wait_s=10)
+    check("the code step carries the form's own words (the prompt), not the job description",
+          r["status"] == "code_step" and "verification code was sent" in r.get("excerpt", ""))
+    before = len(posts)
+    r = br("enter_code", code="Bad00000", wait_s=5)
+    check("⭐ a refused code is recorded as code_rejected, with the page's words",
+          r["status"] == "code_rejected" and "security code is invalid" in r["excerpt"]
+          and len(posts) == before)
+    check("…and the code itself is masked in that record", "Bad00000" not in json.dumps(r))
+finally:
+    br.quit()
+
 print("\nthe protocol:")
 br = S.Browser("node")
 try:

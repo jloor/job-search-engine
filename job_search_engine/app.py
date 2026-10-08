@@ -12131,6 +12131,49 @@ def submit_run_code(run_id: int, request: Request, authorization: str | None = H
     return out
 
 
+# ── proof by mail (2026-10-08) ────────────────────────────────────────────────────────────────
+# Nobody watches the console while a live run submits, so the run must establish the outcome by
+# itself. A thank-you page is one proof; the employer's confirmation email is the other. This
+# answers whether such an email has arrived for the run: classified confirmation, to the
+# application's alias, received after the run armed, from an anchored Greenhouse sender, with
+# DKIM or DMARC passing. An employer that confirms from its own domain is not proof here; job_track
+# still sees it later.
+def _submit_confirmation(con, run_id: int) -> dict:
+    run = _submit_run_row(con, run_id)
+    if run["mode"] != "live" or run["outcome"] != "running":
+        raise HTTPException(409, "only a running live run may ask for its confirmation")
+    appr = con.execute("SELECT consumed_at FROM submit_approval WHERE consumed_run_id=? "
+                       "AND status='consumed'", (run_id,)).fetchone()
+    if appr is None:
+        raise HTTPException(409, "this run consumed no approval")
+    alias = con.execute("SELECT alias_used FROM application WHERE id=?",
+                        (run["application_id"],)).fetchone()["alias_used"]
+    rows = con.execute(
+        "SELECT id, from_addr, subject, received_at, auth_dkim, auth_dmarc FROM message "
+        "WHERE lower(to_alias)=lower(?) AND classification='confirmation' AND received_at >= ? "
+        "ORDER BY received_at, id", (alias or "", appr["consumed_at"])).fetchall()
+    for m in rows:
+        m = dict(m)
+        if not SUBMIT_CODE_SENDERS.search((m["from_addr"] or "").strip()):
+            continue
+        if "pass" not in ((m["auth_dkim"] or "").lower(), (m["auth_dmarc"] or "").lower()):
+            continue
+        # A code email is never proof of submission, whatever label it carries: the code arrives
+        # BEFORE the application is submitted.
+        if re.search(r"security code|verification code|one[- ]time", m["subject"] or "", re.I):
+            continue
+        return {"message_id": m["id"], "subject": (m["subject"] or "")[:200],
+                "received_at": m["received_at"]}
+    raise HTTPException(404, "no confirmation yet")
+
+
+@app.get("/submit/run/{run_id}/confirmation")
+def submit_run_confirmation(run_id: int, request: Request, authorization: str | None = Header(None)):
+    require_submit(authorization, request)
+    with db() as con:
+        return _submit_confirmation(con, run_id)
+
+
 @app.post("/submit/run/{run_id}/submitted")
 async def submit_run_submitted(run_id: int, request: Request, authorization: str | None = Header(None)):
     """The one route that writes application.status: draft -> submitted, for a run that consumed

@@ -142,6 +142,12 @@
       }
       const code = [...boxes.querySelectorAll('input')].map((b) => b.value).join('');
       if (code.length !== 8) { e.preventDefault(); return; }
+      if (code === 'Bad00000') {                // the board refuses a wrong code and stays on the form
+        e.preventDefault();
+        const p = document.createElement('p'); p.textContent = 'That security code is invalid. Please try again.';
+        step.appendChild(p);
+        return;
+      }
       form.action = '/submitted?code=' + encodeURIComponent(code);
     });
   }

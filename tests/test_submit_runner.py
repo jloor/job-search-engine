@@ -94,6 +94,15 @@ class Relay:
 
     code_after = 2                     # the qualifying mail "arrives" on the third poll
     code_polls = 0
+    confirm_after = None               # None: no confirmation email ever arrives
+    confirm_polls = 0
+
+    def confirmation(self, run_id):
+        self.confirm_polls += 1
+        if self.confirm_after is None or self.confirm_polls <= self.confirm_after:
+            return None
+        return {"message_id": 611, "subject": "Thank you for applying to Acme",
+                "received_at": "2026-10-08T12:00:00+00:00"}
 
     def code(self, run_id):
         self.code_polls += 1
@@ -158,6 +167,9 @@ class FakeBrowser:
                     "url": "https://job-boards.greenhouse.io/acme/jobs/1001/confirmation",
                     "excerpt": "Thank you for applying"}
         if cmd in ("final_submit", "await_proof"):
+            if self.proof != "proof":
+                return {"ok": True, "status": self.proof, "url": "https://job-boards.greenhouse.io/acme/jobs/1001",
+                        "excerpt": "Please complete the highlighted fields"}
             return {"ok": True, "status": self.proof, "url": "https://job-boards.greenhouse.io/acme/jobs/1001/confirmation",
                     "excerpt": "Thank you for applying"}
         raise RuntimeError(f"unexpected command {cmd}")
@@ -353,6 +365,40 @@ r, relay, br, alerts, _ = run(item=LIVE, browser=ResendBrowser(rl, has_control=F
 check("a page with no resend control: UNKNOWN after one wait, and the step says why",
       r["outcome"] == "unknown" and relay.code_polls == WAIT
       and any("no resend" in (s.get("detail") or "") for s in relay.steps))
+
+print("\nthe run records the outcome itself (nobody watches the console):")
+rl = Relay()
+rl.confirm_after = 3
+r, relay, br, alerts, _ = run(item=LIVE, browser=FakeBrowser(proof="no_proof"), relay=rl)
+check("⭐ no thank-you page, but the confirmation EMAIL arrives: submitted, with the email as proof",
+      r["outcome"] == "submitted" and relay.reported and relay.reported[0]["url"] == "mail:611")
+check("…and the steps say what the page showed, then which email confirmed it",
+      any("the page: Please complete" in (s.get("detail") or "") for s in relay.steps)
+      and any("confirmed by mail: message 611" in (s.get("detail") or "") for s in relay.steps))
+rl = Relay()
+r, relay, br, alerts, _ = run(item=LIVE, browser=FakeBrowser(proof="no_proof"), relay=rl)
+check("🚨 no page proof and no email within the wait: UNKNOWN, and the reason carries the page's words",
+      r["outcome"] == "unknown" and not relay.reported
+      and "Please complete the highlighted fields" in relay.closed["stop_reason"]
+      and relay.confirm_polls == S.CONFIRM_WAIT_S // S.CONFIRM_POLL_S)
+check("…and the final alert says what the page said",
+      alerts and "Please complete" in alerts[-1]["message"])
+
+
+class RejectingBrowser(FakeBrowser):
+    def __call__(self, cmd, **kw):
+        if cmd == "enter_code":
+            self.sent.append(cmd)
+            return {"ok": True, "entered": True, "status": "code_rejected",
+                    "url": "https://job-boards.greenhouse.io/acme/jobs/1001",
+                    "excerpt": "That security code is invalid. Please try again."}
+        return super().__call__(cmd, **kw)
+
+
+r, relay, br, alerts, _ = run(item=LIVE, browser=RejectingBrowser(proof="code_step"))
+check("a rejected code is recorded as such, with the page's words, and ends UNKNOWN (never retried)",
+      r["outcome"] == "unknown" and relay.closed["stop_reason"].startswith("code_rejected")
+      and "security code is invalid" in relay.closed["stop_reason"])
 
 print("\na submit attempt on the page:")
 r, relay, _, _, _ = run(browser=FakeBrowser(blocked={"submit_events": 1, "submit_calls": 0,

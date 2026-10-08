@@ -341,7 +341,14 @@ async function watchProof(waitS, allowCode = true) {
       excerpt = m ? text.slice(Math.max(0, m.index - 80), m.index + 160).replace(/\s+/g, ' ').trim() : '';
       return { status: 'proof', url, excerpt };
     }
-    if (allowCode && stage === 'clicked' && await codePrompt()) return { status: 'code_step', url };
+    if (allowCode && stage === 'clicked' && await codePrompt()) return { status: 'code_step', url, excerpt: await formTail() };
+    // After the code was entered, a board that refuses it says so; that is an outcome to record,
+    // not a timeout to wait out.
+    if (stage === 'code_done') {
+      const e = text.match(CODE_ERROR);
+      if (e) return { status: 'code_rejected', url,
+                      excerpt: text.slice(Math.max(0, e.index - 80), e.index + 160).replace(/\s+/g, ' ').trim() };
+    }
     // A CAPTCHA challenge a person must solve: the reCAPTCHA or hCaptcha challenge frame, visible.
     const challenge = await page.evaluate(() => [...document.querySelectorAll(
       'iframe[src*="recaptcha"][src*="bframe"], iframe[src*="hcaptcha"][src*="challenge"]')]
@@ -349,8 +356,20 @@ async function watchProof(waitS, allowCode = true) {
     if (challenge) return { status: 'human_step', url };
     await page.waitForTimeout(1000);
   }
-  return { status: 'no_proof', url: page.url(),
-           excerpt: (await page.evaluate(() => document.body ? document.body.innerText : '').catch(() => '')).replace(/\s+/g, ' ').slice(0, 300) };
+  // No proof: record what the FORM says at the end (its messages sit near the submit button), not
+  // the top of the page, which is the job description.
+  return { status: 'no_proof', url: page.url(), excerpt: await formTail() };
+}
+
+const CODE_ERROR = /(invalid|incorrect|expired|wrong|not valid|didn['’]?t match)[^.]{0,40}\bcode\b|\bcode\b[^.]{0,40}(invalid|incorrect|expired|is wrong|not valid)/i;
+
+// The last 500 characters of the application form's visible text: errors, prompts, status lines.
+async function formTail() {
+  return (await page.evaluate(() => {
+    const forms = [...document.querySelectorAll('form')];
+    const f = forms.length ? forms[forms.length - 1] : document.body;
+    return (f && f.innerText) || '';
+  }).catch(() => '')).replace(/\s+/g, ' ').trim().slice(-500);
 }
 
 async function finalSubmit(c) {

@@ -337,5 +337,26 @@ with app.db() as con:
     ev = [r["detail"] for r in con.execute("SELECT detail FROM event WHERE kind='submit_code_released'")]
 check("the audit names the message, never the code", ev and all("AbCd1234" not in d for d in ev))
 
+print("\nproof by confirmation email:")
+_, e = call(app.submit_run_confirmation, live3, Req(), authorization=S)
+check("no confirmation yet (404); a security-code email labelled 'confirmation' (message 907) is NOT proof",
+      e == 404)
+_, e = call(app.submit_run_confirmation, s3, Req(), authorization=S)
+check("a shadow run never asks for one (409)", e == 409)
+_, e = call(app.submit_run_confirmation, live3, Req(), authorization="Bearer adm")
+check("the admin token cannot read it (submit scope only)", e == 403)
+mail(920, "2020-01-01T00:00:00+00:00", cls="confirmation", subj="Thank you for applying")   # before the arm
+mail(921, LATER.format(9), cls="confirmation", subj="Thank you for applying", to="someone@jobs.example.com")
+mail(922, "2099-01-01T00:01:00+00:00", cls="confirmation", subj="Thank you for applying",
+     frm="careers@greenhouse-mail.io.evil.example")
+mail(923, "2099-01-01T00:01:01+00:00", cls="confirmation", subj="Thank you for applying", dkim="fail", dmarc="fail")
+mail(924, "2099-01-01T00:01:02+00:00", cls="rejection", subj="Thank you for applying")
+_, e = call(app.submit_run_confirmation, live3, Req(), authorization=S)
+check("🚨 before the arm, another alias, a look-alike sender, failed DKIM/DMARC, or not a confirmation: "
+      "none is proof", e == 404)
+mail(925, "2099-01-01T00:02:00+00:00", cls="confirmation", subj="Thank you for applying to Acme")
+r, e = call(app.submit_run_confirmation, live3, Req(), authorization=S)
+check("the qualifying confirmation is proof", e is None and r["message_id"] == 925)
+
 print(f"\n{'FAILED: ' + str(len(fails)) if fails else 'all passed'}")
 sys.exit(1 if fails else 0)

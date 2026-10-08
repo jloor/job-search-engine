@@ -108,6 +108,15 @@ class Relay:
     def submitted(self, run_id: int, **kw) -> None:
         self._call("POST", f"/submit/run/{run_id}/submitted", kw)
 
+    def confirmation(self, run_id: int) -> dict | None:
+        """The employer's confirmation email for this run, or None while none has arrived (404)."""
+        try:
+            return self._call("GET", f"/submit/run/{run_id}/confirmation")
+        except RuntimeError as e:
+            if f"/submit/run/{run_id}/confirmation: 404" in str(e):
+                return None
+            raise
+
     def code(self, run_id: int) -> dict | None:
         """The run's ONE security code, or None while no qualifying mail has arrived (404)."""
         try:
@@ -265,6 +274,8 @@ def required_empty(page: list, fields: list) -> list:
 CODE_WAIT_S = 90                       # each wait for the emailed security code
 CODE_POLL_S = 5
 CODE_RESENDS = 2                       # resend requests after a wait with no code (3 waits in all)
+CONFIRM_WAIT_S = 600                   # with no page proof, how long to watch for the confirmation email
+CONFIRM_POLL_S = 15
 
 
 class Run:
@@ -406,7 +417,8 @@ class Run:
                 # The emailed security code (authorized explicitly by the operator, 2026-10-08): the
                 # relay releases this run's ONE code; it is never written to a step or an alert.
                 shot = self._shot(br, "code-step")
-                self._step(step, "ok", "the board asked for its emailed security code", shot)
+                self._step(step, "ok", "the board asked for its emailed security code. The page: "
+                           f"{(r.get('excerpt') or '')[-400:]}", shot)
                 # Wait; if no code came, ask the board to resend it (a board may send none for a
                 # second attempt at one application, and a code sent before this run armed is never
                 # accepted), then wait again. At most CODE_RESENDS times.
@@ -441,15 +453,36 @@ class Run:
                                  "tags": ["robot", "warning"]})
                 r = br("await_proof", wait_s=600)
             shot = self._shot(br, "after-submit")
-            if r.get("status") != "proof":
-                self._step(step, "error", f"no proof of submission: {json.dumps(r)[:1500]}", shot)
-                self.relay.close(self.run_id, outcome="unknown", stop_step=step,
-                                 stop_reason="clicked Submit, no proof seen; check the alias's mail")
-                return self._done(app_id, "unknown", "clicked Submit and saw no proof. NOT retried: "
-                                  "check the mail at the alias before doing anything.")
-            self._step(step, "ok", f"proof: {r.get('url')} | {r.get('excerpt', '')[:300]}", shot)
-            self.relay.submitted(self.run_id, url=r.get("url"), excerpt=r.get("excerpt"))
-            return self._done(app_id, "submitted", f"{r.get('url')}")
+            # 📌 RECORD THE STATE: nobody watches the console. What the page said is the record.
+            state = r.get("status") or "unknown"
+            said = (r.get("excerpt") or "")[:400]
+            self._step(step, "ok" if state == "proof" else "error",
+                       f"after submit: {state} | {r.get('url') or ''} | the page: {said}", shot)
+            if state == "proof":
+                self.relay.submitted(self.run_id, url=r.get("url"), excerpt=r.get("excerpt"))
+                return self._done(app_id, "submitted", f"confirmed on the page: {said[:200]}")
+
+            # No proof on the page: the employer's confirmation email is the other proof. Watch for
+            # it, so the outcome is established by the run and not by a person's memory.
+            step = "confirm"
+            mail = None
+            for _ in range(int(CONFIRM_WAIT_S / CONFIRM_POLL_S)):
+                mail = self.relay.confirmation(self.run_id)
+                if mail:
+                    break
+                self.sleep(CONFIRM_POLL_S)
+            if mail:
+                self._step(step, "ok", f"confirmed by mail: message {mail['message_id']} "
+                                       f"'{mail['subject']}' at {mail['received_at']}")
+                self.relay.submitted(self.run_id, url=f"mail:{mail['message_id']}",
+                                     excerpt=f"confirmation email: {mail['subject']}")
+                return self._done(app_id, "submitted", f"confirmed by email: {mail['subject']}")
+            self._step(step, "error", f"no confirmation email within {CONFIRM_WAIT_S} s")
+            self.relay.close(self.run_id, outcome="unknown", stop_step="submit",
+                             stop_reason=f"{state}: no thank-you page and no confirmation email within "
+                                         f"{CONFIRM_WAIT_S} s. The page said: {said[:300]}")
+            return self._done(app_id, "unknown", f"{state}; no page proof, no confirmation email. "
+                              f"The page said: {said[:200]}. NOT retried.")
         except Stop as e:
             self._safe_step(step, "stop", str(e), br)
             self.relay.close(self.run_id, outcome="stopped", stop_step=step, stop_reason=str(e))
