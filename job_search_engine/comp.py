@@ -36,7 +36,9 @@ _AMOUNT = r"\$\s?\d(?:[\d,]*\d)?(?:\.\d+)?\s*[KkMm]?"
 # WRONG BAND. Global-e (Comeet, 2026-10-09): "$140,000/yr - $150,000/yr" was stored as
 # 140000-140000, the top cut by $10,000, and "$45/hr - $55/hr" was missed entirely. The unit
 # is allowed between the figures and never captured. The archiver carries the same line.
-_UNIT = r"(?:\s?/\s?(?:yr|year|hr|hour|annum))?"
+# ⚠️ Any case: Chugach writes "$110,000.00/Yr - $145,000.00/Yr", and a lower-case-only unit
+# left that row at 110000-110000 after the first fix (2026-10-09).
+_UNIT = r"(?:\s?/\s?(?i:yr|year|hr|hour|annum))?"
 _RANGE = re.compile(rf"({_AMOUNT}){_UNIT}\s*(?:-|–|—|to|and)\s*({_AMOUNT})")
 _PAY_WORDS = re.compile(
     r"salary|compensation|pay range|pay band|base pay|base range|hourly|per hour|"

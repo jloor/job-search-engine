@@ -62,6 +62,7 @@ check("unit spelled out", "Salary: $140,000/year - $150,000/year", (140000, 1500
 check("K figures with units", "Base salary: $140K/yr to $150K/yr", (140000, 150000))
 check("hourly with units", "Pay range: $45/hr - $55/hr", (45, 55))
 check("bare K with a unit", "The pay range is 67K/yr to 105K/yr.", (67000, 105000))
+check("a capitalised unit (Chugach)", "Salary range: $110,000.00/Yr - $145,000.00/Yr.", (110000, 145000))
 
 print("\nnumbers that are not pay, and must stay unmatched:")
 check("charitable giving", "We will facilitate $100 billion in charitable giving over the decade.", None)
@@ -83,7 +84,8 @@ else:
                         ("single annual amount", "The salary is $55,000 annually, and up to a 10% bonus."),
                         ("charitable giving", "We will facilitate $100 billion in charitable giving."),
                         ("unit after the first figure", "Compensation range: $140,000/yr - $150,000/yr"),
-                        ("hourly with units", "Pay range: $45/hr - $55/hr")):
+                        ("hourly with units", "Pay range: $45/hr - $55/hr"),
+                        ("a capitalised unit", "Salary range: $110,000.00/Yr - $145,000.00/Yr.")):
         a = arc.body_comp(text)[0]
         c = comp.from_body(text)
         # ⚠️ Agreeing on "found something" is not enough: on 2026-10-09 both found a band for
