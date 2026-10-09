@@ -4073,6 +4073,25 @@ On Wed, Aug 12, 2026 the candidate wrote:
         check("wd has posting block", _state((200, b'{"jobPostingInfo":{"a":1}}'), True, _WD), "ok")
         # A 200 with no posting block answers nothing. Calling it gone repeats the 403 mistake.
         check("wd 200, no block", _state((200, b"{}"), True, _WD), "blocked")
+
+        # 🚨 LinkedIn's guest endpoint answers 200 for an open AND a closed posting, so the
+        # markup decides. Markers taken from real reads on 2026-10-09 (NeoGenomics, closed;
+        # Care Lumen, open).
+        _LI = "https://www.linkedin.com/jobs/view/digital-integration-specialist-at-neo-4461995168"
+        _closed = (b'<div class="description__text">x</div><figure class="closed-job">'
+                   b'<figcaption class="closed-job__flavor--closed">No longer accepting '
+                   b'applications</figcaption></figure>')
+        _open = b'<div class="description__text description__text--rich">x</div>'
+        check("linkedin closed marker is gone", _state((200, _closed), True, _LI), "gone")
+        check("linkedin open posting is ok", _state((200, _open), True, _LI), "ok")
+        check("linkedin 404 is gone", _state((404, b""), True, _LI), "gone")
+        check("linkedin 429 is NOT gone", _state((429, b""), True, _LI), "blocked")
+        check("linkedin 200, neither marker", _state((200, b"<html>sign up</html>"), True, _LI),
+              "blocked")
+        check("linkedin currentJobId shape is read",
+              _state((200, _closed), True,
+                     "https://www.linkedin.com/jobs/collections/x/?currentJobId=4461995168"),
+              "gone")
         check("wd 404", _state((404, b""), True, _WD), "gone")
 
         # An embed carries the job id and not the token. Guessing the token from the
@@ -4443,6 +4462,9 @@ On Wed, Aug 12, 2026 the candidate wrote:
         ("saved list", "https://www.linkedin.com/jobs/collections/recommended/?currentJobId=4285561079"),
         ("linkedin's own mail", "https://www.linkedin.com/comm/jobs/view/4285561079/?trk=eml"),
         ("locale prefix", "https://www.linkedin.com/de/jobs/view/4285561079"),
+        # ⚠️ The scanner's own form, and the one this pattern missed until 2026-10-09.
+        ("title slug", "https://www.linkedin.com/jobs/view/integration-lead-at-acme-2024-4285561079"),
+        ("slug with tracking", "https://www.linkedin.com/jobs/view/a-at-b%E2%84%A2-4285561079?trk=x"),
     ]:
         check(f"linkedin id, {label}", app.linkedin_job_id(u), "4285561079")
     check("a profile is not a job", app.linkedin_job_id("https://www.linkedin.com/in/x"), None)

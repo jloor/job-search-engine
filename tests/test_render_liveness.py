@@ -79,6 +79,31 @@ check("a file input alone is enough to be live",
       app.render_liveness("u", {"http_status": 200, "field_count": 1, "file_inputs": 1,
                                 "gone_markers": [], "alive_markers": []})[0], "live")
 
+# 🚨 REAL READS FROM 2026-10-07 AND 2026-10-09, both recorded `live`, both on postings
+# LinkedIn had closed. NeoGenomics was throttled (429) into a sign-up form; Candor Health
+# was redirected to a job search. Each was packaged before anyone saw the posting was shut.
+_LI = "https://www.linkedin.com/jobs/view/digital-integration-specialist-at-neogenomics-laboratories-4461995168"
+NEO = {"http_status": 429, "title": "Sign Up | LinkedIn", "field_count": 15,
+       "file_inputs": 0, "redirected": True, "gone_markers": [], "alive_markers": []}
+CANDOR = {"http_status": 200, "title": "11,000+ Technical Solutions Specialist jobs in United States",
+          "field_count": 69, "file_inputs": 0, "redirected": True,
+          "gone_markers": [], "alive_markers": []}
+print("\nlinkedin false positives, real reads:")
+check("a 429 sign-up form is not live", app.render_liveness(_LI, NEO)[0], "unknown")
+check("a redirect to a job search is not live", app.render_liveness(_LI, CANDOR)[0], "unknown")
+check("a 403 is never live, any host",
+      app.render_liveness("u", {"http_status": 403, "field_count": 30, "file_inputs": 1,
+                                "gone_markers": [], "alive_markers": []})[0], "unknown")
+check("a 503 is never live, any host",
+      app.render_liveness("u", {"http_status": 503, "field_count": 30,
+                                "gone_markers": [], "alive_markers": []})[0], "unknown")
+check("a linkedin page with a real alive marker is still live",
+      app.render_liveness(_LI, {"http_status": 200, "field_count": 0,
+                                "gone_markers": [], "alive_markers": ["easy apply"]})[0], "live")
+check("a non-linkedin form with fields is still live",
+      app.render_liveness("https://example.com/job/1", {"http_status": 200, "field_count": 6,
+                                "gone_markers": [], "alive_markers": []})[0], "live")
+
 print("\nevidence travels with every verdict:")
 for name, obs in (("dead", GEHC), ("live", CELIGO)):
     ev = app.render_liveness("u", obs)[1]

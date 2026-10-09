@@ -6525,6 +6525,32 @@ def posting_liveness(url: str, board: str = "", timeout: int = 0) -> dict:
         return ({"state": "ok", "evidence": "200 with jobPostingInfo"} if has else
                 {"state": "blocked", "evidence": "200 with no jobPostingInfo"})
 
+    # 🚨 LINKEDIN, READ FROM THE GUEST ENDPOINT, NEVER FROM THE RENDERED PAGE (2026-10-09).
+    # A LinkedIn URL used to fall through to `unaddressable` and then to the browser pass,
+    # which marked closed postings live: a closed /jobs/view/ page redirects to a job SEARCH
+    # ("11,000+ Technical Solutions Specialist jobs") or, when throttled, to a sign-up form,
+    # and the search filters and sign-up fields counted as an application form. NeoGenomics
+    # and Candor Health were both packaged against postings LinkedIn had already closed.
+    # ⭐ The guest endpoint answers 200 for BOTH states, so the status says nothing. The
+    # markup decides: a closed posting carries `closed-job__flavor--closed` ("No longer
+    # accepting applications"); an open one carries the description and no closed marker.
+    jid = linkedin_job_id(u)
+    if jid:
+        code, body = _live_get(f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{jid}",
+                               timeout)
+        if code in (404, 410):
+            return {"state": "gone", "evidence": f"HTTP {code} from the linkedin guest endpoint"}
+        if code != 200:
+            return {"state": "blocked", "evidence": f"linkedin: HTTP {code}" if code else
+                    "linkedin: network error"}
+        b = body.decode("utf-8", "replace") if isinstance(body, bytes) else str(body)
+        if "closed-job__flavor--closed" in b:
+            return {"state": "gone", "evidence": "linkedin: No longer accepting applications"}
+        if "description__text" in b:
+            return {"state": "ok", "evidence": "linkedin guest endpoint: open, no closed marker"}
+        # ⚠️ A 200 with neither marker is a page LinkedIn chose to serve instead. Not an answer.
+        return {"state": "blocked", "evidence": "linkedin: 200 with neither marker"}
+
     return {"state": "unaddressable", "evidence": "no supported ATS in the URL"}
 
 
@@ -6620,6 +6646,16 @@ def render_liveness(url: str, obs: dict) -> tuple[str, str]:
           f"{', redirected' if obs.get('redirected') else ''}; title {title!r}")
     if isinstance(status, int) and status in (404, 410):
         return "dead", f"{ev}; status says gone"
+    # 🚨 A REFUSAL IS NEVER A VERDICT (2026-10-09). LinkedIn answered 429 with a sign-up form,
+    # its 15 fields passed the field test below, and 13 throttled reads were recorded live.
+    # The fetch path already treats 401/403/429/5xx as blocked; the render pass now agrees.
+    if isinstance(status, int) and (status in (401, 403, 429) or status >= 500):
+        return "unknown", f"{ev}; status says refused, not live"
+    # ⚠️ A LinkedIn page's fields are search filters or a sign-up form, never an application,
+    # so only a positive marker can make one live. posting_liveness reads LinkedIn from the
+    # guest endpoint first; a row only reaches this pass when that read was blocked.
+    if linkedin_job_id(url) and not alive:
+        return "unknown", f"{ev}; linkedin page with no alive marker"
     if alive or files or fields >= 4:
         return "live", f"{ev}; alive markers {alive[:3]}"
     if gone:
@@ -8104,7 +8140,11 @@ def job_gate_audit() -> str:
 
 
 
-_LI_JOB = re.compile(r"linkedin\.com/(?:[a-z]{2}/)?(?:comm/)?jobs/view/(\d{6,})"
+# ⚠️ The SLUG form, /jobs/view/<title>-at-<company>-<id>, is what the scanner stores for every
+# LinkedIn row, and until 2026-10-09 this pattern did not read it: every queue URL looked like
+# a non-LinkedIn link, so liveness fell through to the browser and its false `live`.
+_LI_JOB = re.compile(r"linkedin\.com/(?:[a-z]{2}/)?(?:comm/)?jobs/view/(?:[^/?#\s]*?-)?(\d{6,})"
+                     r"(?=[/?#\s]|$)"
                      r"|linkedin\.com/jobs[^\s]*[?&]currentJobId=(\d{6,})", re.I)
 
 
