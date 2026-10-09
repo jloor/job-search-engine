@@ -82,10 +82,11 @@ class H(http.server.BaseHTTPRequestHandler):
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 BASE = f"http://127.0.0.1:{srv.server_address[1]}/example/0000/application"
-LINKEDIN, GROUP, YESNO, WHY, RADIO = (f"1a2b3c4d-0000-4000-8000-00000000000{i}" for i in (2, 3, 4, 5, 6))
+LINKEDIN, GROUP, YESNO, WHY, RADIO, LETTER = (f"1a2b3c4d-0000-4000-8000-00000000000{i}" for i in (2, 3, 4, 5, 6, 7))
 
 pkg = pathlib.Path(tempfile.mkdtemp())
 (pkg / "resume.pdf").write_bytes(b"%PDF-1.4 resume " * 64)
+(pkg / "cover-letter.pdf").write_bytes(b"%PDF-1.4 letter " * 64)
 (pkg / "form-answers.json").write_text(json.dumps({GROUP: "Other (please specify)",
                                                    WHY: "Because the integrations are the product."}))
 CFG = {"identity": {"full_name": "Alex Rivera", "phone": "555-010-0199",
@@ -144,6 +145,8 @@ try:
     check("the email is the application's alias", by["_systemfield_email"].value == ALIAS)
     check("the résumé goes to the system résumé field, never to 'Autofill from resume'",
           by["_systemfield_resume"].answered and not by.get("autofill-upload", A.Decision("x", "file", "", False)).answered)
+    check("a custom 'Cover Letter' file question gets the package's letter, by its label",
+          by[LETTER].answered and by[LETTER].value.endswith("cover-letter.pdf"))
     check("every planned field reports set", all(r["status"] == "set" for r in fr["results"]))
     bad = S.compare(decisions, fr["results"], rb["fields"], rb["uploads"])
     check("the read-back matches every decision (yes/no from aria-pressed, the group's ticks)", not bad)

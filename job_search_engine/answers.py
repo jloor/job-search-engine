@@ -40,6 +40,12 @@ FILE_FIELDS = {"resume": "resume.pdf", "cover_letter": "cover-letter.pdf",
                # Ashby's system fields (2026-10-08). Its "Autofill from resume" input is NOT one of
                # these: uploading there runs their parser over typed fields.
                "_systemfield_resume": "resume.pdf", "_systemfield_coverLetter": "cover-letter.pdf"}
+# ⚠️ A CUSTOM FILE QUESTION HAS A PER-POSTING ID (2026-10-09). Assured's Ashby form asks "Cover
+# Letter" as its own question, keyed by a UUID, so the id table above never matched and the sheet
+# said to leave it empty. The WHOLE label is matched, anchored, so "Autofill from resume" and
+# "Upload any other documents" can never be taken for the résumé or the letter.
+FILE_LABELS = [(re.compile(r"^cover\s*letter$", re.I), "cover-letter.pdf"),
+               (re.compile(r"^(resume|résumé|cv|resume\s*/\s*cv|cv\s*/\s*resume)$", re.I), "resume.pdf")]
 EMAIL_IDS = ("email", "_systemfield_email")
 # Fields a board names only by label (Ashby ids are per-posting UUIDs). Whole label, anchored.
 LABEL_STANDARD = [
@@ -133,7 +139,8 @@ def decide(f: dict, api: dict | None, cfg: dict, pkg: Path, pkg_answers: dict,
     d = Decision(id=f["id"], kind=kind, label=label, required=required)
 
     if kind == "file":
-        name = FILE_FIELDS.get(f["id"])
+        name = FILE_FIELDS.get(f["id"]) or next(
+            (n for rx, n in FILE_LABELS if rx.match(_norm(label).rstrip(":").strip())), None)
         path = Path(pkg) / name if name else None
         if path and path.exists():
             d.value, d.source = str(path), "package"

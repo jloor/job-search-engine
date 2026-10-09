@@ -67,6 +67,17 @@ check("the résumé field gets the package's résumé.pdf",
       d(F("resume", "file", req=True)).value == str(pkg / "resume.pdf"))
 check("a cover-letter slot with no letter in the package is a problem",
       d(F("cover_letter", "file")).problem)
+# ⚠️ 2026-10-09: a custom Ashby file question is keyed by a UUID, so only its label can say what
+# it wants. Assured's "Cover Letter" was left empty on the sheet before this.
+_UID = "c0ffee00-0000-4000-8000-000000000009"
+check("a custom file question labelled 'Cover Letter' wants the package's letter",
+      d(F(_UID, "file", "Cover Letter")).problem == "no cover-letter.pdf in the package")
+check("a custom file question labelled 'Resume/CV:' gets the résumé",
+      d(F(_UID, "file", "Resume/CV:")).value == str(pkg / "resume.pdf"))
+check("'Autofill from resume' is never the résumé (whole-label match only)",
+      not d(F(_UID, "file", "Autofill from resume")).answered)
+check("'Upload any other documents' is not mapped",
+      d(F(_UID, "file", "Upload any other documents")).problem == "a file field this runner does not know")
 g = d(F("gender", "select"), {"label": "Gender", "options": ["Male", "Woman", "Decline"]})
 check("EEO gender comes from [eeo] and carries its configured spellings",
       g.value == "Female" and g.spellings == ["Female", "Woman"] and not g.problem)
