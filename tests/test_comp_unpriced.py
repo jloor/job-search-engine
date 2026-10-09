@@ -54,6 +54,15 @@ check("priced range", "The base salary range is $120,000 to $150,000 per year.",
 check("priced wins over bare", "Salary $67,000 to $105,000 per year.", (67000, 105000))
 check("hourly keeps its units", "The hourly rate is $18.70 - $21.25 per hour.", (18, 21))
 
+# 🚨 2026-10-09: these were not missed, they were WRONG. The range failed, and the single-figure
+# pass stored the first number alone, 140000-140000, a band that looks like a record.
+print("\na unit after the first figure (Global-e, 2026-10-09):")
+check("unit on both figures", "Compensation range: $140,000/yr - $150,000/yr", (140000, 150000))
+check("unit spelled out", "Salary: $140,000/year - $150,000/year", (140000, 150000))
+check("K figures with units", "Base salary: $140K/yr to $150K/yr", (140000, 150000))
+check("hourly with units", "Pay range: $45/hr - $55/hr", (45, 55))
+check("bare K with a unit", "The pay range is 67K/yr to 105K/yr.", (67000, 105000))
+
 print("\nnumbers that are not pay, and must stay unmatched:")
 check("charitable giving", "We will facilitate $100 billion in charitable giving over the decade.", None)
 check("growth investment", "In 2025 we celebrated a $140 million growth investment and a liquidity event.", None)
@@ -72,10 +81,17 @@ except Exception:                                                 # noqa: BLE001
 else:
     for label, text in (("bare K range", "The pay range for this position is 67K to 105K per year."),
                         ("single annual amount", "The salary is $55,000 annually, and up to a 10% bonus."),
-                        ("charitable giving", "We will facilitate $100 billion in charitable giving.")):
+                        ("charitable giving", "We will facilitate $100 billion in charitable giving."),
+                        ("unit after the first figure", "Compensation range: $140,000/yr - $150,000/yr"),
+                        ("hourly with units", "Pay range: $45/hr - $55/hr")):
         a = arc.body_comp(text)[0]
         c = comp.from_body(text)
+        # ⚠️ Agreeing on "found something" is not enough: on 2026-10-09 both found a band for
+        # the unit case and both had it wrong. A found band must carry both figures.
         agree = (a is None) == (c is None)
+        if agree and a is not None:
+            lo, _, hi = a.partition(" - ")
+            agree = (lo.strip() != hi.strip()) == (c["min"] != c["max"])
         print(f"  {'ok  ' if agree else 'FAIL'} both readers agree on {label:<24} archiver={a}")
         if not agree:
             fails.append(f"drift: {label}")

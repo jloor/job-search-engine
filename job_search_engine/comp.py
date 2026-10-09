@@ -32,7 +32,12 @@ import re
 # ⚠️ Must not end on a comma. "$125,000, as well as stock options" otherwise captures
 # "$125,000," and the trailing punctuation lands in the record.
 _AMOUNT = r"\$\s?\d(?:[\d,]*\d)?(?:\.\d+)?\s*[KkMm]?"
-_RANGE = re.compile(rf"({_AMOUNT})\s*(?:-|–|—|to|and)\s*({_AMOUNT})")
+# 🚨 A UNIT AFTER THE FIRST FIGURE HID THE RANGE, AND THE SINGLE-FIGURE PASS THEN RECORDED A
+# WRONG BAND. Global-e (Comeet, 2026-10-09): "$140,000/yr - $150,000/yr" was stored as
+# 140000-140000, the top cut by $10,000, and "$45/hr - $55/hr" was missed entirely. The unit
+# is allowed between the figures and never captured. The archiver carries the same line.
+_UNIT = r"(?:\s?/\s?(?:yr|year|hr|hour|annum))?"
+_RANGE = re.compile(rf"({_AMOUNT}){_UNIT}\s*(?:-|–|—|to|and)\s*({_AMOUNT})")
 _PAY_WORDS = re.compile(
     r"salary|compensation|pay range|pay band|base pay|base range|hourly|per hour|"
     r"per year|per annum|annually|annualized|OTE|on[- ]target earnings|"
@@ -51,7 +56,7 @@ _HOURLY = re.compile(r"hourly|per hour|/\s?hr|an hour", re.I)
 # Both guards matter: GiveCampus writes "$100 billion in charitable giving" and "a $140
 # million growth investment" in prose, and neither sentence mentions pay.
 _BARE = r"\d{2,3}\s?[Kk]\b|\d{2,3},\d{3}\b"
-_BARE_RANGE = re.compile(rf"({_BARE})\s*(?:-|–|—|to|and)\s*({_BARE})")
+_BARE_RANGE = re.compile(rf"({_BARE}){_UNIT}\s*(?:-|–|—|to|and)\s*({_BARE})")
 
 # ⭐ ONE NUMBER IS ALSO AN ANSWER. Feathr states "$55,000 annually, and up to a 10% bonus
 # potential": a single figure, no range, and the row was carried as unpriced against a
