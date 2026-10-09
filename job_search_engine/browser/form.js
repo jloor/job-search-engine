@@ -151,7 +151,7 @@ async function harvest() {
       if (by) { const l = document.getElementById(by); if (l) return clean(l.innerText); }
       return clean(el.getAttribute('aria-label') || '');
     };
-    const fields = [];
+    const fields = [], els = [];
     // ⭐ ASHBY WIDGETS (2026-10-08). A yes/no question is two buttons over a hidden checkbox whose
     // NAME is the question id; a checkbox group is a fieldset of options. Each is ONE field here,
     // keyed by the question id, labelled by its question title. "Required" is a class on the title,
@@ -164,6 +164,7 @@ async function harvest() {
       const lab = ashbyTitle(cb.name);
       fields.push({ id: cb.name, name: cb.name, kind: 'yesno', label: clean(lab ? lab.innerText : ''),
                     required: ashbyReq(lab), visible: true });
+      els.push(w);
     });
     document.querySelectorAll('fieldset.ashby-application-form-input-checkbox-group').forEach((fs) => {
       const lab = fs.querySelector('.ashby-application-form-question-title');
@@ -173,6 +174,7 @@ async function harvest() {
         .map((i) => clean(i.labels && i.labels[0] ? i.labels[0].innerText : i.name)).filter(Boolean);
       fields.push({ id: qid, name: qid, kind: 'checkgroup', label: clean(lab.innerText),
                     required: ashbyReq(lab), options, visible: true });
+      els.push(fs);
     });
     document.querySelectorAll('input, textarea, select').forEach((el) => {
       const type = (el.type || el.tagName).toLowerCase();
@@ -190,7 +192,14 @@ async function harvest() {
       const r = el.getBoundingClientRect();
       fields.push({ id: el.id, name: el.name || '', kind, label: label.replace(/\s*\*\s*$/, ''),
                     required, visible: r.width > 0 && r.height > 0 || type === 'file' });
+      els.push(el);
     });
+    // pos: the field's place in document order (2026-10-09). The list above is collected widget
+    // type by widget type, so its order is not the form's; a paste-ready sheet sorts on pos.
+    // The list itself keeps its order: the fill and the record do not depend on pos.
+    const order = els.map((e, i) => i).sort((a, b) =>
+      (els[a].compareDocumentPosition(els[b]) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1);
+    order.forEach((i, rank) => { fields[i].pos = rank; });
     return {
       fields,
       captcha: !!document.querySelector('iframe[src*="recaptcha"][src*="bframe"], iframe[src*="hcaptcha"], .cf-turnstile'),
