@@ -176,10 +176,24 @@ async function harvest() {
                     required: ashbyReq(lab), options, visible: true });
       els.push(fs);
     });
+    // ⚠️ ASHBY RADIO GROUP (2026-10-09). One choice of several, a fieldset whose title is a label
+    // for the question id. Until this block each radio was harvested as its own field labelled
+    // "Yes" or "No", with no question and never required, so four Ashby sheets in one day needed
+    // their labels typed by hand, and a required radio question could not stop a run.
+    document.querySelectorAll('fieldset.ashby-application-form-input-radio-group').forEach((fs) => {
+      const lab = fs.querySelector('.ashby-application-form-question-title');
+      const qid = lab && lab.getAttribute('for');
+      if (!qid) return;
+      const options = [...fs.querySelectorAll('input[type=radio]')]
+        .map((i) => clean(i.labels && i.labels[0] ? i.labels[0].innerText : i.value)).filter(Boolean);
+      fields.push({ id: qid, name: qid, kind: 'radiogroup', label: clean(lab.innerText),
+                    required: ashbyReq(lab), options, visible: true });
+      els.push(fs);
+    });
     document.querySelectorAll('input, textarea, select').forEach((el) => {
       const type = (el.type || el.tagName).toLowerCase();
       if (['hidden', 'submit', 'button', 'search', 'password'].includes(type)) return;
-      if (el.closest('.ashby-application-form-input-yesno, fieldset.ashby-application-form-input-checkbox-group')) return;
+      if (el.closest('.ashby-application-form-input-yesno, fieldset.ashby-application-form-input-checkbox-group, fieldset.ashby-application-form-input-radio-group')) return;
       if (!el.id) return;                                   // nothing to address it by
       if (/^iti-/.test(el.id) || /recaptcha/i.test(el.id + ' ' + el.name)) return;
       let kind = type;
@@ -323,6 +337,25 @@ async function fill(c) {
     results.push({ id: g.id, kind: 'checkgroup', status: missing ? 'no_option' : 'set', chosen,
                    ...(missing ? { options: labels } : {}) });
   }
+  for (const rg of c.radios || []) {                        // 2d. Ashby radio group, by question id
+    const fs = page.locator('fieldset.ashby-application-form-input-radio-group')
+      .filter({ has: page.locator(`label[for=${JSON.stringify(rg.id)}]`) }).first();
+    if (await fs.count() === 0) { results.push({ id: rg.id, kind: 'radiogroup', status: 'not_found' }); continue; }
+    const radios = fs.locator('input[type=radio]');
+    const labels = await radios.evaluateAll((els) => els.map((e) => (e.labels && e.labels[0] ? e.labels[0].innerText : e.value).replace(/\s+/g, ' ').trim()));
+    // The same option tiers as a select: exact, starts-with, whole word; two hits is no match.
+    let hit = null;
+    for (const want of rg.values || []) { hit = pickOption(labels, want); if (hit) break; }
+    if (!hit) { results.push({ id: rg.id, kind: 'radiogroup', status: 'no_option', options: labels }); continue; }
+    const i = labels.indexOf(hit);
+    if (!(await radios.nth(i).isChecked())) await radios.nth(i).check({ force: true });
+    await page.waitForTimeout(200);
+    const on = await radios.evaluateAll((els) => {
+      const x = els.find((e) => e.checked);
+      return x ? (x.labels && x.labels[0] ? x.labels[0].innerText : x.value).replace(/\s+/g, ' ').trim() : '';
+    });
+    results.push({ id: rg.id, kind: 'radiogroup', status: on === hit ? 'set' : 'not_set', chosen: on });
+  }
   for (const k of c.checks || []) {                         // 3. checkboxes and radios, by id
     const el = page.locator(attr(k.id)).first();
     if (await el.count() === 0) { results.push({ id: k.id, kind: 'check', status: 'not_found' }); continue; }
@@ -365,10 +398,19 @@ async function readback(c) {
         .map((i) => clean(i.labels && i.labels[0] ? i.labels[0].innerText : i.name));
       out.push({ id: qid, kind: 'checkgroup', label: clean(lab.innerText), value: on.join(' | ') });
     });
+    // Ashby radio group: the one checked option's label, or empty.
+    document.querySelectorAll('fieldset.ashby-application-form-input-radio-group').forEach((fs) => {
+      const lab = fs.querySelector('.ashby-application-form-question-title');
+      const qid = lab && lab.getAttribute('for');
+      if (!qid) return;
+      const on = [...fs.querySelectorAll('input[type=radio]')].find((i) => i.checked);
+      out.push({ id: qid, kind: 'radiogroup', label: clean(lab.innerText),
+                 value: on ? clean(on.labels && on.labels[0] ? on.labels[0].innerText : on.value) : '' });
+    });
     document.querySelectorAll('input, textarea, select').forEach((el) => {
       const type = (el.type || el.tagName).toLowerCase();
       if (!el.id || ['hidden', 'submit', 'button', 'search', 'password'].includes(type)) return;
-      if (el.closest('.ashby-application-form-input-yesno, fieldset.ashby-application-form-input-checkbox-group')) return;
+      if (el.closest('.ashby-application-form-input-yesno, fieldset.ashby-application-form-input-checkbox-group, fieldset.ashby-application-form-input-radio-group')) return;
       if (/^iti-/.test(el.id) || /recaptcha/i.test(el.id + ' ' + el.name)) return;
       const label = clean(el.labels && el.labels[0] ? el.labels[0].innerText : '').replace(/\s*\*\s*$/, '');
       const f = { id: el.id, label };

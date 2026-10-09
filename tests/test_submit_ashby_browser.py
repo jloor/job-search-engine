@@ -82,7 +82,7 @@ class H(http.server.BaseHTTPRequestHandler):
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 BASE = f"http://127.0.0.1:{srv.server_address[1]}/example/0000/application"
-LINKEDIN, GROUP, YESNO, WHY = (f"1a2b3c4d-0000-4000-8000-00000000000{i}" for i in (2, 3, 4, 5))
+LINKEDIN, GROUP, YESNO, WHY, RADIO = (f"1a2b3c4d-0000-4000-8000-00000000000{i}" for i in (2, 3, 4, 5, 6))
 
 pkg = pathlib.Path(tempfile.mkdtemp())
 (pkg / "resume.pdf").write_bytes(b"%PDF-1.4 resume " * 64)
@@ -92,7 +92,8 @@ CFG = {"identity": {"full_name": "Alex Rivera", "phone": "555-010-0199",
                     "linkedin": "https://www.example.com/in/alex"},
        "form_rule": [{"match": "^name$", "from": "identity.full_name", "kind": "text"},
                      {"match": "linkedin", "from": "identity.linkedin", "kind": "text"},
-                     {"match": "legally authorized", "answer": "Yes", "kind": "select"}]}
+                     {"match": "legally authorized", "answer": "Yes", "kind": "select"},
+                     {"match": "nyc-metro", "answer": "Yes", "kind": "select"}]}
 ALIAS = "acme@jobs.example.com"
 ENV = dict(os.environ, FORMJS_TEST_HUMAN_CLICK="1")
 
@@ -121,11 +122,24 @@ try:
           and next(f for f in h["fields"] if f["id"] == GROUP)["options"][-1] == "Other (please specify)")
     check("the group's option checkboxes are not separate fields",
           not any(k.startswith("g1_") for k in kinds))
+    # ⚠️ 2026-10-09: each radio used to be its own field labelled "Yes" or "No", never required.
+    rf = next((f for f in h["fields"] if f["id"] == RADIO), {})
+    check("the radio group is ONE field, keyed by the question id, labelled by the question",
+          rf.get("kind") == "radiogroup" and rf.get("label", "").startswith("Are you based in the NYC")
+          and rf.get("options") == ["Yes", "No"])
+    check("the group's radios are not separate fields", not any(k.startswith("f0_") for k in kinds))
+    check("the radio group's required is read from the question title's class", RADIO in req)
     check("required is read from the question title's class (yes/no, group) and the attribute (text)",
           {YESNO, GROUP, "_systemfield_name", WHY} <= req and LINKEDIN not in req)
     by = {d.id: d for d in decisions}
     check("the yes/no answer comes from a Yes/No select rule, as exactly 'yes'", by[YESNO].value == "yes")
     check("the group answer comes ONLY from form-answers.json", by[GROUP].source == "package form-answers.json")
+    check("the radio answer comes from a select rule, matched to an offered option",
+          by[RADIO].value == "Yes" and by[RADIO].source.startswith("form_rule") and not by[RADIO].problem)
+    check("the fill checks the radio and reports it set",
+          any(r["id"] == RADIO and r["status"] == "set" and r["chosen"] == "Yes" for r in fr["results"]))
+    check("the read-back shows the checked option's label",
+          any(f["id"] == RADIO and f.get("value") == "Yes" for f in rb["fields"]))
     check("the phone is found by its label (Ashby ids are UUIDs)", by["1a2b3c4d-0000-4000-8000-000000000001"].value == "555-010-0199")
     check("the email is the application's alias", by["_systemfield_email"].value == ALIAS)
     check("the résumé goes to the system résumé field, never to 'Autofill from resume'",

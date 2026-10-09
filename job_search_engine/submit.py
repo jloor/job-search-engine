@@ -259,7 +259,7 @@ def compare(decisions: list, fill_results: list, page: list, uploads: dict | Non
             got_set = {x.strip().lower() for x in (f.get("value") or "").split("|") if x.strip()}
             if got_set != {x.strip().lower() for x in d.spellings}:
                 bad.append(f"{d.label or d.id}: reads {f.get('value')!r}, wanted {' | '.join(d.spellings)!r}")
-        elif d.kind in ("select", "native_select"):
+        elif d.kind in ("select", "native_select", "radiogroup"):
             # Compared without whitespace: a board's two renderings of one option differ only in
             # spacing ("United States +1" / "United States+1"), the same rule form.js chooses by.
             if re.sub(r"\s+", "", (f.get("value") or "").lower()) != re.sub(r"\s+", "", (r.get("chosen") or "").lower()):

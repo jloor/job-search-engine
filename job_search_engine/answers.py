@@ -108,7 +108,8 @@ def _kind_ok(rule_kind: str | None, field_kind: str) -> bool:
     if rule_kind == "select":
         # An Ashby yes/no is a two-option choice: a select rule answering Yes or No applies. The
         # answer itself is checked to be exactly yes or no in decide().
-        return field_kind in ("select", "native_select", "yesno")
+        # An Ashby radio group is a one-of-several choice, so a select rule applies to it too.
+        return field_kind in ("select", "native_select", "yesno", "radiogroup")
     return rule_kind == field_kind
 
 
@@ -214,9 +215,10 @@ def decide(f: dict, api: dict | None, cfg: dict, pkg: Path, pkg_answers: dict,
         else:
             d.value = v
         return d
-    if kind in ("select", "native_select"):
+    if kind in ("select", "native_select", "radiogroup"):
         d.spellings = spellings_for(d.value, cfg, extra)
-        options = (api or {}).get("options") or []
+        # A radio group carries its options from the page itself; a select gets them from the API.
+        options = (api or {}).get("options") or f.get("options") or []
         if options and not any(_option_match(s, options) for s in d.spellings):
             d.problem = (f"the answer {d.value!r} matches none of the options "
                          f"{options[:12]}; add a spelling or a package answer")
@@ -261,7 +263,8 @@ def plan(fields: list, api_q: dict, cfg: dict, pkg: Path, alias: str) -> tuple[l
 
 def fill_command(decisions: list) -> dict:
     """The `fill` command for form.js, from the answered decisions."""
-    cmd = {"cmd": "fill", "files": [], "selects": [], "yesnos": [], "groups": [], "checks": [], "texts": []}
+    cmd = {"cmd": "fill", "files": [], "selects": [], "yesnos": [], "groups": [], "radios": [],
+           "checks": [], "texts": []}
     for d in decisions:
         if not d.answered:
             continue
@@ -271,6 +274,8 @@ def fill_command(decisions: list) -> dict:
             cmd["yesnos"].append({"id": d.id, "value": d.value})
         elif d.kind == "checkgroup":
             cmd["groups"].append({"id": d.id, "values": d.spellings})
+        elif d.kind == "radiogroup":
+            cmd["radios"].append({"id": d.id, "values": d.spellings or [d.value]})
         elif d.kind in ("select", "native_select"):
             cmd["selects"].append({"id": d.id, "values": d.spellings or [d.value]})
         else:
