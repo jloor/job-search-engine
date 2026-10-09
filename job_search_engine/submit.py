@@ -52,6 +52,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -331,6 +332,7 @@ class Run:
         self.sleep = sleep
         self.batch = batch                   # a batch sends one "ready" alert for all its forms
         self.handed_off = False
+        self.spam_seen = False               # Ashby showed its spam refusal during the hand-off
         self.n = 0
 
     def _step(self, name: str, outcome: str, detail: str = "", shot: Path | None = None):
@@ -511,6 +513,8 @@ class Run:
                                      excerpt=f"confirmation email: {mail['subject']}")
                 return self._done(app_id, "submitted", f"confirmed by email: {mail['subject']}")
             self._step(step, "error", f"no confirmation email within {CONFIRM_WAIT_S} s")
+            if ats == "ashby" and self.spam_seen and (r.get("spam_page") or state == "spam_refused"):
+                return self._spam_close(app_id, said)
             self.relay.close(self.run_id, outcome="unknown", stop_step="submit",
                              stop_reason=f"{state}: no thank-you page and no confirmation email within "
                                          f"{CONFIRM_WAIT_S} s. The page said: {said[:300]}")
@@ -588,6 +592,7 @@ class Run:
         for _ in range(HANDOFF_ROUNDS):
             st = r.get("status")
             if st == "spam_refused":
+                self.spam_seen = True
                 shot = self._shot(br, "spam-refused")
                 self._step(step, "error", "Ashby refused the click as possible spam; NOTHING was sent. "
                            "The form stays held for the person. The page: "
@@ -632,6 +637,25 @@ class Run:
                                            "no click; nothing sent; approval "
                                            + ("kept for the next batch" if kept else "NOT kept"))}
         return r
+
+    def _spam_close(self, app_id: int, said: str) -> dict:
+        """Ashby refused the click as possible spam and its refusal is still the last thing on the
+        page: no proof, no confirmation email. Ashby's own page says nothing was sent, so the run
+        closes 'spam_refused' and not 'unknown'. The relay applies the operator's rule (2026-10-08):
+        the first refusal waits SUBMIT_SPAM_WAIT_S and keeps the approval; the second sets the
+        application aside for manual entry."""
+        out = self.relay.close(self.run_id, outcome="spam_refused", stop_step="submit",
+                               stop_reason=f"Ashby refused the click as possible spam; nothing was "
+                                           f"sent. The page said: {said[:300]}") or {}
+        if out.get("manual"):
+            why = (f"Ashby refused it as possible spam {out.get('refusals')} times; set aside for "
+                   "manual entry. Submit it by hand with the paste-ready sheet.")
+        elif out.get("released"):
+            at = datetime.fromtimestamp(int(out["retry_at"]), timezone.utc).strftime("%H:%M UTC")
+            why = f"Ashby refused it as possible spam; nothing was sent. The approval is kept; retry after {at}."
+        else:
+            why = "Ashby refused it as possible spam; nothing was sent. The approval was NOT kept (expired?)."
+        return self._done(app_id, "spam_refused", why)
 
     def _safe_step(self, name, outcome, detail, br):
         shot = None

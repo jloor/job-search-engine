@@ -901,8 +901,10 @@ MIGRATIONS = [
      "run_id INTEGER REFERENCES submit_run(id), token TEXT NOT NULL UNIQUE, record_fp TEXT NOT NULL, "
      "record_json TEXT NOT NULL, created_at TEXT NOT NULL, expires_at INTEGER NOT NULL, "
      "status TEXT NOT NULL DEFAULT 'pending', challenge TEXT, challenge_expires INTEGER, "
-     "approved_by TEXT, approved_at TEXT, consumed_at TEXT, consumed_run_id INTEGER)"),
+     "approved_by TEXT, approved_at TEXT, consumed_at TEXT, consumed_run_id INTEGER, not_before INTEGER)"),
     "CREATE INDEX IF NOT EXISTS idx_submit_approval_app ON submit_approval(application_id, id DESC)",
+    # 2026-10-08: the wait after an Ashby spam refusal. See schema.sql.
+    "ALTER TABLE submit_approval ADD COLUMN not_before INTEGER",
     # 2026-10-08: the one security code a live run may enter. See schema.sql.
     ("CREATE TABLE IF NOT EXISTS submit_code_used (run_id INTEGER PRIMARY KEY REFERENCES submit_run(id), "
      "message_id INTEGER NOT NULL REFERENCES message(id), at TEXT NOT NULL)"),
@@ -11786,11 +11788,18 @@ def _mcp_call(name: str, args: dict) -> str:
 SUBMIT_MODES = ("shadow", "live")
 # What a runner may close a run with. 'submitted' is NOT here: only the submitted route sets it.
 # 'unknown' is a live run that clicked and saw no proof; it is never retried (the approval is spent).
-SUBMIT_OUTCOMES = ("shadow_complete", "stopped", "error", "unknown", "not_clicked")
+SUBMIT_OUTCOMES = ("shadow_complete", "stopped", "error", "unknown", "not_clicked", "spam_refused")
 # 'not_clicked' (2026-10-08, Ashby hand-off): the form was handed to the operator and no click came.
 # The page counted zero clicks and zero submit attempts, so nothing was sent, and the operator
 # decided the approval goes back to 'approved' for the next batch. Refused when any counter is
 # non-zero or the run was released a security code: then a click happened, and the run is 'unknown'.
+# 'spam_refused' (2026-10-08, the operator's rule): Ashby answered the click with its "flagged as
+# possible spam" page, the page still said so at the end, no proof and no confirmation email came,
+# and no security code was released. Ashby's own page says nothing was sent. The FIRST such run
+# for an application puts the approval back to 'approved' with a wait of SUBMIT_SPAM_WAIT_S; the
+# SECOND sets the application aside for manual entry (next_action) and expires its approvals.
+SUBMIT_SPAM_WAIT_S = 4 * 3600
+SUBMIT_SPAM_LIMIT = 2
 SUBMIT_CLICK_COUNTERS = ("human_clicks", "sanctioned", "submit_events", "submit_requests",
                          "post_navigations", "submit_calls")
 SUBMIT_APPROVAL_TTL_S = 24 * 3600
@@ -11862,11 +11871,14 @@ def _submit_live_items(con, app_id, stale, ats: str | None, limit: int) -> list:
         "FROM application a JOIN posting p ON p.id = a.posting_id "
         "JOIN submit_approval s ON s.application_id = a.id "
         "WHERE a.status = 'draft' AND s.status = 'approved' AND s.expires_at > ? "
+        "AND coalesce(s.not_before, 0) <= ? "
         "AND coalesce(a.package_path,'') <> '' AND coalesce(a.alias_used,'') <> '' "
         "AND " + _SUBMIT_ATS_SQL + " "
         "AND NOT EXISTS (SELECT 1 FROM submit_run r WHERE r.application_id = a.id "
-        "  AND r.outcome = 'running' AND r.started_at > ?) ")
-    params: list = [int(time.time()), stale]
+        "  AND r.outcome = 'running' AND r.started_at > ?) "
+        "AND (SELECT count(*) FROM submit_run r WHERE r.application_id = a.id "
+        "  AND r.outcome = 'spam_refused') < ? ")
+    params: list = [int(time.time()), int(time.time()), stale, SUBMIT_SPAM_LIMIT]
     if app_id is not None:
         sql += "AND a.id = ? "
         params.append(int(app_id))
@@ -11989,6 +12001,12 @@ def _submit_close(con, run_id: int, p: dict) -> str | None:
                                      "close the run 'unknown', never 'not_clicked'")
         if con.execute("SELECT 1 FROM submit_code_used WHERE run_id=?", (int(run_id),)).fetchone():
             raise HTTPException(400, "this run was released a security code: a click happened")
+    if outcome == "spam_refused":
+        if run["mode"] != "live" or run["ats"] != "ashby":
+            raise HTTPException(400, "only a live Ashby run closes spam_refused")
+        if con.execute("SELECT 1 FROM submit_code_used WHERE run_id=?", (int(run_id),)).fetchone():
+            raise HTTPException(400, "this run was released a security code: Ashby accepted a click; "
+                                     "close the run 'unknown'")
     token = None
     if outcome == "shadow_complete" and p.get("record") is not None and run["outcome"] == "running":
         token = _submit_approval_create(con, run, p["record"], str(p.get("record_fp") or ""))
@@ -12013,6 +12031,36 @@ def _submit_release(con, run_id: int) -> bool:
         "WHERE consumed_run_id=? AND status='consumed' AND expires_at > ?",
         (int(run_id), int(time.time()))).rowcount
     return bool(n)
+
+
+def _submit_spam_release(con, run_id: int) -> dict:
+    """After a 'spam_refused' close (the operator's rule, 2026-10-08).
+
+    First refusal for the application: the approval this run consumed goes back to 'approved',
+    and no live run may take it for SUBMIT_SPAM_WAIT_S. Second refusal: the application is set
+    aside for manual entry. Its approvals are expired and next_action says what to do.
+    Returns {"refusals": n, "retry_at": unix or None, "manual": bool, "released": bool}."""
+    run = _submit_run_row(con, run_id)
+    if run["outcome"] != "spam_refused":
+        return {"refusals": 0, "retry_at": None, "manual": False, "released": False}
+    app_id = run["application_id"]
+    n = con.execute("SELECT count(*) FROM submit_run WHERE application_id=? AND outcome='spam_refused'",
+                    (app_id,)).fetchone()[0]
+    if n >= SUBMIT_SPAM_LIMIT:
+        con.execute("UPDATE submit_approval SET status='expired' WHERE application_id=? "
+                    "AND status IN ('pending','approved')", (app_id,))
+        con.execute("UPDATE application SET next_action=? WHERE id=?",
+                    (f"Manual entry: Ashby refused the submitter's form as possible spam {n} times "
+                     f"(last run {run_id}). Submit it by hand from your own browser with the "
+                     f"paste-ready sheet.", app_id))
+        return {"refusals": n, "retry_at": None, "manual": True, "released": False}
+    retry_at = int(time.time()) + SUBMIT_SPAM_WAIT_S
+    released = con.execute(
+        "UPDATE submit_approval SET status='approved', consumed_at=NULL, consumed_run_id=NULL, "
+        "not_before=? WHERE consumed_run_id=? AND status='consumed' AND expires_at > ?",
+        (retry_at, int(run_id), retry_at)).rowcount
+    return {"refusals": n, "retry_at": retry_at if released else None, "manual": False,
+            "released": bool(released)}
 
 
 def _submit_clear(con, app_id: int, note: str) -> int:
@@ -12091,7 +12139,7 @@ async def submit_run_step(run_id: int, request: Request, authorization: str | No
 async def submit_run_close(run_id: int, request: Request, authorization: str | None = Header(None)):
     require_submit(authorization, request)
     p = await request.json()
-    released = False
+    released, spam = False, None
     with db() as con:
         token = _submit_close(con, run_id, p)
         log_event(con, "submit_run_close", f"run {run_id} {p.get('outcome')} "
@@ -12101,7 +12149,15 @@ async def submit_run_close(run_id: int, request: Request, authorization: str | N
             log_event(con, "submit_approval_released" if released else "submit_approval_not_released",
                       f"run {run_id}: no click, nothing sent; approval "
                       f"{'back to approved' if released else 'not released (expired?)'}", client_ip(request))
-    out = {"ok": True, **({"released": released} if p.get("outcome") == "not_clicked" else {})}
+        if p.get("outcome") == "spam_refused":
+            spam = _submit_spam_release(con, run_id)
+            log_event(con, "submit_spam_refused",
+                      f"run {run_id}: Ashby refusal {spam['refusals']}; " +
+                      ("set aside for manual entry" if spam["manual"] else
+                       f"approval back to approved, not before {spam['retry_at']}" if spam["released"]
+                       else "approval not released (expired?)"), client_ip(request))
+    out = {"ok": True, **({"released": released} if p.get("outcome") == "not_clicked" else {}),
+           **(spam or {})}
     if token:
         url = f"{PUBLIC_URL}/submit/approve/{token}"
         out["approval_url"] = url

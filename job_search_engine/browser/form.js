@@ -493,8 +493,10 @@ async function watchProof(waitS, allowCode = true) {
     await page.waitForTimeout(1000);
   }
   // No proof: record what the FORM says at the end (its messages sit near the submit button), not
-  // the top of the page, which is the job description.
-  return { status: 'no_proof', url: page.url(), excerpt: await formTail() };
+  // the top of the page, which is the job description. spam_page: Ashby's refusal is still on the
+  // page at the end, which is the runner's evidence that nothing was sent (outcome spam_refused).
+  const last = await page.evaluate(() => document.body ? document.body.innerText : '').catch(() => '');
+  return { status: 'no_proof', url: page.url(), excerpt: await formTail(), spam_page: SPAM.test(last) };
 }
 
 const CODE_ERROR = /(invalid|incorrect|expired|wrong|not valid|didn['’]?t match)[^.]{0,40}\bcode\b|\bcode\b[^.]{0,40}(invalid|incorrect|expired|is wrong|not valid)/i;

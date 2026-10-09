@@ -543,6 +543,14 @@ clicks it. What enforces that:
   the run closes `not_clicked` and the relay puts the approval back to `approved` (the operator's
   decision). The relay refuses `not_clicked` for a run with any counter above zero or a released
   security code; such a run is `unknown` and never retried.
+- **Spam refusal (the operator's rule, 2026-10-08):** a live Ashby run closes `spam_refused`, not
+  `unknown`, only when all of these are true: the refusal appeared during the hand-off, the refusal
+  is still on the page at the end, no proof and no confirmation email came, and the relay released
+  no security code. Ashby's own page then says nothing was sent. The first such run puts the
+  approval back to `approved` with `not_before` four hours out. The second sets the application
+  aside for manual entry: its approvals expire, `next_action` says so, and no live run takes it
+  again. A later retry is a new form and a new click by the operator. Nothing in it changes how
+  the browser looks or behaves to Ashby.
 - `test_human_click` in `form.js` stands in for the operator's click in the test suite only; it
   exists only when `FORMJS_TEST_HUMAN_CLICK=1`, which the submitter host never sets.
 

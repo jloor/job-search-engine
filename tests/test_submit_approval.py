@@ -24,6 +24,7 @@ import pathlib
 import struct
 import sys
 import tempfile
+import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "job_search_engine"))
@@ -424,6 +425,59 @@ with app.db() as con:
                 "'no-reply@ashbyhq.com.evil.example', 'Thank you for applying', '{}', 'confirmation', NULL, 'pass', 'pass')")
 _, e = call(app.submit_run_confirmation, r6, Req(), authorization=S)
 check("a look-alike Ashby sender is not proof", e == 404)
+
+
+print("\nAshby's spam refusal: wait 4 hours, then manual entry after the second (the operator's rule):")
+r7 = live_armed(5, fp5)                 # no board recorded on the run, and no code released
+_, e = call(app.submit_run_close, r7, Req({"outcome": "spam_refused"}), authorization=S)
+check("🚨 a run with no board recorded cannot close spam_refused (400)", e == 400)
+_, e = call(app.submit_run_close, r7, Req({"outcome": "not_clicked", "counters": ZERO}), authorization=S)
+check("…(that run closes not_clicked, and the approval is back)", e is None)
+with app.db() as con:
+    con.execute("UPDATE submit_run SET ats='ashby' WHERE id=?", (r6,))
+_, e = call(app.submit_run_close, r6, Req({"outcome": "spam_refused"}), authorization=S)
+check("🚨 a run that was released a security code cannot close spam_refused: Ashby accepted a click (400)",
+      e == 400)
+
+
+def live_ashby(aid, fpx):
+    rid = call(app.submit_run_open, Req({"application_id": aid, "mode": "live", "record_fp": fpx, "ats": "ashby"}),
+               authorization=S)[0]["run_id"]
+    call(app.submit_run_arm, rid, Req({"record_fp": fpx}), authorization=S)
+    return rid
+
+
+s1 = live_ashby(5, fp5)
+before = int(time.time())
+r, e = call(app.submit_run_close, s1, Req({"outcome": "spam_refused", "stop_reason": "flagged as possible spam"}),
+            authorization=S)
+check("the first refusal: closed, the approval kept, a retry time 4 hours out",
+      e is None and r["released"] is True and r["manual"] is False and r["refusals"] == 1
+      and before + app.SUBMIT_SPAM_WAIT_S <= r["retry_at"] <= int(time.time()) + app.SUBMIT_SPAM_WAIT_S)
+nxt = call(app.submit_next, Req(), authorization=S, app_id=5, mode="live")[0]["next"]
+check("🚨 …and no live run may take it before the wait ends", nxt is None)
+b = call(app.submit_next, Req(), authorization=S, mode="live", ats="ashby", all=1)[0]
+check("🚨 …nor a batch", 5 not in [i["application_id"] for i in b["items"]])
+with app.db() as con:
+    con.execute("UPDATE submit_approval SET not_before=? WHERE application_id=5 AND status='approved'",
+                (int(time.time()) - 1,))
+nxt = call(app.submit_next, Req(), authorization=S, app_id=5, mode="live")[0]["next"]
+check("after the wait, the same approved record is offered again", nxt and nxt["record_fp"] == fp5)
+s2 = live_ashby(5, fp5)
+r, e = call(app.submit_run_close, s2, Req({"outcome": "spam_refused"}), authorization=S)
+with app.db() as con:
+    na = con.execute("SELECT next_action FROM application WHERE id=5").fetchone()[0]
+    left = con.execute("SELECT count(*) FROM submit_approval WHERE application_id=5 "
+                       "AND status IN ('pending','approved')").fetchone()[0]
+    ev = con.execute("SELECT count(*) FROM event WHERE kind='submit_spam_refused'").fetchone()[0]
+check("the second refusal: set aside for manual entry, its approvals expired, next_action says so",
+      e is None and r["manual"] is True and r["released"] is False and left == 0 and "Manual entry" in (na or ""))
+check("both refusals are in the event log", ev == 2)
+with app.db() as con:
+    con.execute("UPDATE submit_approval SET status='approved', not_before=NULL WHERE id=(SELECT max(id) "
+                "FROM submit_approval WHERE application_id=5)")
+nxt = call(app.submit_next, Req(), authorization=S, app_id=5, mode="live")[0]["next"]
+check("🚨 after two refusals, even an approved record is never offered to a live run", nxt is None)
 
 print(f"\n{'FAILED: ' + str(len(fails)) if fails else 'all passed'}")
 sys.exit(1 if fails else 0)

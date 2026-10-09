@@ -58,9 +58,10 @@ def opener_for(job=JOB, board_ok=True):
 
 
 class Relay:
-    def __init__(self, items=None, release=True):
+    def __init__(self, items=None, release=True, spam=None):
         self.steps, self.closed, self.armed, self.reported = [], [], [], []
         self.items, self.release, self.n = items or [], release, 0
+        self.spam = spam or {"refusals": 1, "released": True, "retry_at": 4102444800, "manual": False}
 
     def open(self, **kw):
         self.opened = kw
@@ -72,6 +73,8 @@ class Relay:
 
     def close(self, run_id, **kw):
         self.closed.append(kw)
+        if kw.get("outcome") == "spam_refused":
+            return {"ok": True, **self.spam}
         return {"ok": True, "released": self.release} if kw.get("outcome") == "not_clicked" else {"ok": True}
 
     def arm(self, run_id, record_fp):
@@ -102,8 +105,8 @@ ZERO = {"submit_events": 0, "submit_calls": 0, "post_navigations": 0, "sanctione
 
 class FakeBrowser:
     """proofs: what each await_proof returns, in order. counters: the readback after the hand-off."""
-    def __init__(self, proofs=("proof",), counters=None):
-        self.proofs, self.counters = list(proofs), counters
+    def __init__(self, proofs=("proof",), counters=None, spam_page=False):
+        self.proofs, self.counters, self.spam_page = list(proofs), counters, spam_page
         self.sent, self.filled, self.handoff_kw = [], {}, None
 
     def __call__(self, cmd, **kw):
@@ -142,7 +145,8 @@ class FakeBrowser:
             st = self.proofs.pop(0) if self.proofs else "no_proof"
             return {"ok": True, "status": st, "url": URL + "/application",
                     "excerpt": {"proof": "Your application was successfully submitted",
-                                "spam_refused": "flagged as possible spam"}.get(st, "")}
+                                "spam_refused": "flagged as possible spam"}.get(st, ""),
+                    **({"spam_page": self.spam_page} if st == "no_proof" else {})}
         if cmd == "enter_code":
             return {"ok": True, "status": "proof", "url": URL, "excerpt": "Your application was successfully submitted"}
         if cmd == "status":
@@ -205,6 +209,26 @@ check("the refusal is recorded as a step, and the person is told nothing was sen
       any("possible spam" in s["detail"] for s in relay.steps)
       and any("refused that click" in a["title"] for a in alerts))
 check("…then the second click's proof submits it", r["outcome"] == "submitted")
+
+print("\na spam refusal and no proof (the operator's rule, 2026-10-08):")
+CLICKED = dict(ZERO, human_clicks=1, submit_events=1)
+br = FakeBrowser(proofs=["spam_refused", "no_proof"], counters=CLICKED, spam_page=True)
+r, relay, _ = run(br)
+check("the refusal still on the page: closed spam_refused, never 'unknown'",
+      r["outcome"] == "spam_refused" and relay.closed[-1]["outcome"] == "spam_refused"
+      and all(c["outcome"] != "unknown" for c in relay.closed))
+check("…the confirmation email was awaited first", any(s["name"] == "confirm" for s in relay.steps))
+check("…and it says the approval is kept, with the retry time", "retry after" in r["why"])
+r, relay, _ = run(FakeBrowser(proofs=["spam_refused", "no_proof"], counters=CLICKED, spam_page=True),
+                  relay=Relay(spam={"refusals": 2, "released": False, "retry_at": None, "manual": True}))
+check("the second refusal: set aside for manual entry", r["outcome"] == "spam_refused" and "manual entry" in r["why"])
+br = FakeBrowser(proofs=["spam_refused", "no_proof"], counters=CLICKED, spam_page=False)
+r, relay, _ = run(br)
+check("🚨 the refusal GONE from the page at the end (a later click may have gone through): 'unknown'",
+      r["outcome"] == "unknown")
+br = FakeBrowser(proofs=["no_proof"], counters=CLICKED, spam_page=True)
+r, relay, _ = run(br)
+check("🚨 a spam page with no refusal seen during the hand-off: 'unknown'", r["outcome"] == "unknown")
 
 print("\nno click:")
 br = FakeBrowser(proofs=["no_proof"], counters=ZERO)

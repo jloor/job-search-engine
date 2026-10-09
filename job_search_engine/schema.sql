@@ -974,7 +974,11 @@ CREATE TABLE IF NOT EXISTS submit_approval (
   approved_by       TEXT,
   approved_at       TEXT,
   consumed_at       TEXT,
-  consumed_run_id   INTEGER
+  consumed_run_id   INTEGER,
+  -- 2026-10-08: after Ashby refused a click as possible spam, the approval goes back to
+  -- 'approved' with this unix time set: no live run may take it before then (the operator's
+  -- 4-hour wait). A second refusal for the application sets it aside for manual entry.
+  not_before        INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_submit_approval_app ON submit_approval(application_id, id DESC);
 

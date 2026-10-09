@@ -185,6 +185,9 @@ try:
     r = br("await_proof", wait_s=10)
     check("the refusal is reported as spam_refused, with the page's words",
           r["status"] == "spam_refused" and "possible spam" in r["excerpt"])
+    r = br("await_proof", wait_s=2)
+    check("no further click: no proof, and the refusal still on the page (spam_page)",
+          r["status"] == "no_proof" and r.get("spam_page") is True)
     br("test_human_click")
     r = br("await_proof", wait_s=10)
     check("the person's second click goes through", r["status"] == "proof")
@@ -203,6 +206,7 @@ try:
     c = br("readback")["blocked_submits"]
     check("no proof, and every counter reads zero: nothing was attempted",
           r["status"] == "no_proof" and not any(c.values()))
+    check("…and no spam refusal on the page", r.get("spam_page") is False)
     check("nothing reached the server", not posts)
 finally:
     br.quit()
