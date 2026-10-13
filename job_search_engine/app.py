@@ -916,6 +916,12 @@ MIGRATIONS = [
      "assertion_json TEXT, approved_by TEXT, approved_at TEXT, result_code INTEGER, "
      "result_output TEXT, done_at TEXT)"),
     "CREATE INDEX IF NOT EXISTS idx_root_request_status ON root_request(status, id)",
+    # 2026-10-13: every attempt at the VA's queue notice. See schema.sql.
+    # ⚠️ The column list must stay identical to schema.sql.
+    ("CREATE TABLE IF NOT EXISTS va_notice ("
+     "id INTEGER PRIMARY KEY, at TEXT NOT NULL, count INTEGER, "
+     "to_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, detail TEXT, resend_id TEXT)"),
+    "CREATE INDEX IF NOT EXISTS idx_va_notice_status_at ON va_notice(status, at)",
 ]
 
 
@@ -11049,6 +11055,172 @@ def _send_via_resend(from_alias: str, to_addr: str, subject: str, body: str, par
     if not out.get("id"):
         raise RuntimeError(f"no id in response: {str(out)[:200]}")
     return f"<{out['id']}@resend>"
+
+
+# ============================================================ the VA's queue notice
+# 2026-10-13. When packages are released to a hired virtual assistant's queue, the VM asks
+# this relay to email the VA ONE fixed notice: "N new tasks are ready, sign in here".
+#
+# ⭐ WHY IT LIVES HERE. The VM is a different host and must never hold RESEND_API_KEY. That
+# key can send as ANY alias on the domain, so a copy on a second host doubles the places a
+# leak sends mail as the operator. The relay already holds it; the VM holds only the admin
+# token and asks.
+#
+# 🚨 THIS IS THE SECOND OUTBOUND PATH WITHOUT A HUMAN'S APPROVAL, AND IT IS SHAPED SO IT CAN
+# SEND NOTHING ELSE. The caller supplies ONE integer. The recipients, the sender, the link,
+# the subject and every word of the body are configuration or constants. An attacker who holds
+# the admin token gains the ability to tell the VA that some number of tasks exist, at most
+# once per VA_NOTIFY_MIN_GAP_S. If this ever grows a `to`, a `subject`, a `body` or a `url`
+# parameter, it has become /send without the approval and must be deleted rather than guarded.
+#
+# ⚠️ No package, company or candidate data goes in the mail. The VA reads that after signing
+# in, behind the queue's own login.
+VA_NOTIFY_TO   = os.environ.get("VA_NOTIFY_TO", "").strip()
+# ⚠️ The default sender is built from MAIL_DOMAIN, never typed here. With MAIL_DOMAIN unset
+# there is no default, and the route answers 503 rather than inventing a domain.
+VA_NOTIFY_FROM = os.environ.get("VA_NOTIFY_FROM", "").strip()
+VA_NOTIFY_URL  = os.environ.get("VA_NOTIFY_URL", "").strip()
+VA_NOTIFY_MIN_GAP_S = int(os.environ.get("VA_NOTIFY_MIN_GAP_S", "10800"))      # 3 hours
+# A constant, not a setting. The notice goes to the VA and perhaps one backup; a list longer
+# than this is a misconfiguration or an attempt to turn the notice into a mailshot.
+VA_NOTIFY_MAX_TO = 5
+VA_NOTIFY_MAX_COUNT = 50
+VA_NOTIFY_SUBJECT = "New tasks in your queue"
+
+_VA_ADDR_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+_ANY_ADDR_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+")
+
+
+def va_notice_body(count: int, url: str) -> str:
+    """The whole body. Pure, so the exact text is testable without a network."""
+    lead = ("1 new task is ready in your queue." if count == 1
+            else f"{count} new tasks are ready in your queue.")
+    return (f"{lead}\n\nSign in here: {url}\n\n"
+            "This is an automatic notice. Please do not reply.")
+
+
+def _va_config() -> tuple[list[str], str, str] | str:
+    """(recipients, sender, url), or the reason the notice is not configured.
+
+    Every value is checked strictly, because a value that only LOOKS like one address (a
+    comma inside a display name, a newline) is how a fixed notice becomes a header injection.
+    """
+    to = [a.strip() for a in VA_NOTIFY_TO.split(",") if a.strip()]
+    if not to:
+        return "VA notice not configured (VA_NOTIFY_TO)"
+    if len(to) > VA_NOTIFY_MAX_TO or not all(_VA_ADDR_RE.match(a) for a in to):
+        return "VA notice misconfigured (VA_NOTIFY_TO)"
+    if not MAIL_DOMAIN:
+        return "VA notice not configured (MAIL_DOMAIN)"
+    sender = VA_NOTIFY_FROM or f"notify@{MAIL_DOMAIN}"
+    if not (_VA_ADDR_RE.match(sender) and sender.lower().endswith("@" + MAIL_DOMAIN.lower())):
+        return f"VA notice misconfigured (VA_NOTIFY_FROM must be an address @{MAIL_DOMAIN})"
+    url = VA_NOTIFY_URL
+    if not url:
+        return "VA notice not configured (VA_NOTIFY_URL)"
+    if not url.startswith("https://") or any(c.isspace() for c in url) or len(url) > 300:
+        return "VA notice misconfigured (VA_NOTIFY_URL)"
+    if not RESEND_API_KEY:
+        return "VA notice not configured (RESEND_API_KEY)"
+    return to, sender, url
+
+
+def _va_record(con, count, to_count: int, status: str, detail: str,
+               resend_id: str | None = None) -> int:
+    cur = con.execute(
+        "INSERT INTO va_notice(at,count,to_count,status,detail,resend_id) VALUES (?,?,?,?,?,?)",
+        (now(), count, to_count, status, detail[:500], resend_id))
+    return cur.lastrowid
+
+
+def _va_scrub(text: str) -> str:
+    """An error from Resend can echo the recipient. Addresses never reach the table or a log."""
+    return _ANY_ADDR_RE.sub("<addr>", text)
+
+
+@app.post("/va/notify")
+async def va_notify(request: Request, authorization: str | None = Header(None)):
+    """Email the VA the fixed queue notice. Admin token only. Body: {"count": 1..50}, nothing else.
+
+    429 with {"retry_after_s": N} while the last notice is younger than VA_NOTIFY_MIN_GAP_S; the
+    caller keeps its own pending count and asks again later. Every attempt after the token check
+    is a row in va_notice.
+    """
+    require_admin(authorization, request)
+    try:
+        p = await request.json()
+    except Exception:
+        p = None
+    # 🚨 EXACTLY ONE KEY. An unknown key is refused rather than ignored, so a caller that
+    # believes it is passing a subject or a recipient finds out at once instead of assuming
+    # it worked. bool is refused explicitly: in Python True is an int.
+    if not isinstance(p, dict) or set(p) != {"count"}:
+        with db() as con:
+            _va_record(con, None, 0, "refused", "bad body: exactly one key, count, is accepted")
+        raise HTTPException(400, 'refused: the body must be exactly {"count": <int 1..50>}')
+    count = p["count"]
+    if (isinstance(count, bool) or not isinstance(count, int)
+            or not 1 <= count <= VA_NOTIFY_MAX_COUNT):
+        with db() as con:
+            _va_record(con, None, 0, "refused", "bad count")
+        raise HTTPException(400, f"refused: count must be an integer 1..{VA_NOTIFY_MAX_COUNT}")
+
+    cfg = _va_config()
+    if isinstance(cfg, str):
+        with db() as con:
+            _va_record(con, count, 0, "refused", cfg)
+        raise HTTPException(503, cfg)
+    to, sender, url = cfg
+
+    # ⭐ THE RATE LIMIT IS ONE STATEMENT, SO TWO CALLS CANNOT BOTH PASS IT. Bunny runs each
+    # statement on its own (no transaction spans a `with db()` block there), so a SELECT then
+    # an INSERT would let two concurrent requests both see "no recent notice". The INSERT
+    # carries the condition instead, and the row it writes ('sending') is the reservation.
+    # 'error' does not count, so a failed send can be retried at once; a crash mid-send leaves
+    # 'sending' and holds the gap, which fails toward fewer mails, never more.
+    cutoff = datetime.fromtimestamp(time.time() - VA_NOTIFY_MIN_GAP_S,
+                                    timezone.utc).isoformat(timespec="seconds")
+    with db() as con:
+        cur = con.execute(
+            "INSERT INTO va_notice(at,count,to_count,status,detail) "
+            "SELECT ?,?,?,'sending','' WHERE NOT EXISTS (SELECT 1 FROM va_notice "
+            "  WHERE status IN ('sent','sending') AND at > ?)",
+            (now(), count, len(to), cutoff))
+        nid = cur.lastrowid if (cur.rowcount or 0) else None
+        if nid is None:
+            last = con.execute("SELECT max(at) a FROM va_notice "
+                               "WHERE status IN ('sent','sending')").fetchone()
+            try:
+                age = time.time() - datetime.fromisoformat(last["a"]).timestamp()
+            except Exception:                                 # noqa: BLE001
+                age = 0
+            wait = max(1, int(VA_NOTIFY_MIN_GAP_S - age + 0.999))
+            _va_record(con, count, len(to), "refused", f"rate limit: retry in {wait}s")
+            return JSONResponse({"retry_after_s": wait}, status_code=429,
+                                headers={"Retry-After": str(wait)})
+
+    # One message per recipient, so no VA sees another's address. Resend only: SMTP can send
+    # only as SMTP_USER, which is not the configured sender. No bcc and no parent: this notice
+    # is not a reply and the operator's sent-copy is for approved mail only.
+    body = va_notice_body(count, url)
+    ids, errors = [], []
+    for addr in to:
+        try:
+            ids.append(_send_via_resend(sender, addr, VA_NOTIFY_SUBJECT, body, None))
+        except Exception as e:                                # noqa: BLE001
+            errors.append(_va_scrub(f"{type(e).__name__}: {e}")[:200])
+    rid = " ".join(ids) or None
+    status = "sent" if ids else "error"
+    detail = (f"sent {len(ids)} of {len(to)}" + (f"; {' | '.join(errors)}" if errors else ""))
+    with db() as con:
+        con.execute("UPDATE va_notice SET status=?, detail=?, resend_id=? WHERE id=?",
+                    (status, detail[:500], rid, nid))
+    if not ids:
+        raise HTTPException(502, f"VA notice not sent: {detail[:300]}")
+    out = {"sent": True, "resend_id": rid, "to_count": len(ids)}
+    if errors:
+        out["failed_count"] = len(errors)
+    return out
 
 
 # ============================================================ MCP control plane

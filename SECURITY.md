@@ -258,6 +258,7 @@ Admin is a superset, so driving by hand needs one token rather than two. Verifie
 | `/diag/ip`, `/diag/repo`, `/diag/mailports` | **403** | 200 | 401 |
 | `POST /send` | **403** | 400 (field validation, past auth) | 401 |
 | `/submit/*` | **403** | **403** | 401 (503 when `SUBMIT_TOKEN` is unset) |
+| `POST /va/notify` | **403** | 200, 400, 429 or 503 | 401 |
 | `POST /submit/clear/{app}` | **403** | 200 | 401. ⚠️ **Admin only, and the submit token is refused:** a stopped run waits for a person, so the runner must not be able to clear its own stops. |
 | `/submit/approve/{token}` (page, options, verify) | no token: the link plus an active **passkey** | | the passkey is the gate; the link alone shows the record and cannot approve it |
 
@@ -446,6 +447,44 @@ approval, and the exception is deliberately shaped so it cannot become a general
 
 **The line that must not be crossed:** if this ever grows a `to` parameter, it has become
 `/send` without the approval, and it must be deleted rather than guarded.
+
+## 📨 The VA's queue notice, added 2026-10-13 with `POST /va/notify`
+
+A hired virtual assistant works a queue of packages. When packages are released to it, the VM
+asks the relay to email the VA "N new tasks are ready, sign in here". This is the second
+outbound path without a human's approval, and it is shaped like the inbox reply so it cannot
+become a general one.
+
+**Why the relay sends it and the VM does not:** `RESEND_API_KEY` can send as ANY alias on the
+domain. A copy on the VM would double the hosts where a leak sends mail as the operator. The VM
+holds the admin token and asks; the key stays in the container.
+
+**Why it is not a hole in `/send`:**
+
+- 🚨 **The caller supplies one integer.** The body must be exactly `{"count": <int 1..50>}`. Any
+  other key is a 400, not ignored. Recipients (`VA_NOTIFY_TO`), sender (`VA_NOTIFY_FROM`), link
+  (`VA_NOTIFY_URL`), subject and body text are configuration or constants. An attacker with the
+  admin token gains the ability to tell the VA that some number of tasks exist.
+- 🚨 **At most one notice per `VA_NOTIFY_MIN_GAP_S`** (default 3 hours). The check and the
+  reservation are one SQL statement, so two concurrent calls cannot both pass it. A crash during
+  a send holds the gap: it fails toward fewer mails.
+- **Configuration is checked strictly.** At most 5 recipients, bare addresses only (no display
+  name, no newline), a sender on `MAIL_DOMAIN`, an `https://` link with no whitespace. Anything
+  else is a 503 and nothing is sent. Unset is closed, never open.
+- **No data leaves in it.** No package, company or candidate data. The VA reads that behind the
+  queue's own sign-in.
+- **No address is stored.** `va_notice` records the count, how many recipients, the status and
+  Resend's ids. An error that echoes an address is scrubbed before it is written.
+- `/send`, `/send/queue` and every approval path are untouched. This route cannot reply to a
+  message, cannot add a BCC, and cannot use SMTP.
+
+**The line that must not be crossed:** if this ever grows a `to`, `subject`, `body` or `url`
+parameter, it has become `/send` without the approval, and it must be deleted rather than
+guarded.
+
+⚠️ **What it does not stop:** a holder of the admin token can make the VA receive a misleading
+count, once per gap. The admin token can already do far more than that, so this adds no
+capability worth guarding further.
 
 ## 🖱️ The browser submitter, added 2026-10-07 with `submit.py`
 

@@ -109,6 +109,9 @@ jobs:
       - run: python3 tests/test_root_request.py
       # Added 2026-10-08: the backup retry buffer, after a full volume shipped truncated snapshots.
       - run: python3 tests/test_backup_buffer.py
+      # Added 2026-10-13: the VA's queue notice. Guards that only the admin token sends it, that
+      # no caller text reaches the mail, the gap between notices, and that no address is stored.
+      - run: python3 tests/test_va_notify.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #

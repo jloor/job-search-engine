@@ -79,7 +79,8 @@ def load_app():
     resp = types.ModuleType("fastapi.responses")
 
     class JSONResponse:
-        def __init__(self, c, status_code=200): self.content, self.status_code = c, status_code
+        def __init__(self, c, status_code=200, headers=None):
+            self.content, self.status_code, self.headers = c, status_code, headers or {}
 
     resp.JSONResponse = JSONResponse
     fa.responses = resp

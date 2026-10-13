@@ -1016,3 +1016,18 @@ CREATE TABLE IF NOT EXISTS root_request (
   done_at           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_root_request_status ON root_request(status, id);
+
+-- Every attempt at the VA's queue notice (POST /va/notify, 2026-10-13). The notice is a fixed
+-- text; the caller supplies only `count`. This table is the record and also the rate limit:
+-- a row at 'sent' or 'sending' younger than VA_NOTIFY_MIN_GAP_S refuses the next notice.
+-- 🚨 No address is stored, here or in a log. `to_count` is how many recipients it went to.
+CREATE TABLE IF NOT EXISTS va_notice (
+  id         INTEGER PRIMARY KEY,
+  at         TEXT NOT NULL,
+  count      INTEGER,                                     -- NULL when the body was refused
+  to_count   INTEGER NOT NULL DEFAULT 0,
+  status     TEXT NOT NULL,                               -- sending (transient) | sent | refused | error
+  detail     TEXT,                                        -- why, with any address scrubbed
+  resend_id  TEXT                                         -- Resend's ids, space-separated
+);
+CREATE INDEX IF NOT EXISTS idx_va_notice_status_at ON va_notice(status, at);

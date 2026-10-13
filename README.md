@@ -503,6 +503,43 @@ send.jobs                MX    10 feedback-smtp.us-east-1.amazonses.com
 `jobs.example.com` MX still points at ImprovMX for inbound; the apex still points at
 Fastmail. Resend's "Enable Receiving" is deliberately **off**.
 
+## Routes that send mail
+
+| Route | Token | Who chooses the recipient and the text | Human approval |
+|---|---|---|---|
+| `POST /send` | admin | the caller | **required**: a signed approval of the exact bytes |
+| `POST /send/queue` | admin | the caller | **required**: the operator's passkey; queueing sends nothing |
+| `POST /va/notify` | admin | **configuration only**; the caller sends `{"count": 1..50}` and nothing else | none, by design (see below) |
+| inbox reply (`job_inbox_url`) | none (a scheduled job) | configuration only | none, by design (see SECURITY.md) |
+
+### `POST /va/notify`: the VA's queue notice (2026-10-13)
+
+When packages are released to a hired virtual assistant's queue, the VM asks the relay to email
+the VA one fixed notice. The VM is a different host and never holds `RESEND_API_KEY`.
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+     -d '{"count": 3}' https://<host>/va/notify
+# 200 {"sent": true, "resend_id": "...", "to_count": 1}
+# 429 {"retry_after_s": N}   a notice went out less than VA_NOTIFY_MIN_GAP_S ago; nothing sent
+# 503                         not configured; nothing sent
+# 400                         any key other than count, or count outside 1..50
+```
+
+The mail is plain text, subject `New tasks in your queue`, body *"N new tasks are ready in your
+queue. Sign in here: VA_NOTIFY_URL. This is an automatic notice. Please do not reply."* (singular
+for 1). No package, company or candidate data. Every attempt is a row in `va_notice`, which
+stores how many recipients, never who.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `VA_NOTIFY_TO` | none | Comma-separated, at most 5 bare addresses. **Unset means 503.** |
+| `VA_NOTIFY_FROM` | `notify@<MAIL_DOMAIN>` | Must be a bare address on `MAIL_DOMAIN`. |
+| `VA_NOTIFY_URL` | none | The queue's sign-in page, `https://` only. **Unset means 503.** |
+| `VA_NOTIFY_MIN_GAP_S` | `10800` | The least time between two notices. The caller keeps its own count and retries. |
+
+Resend only: SMTP can send only as `SMTP_USER`. One message per recipient, no BCC copy.
+
 ## ✅ Outbound SMTP also works as of 2026-08-12 20:45 UTC (was blocked; the Bunny case fixed it)
 
 Port **587 is now open** from the container to Gmail, Fastmail and ImprovMX. The full
