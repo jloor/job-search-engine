@@ -112,6 +112,10 @@ jobs:
       # Added 2026-10-13: the VA's queue notice. Guards that only the admin token sends it, that
       # no caller text reaches the mail, the gap between notices, and that no address is stored.
       - run: python3 tests/test_va_notify.py
+      # Added 2026-10-13: the place job read "fantastic|<ats>" as one employer's office and
+      # measured time zone text as a place. Guards that an ATS-named board uses the city row
+      # and no office lookup, that a time zone is ruled and never routed, and the retire step.
+      - run: python3 tests/test_place_rules.py
 
   # 🚨 THE DRIFT GUARD ONLY RUNS WHEN THE ARCHIVER IS INSTALLED, AND IT NEVER WAS.
   #

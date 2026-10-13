@@ -409,6 +409,24 @@ class _RS:
         return iter(self._rows)
 
 
+# 🚨 ONE-TIME DATA FIX, 2026-10-13, written as an idempotent migration like the scan_run
+# backfill below. job_place wrote `place` rows keyed on "fantastic|<ats>" boards, which name
+# the platform and not the employer (see _NO_OFFICE_BOARD). 148 such rows existed, 13 with
+# a verdict. job_place no longer writes or reads them, and this hides the ones it left.
+# ⭐ RETIRED, NEVER DELETED: the same soft delete as an origin change, so a mistake costs one
+# UPDATE to revert. retired_origin keeps the origin as that path does. The note says why, so
+# these rows are never confused with a re-origin.
+# 🚨 A HUMAN ROW IS NEVER TOUCHED. human > measurement > model, and no migration outranks him.
+# ⚠️ Idempotent: `retired_at IS NULL` makes every run after the first change nothing. It runs
+# at every start, so a row written later by an older tool is retired on the next start too.
+RETIRE_ATS_BOARD_PLACES = (
+    "UPDATE place SET retired_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now'), "
+    "retired_origin = origin, "
+    "note = CASE WHEN coalesce(note, '') = '' THEN '' ELSE note || ' | ' END "
+    "|| 'retired: the board names the ATS, not the employer' "
+    "WHERE board LIKE 'fantastic|%' AND retired_at IS NULL "
+    "AND coalesce(verdict_from, '') <> 'human'")
+
 # Columns added after the first deployment. CREATE TABLE IF NOT EXISTS will not add a
 # column to a table that already exists, so each one is applied separately and a
 # "duplicate column" error is the expected no-op on an up-to-date database.
@@ -922,6 +940,9 @@ MIGRATIONS = [
      "id INTEGER PRIMARY KEY, at TEXT NOT NULL, count INTEGER, "
      "to_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, detail TEXT, resend_id TEXT)"),
     "CREATE INDEX IF NOT EXISTS idx_va_notice_status_at ON va_notice(status, at)",
+    # 2026-10-13: retire the office rows keyed on an ATS name. See RETIRE_ATS_BOARD_PLACES.
+    # ⚠️ LAST in this list on purpose: it needs place.retired_at, added further up.
+    RETIRE_ATS_BOARD_PLACES,
 ]
 
 
@@ -5789,6 +5810,63 @@ _UNROUTABLE = re.compile(
 # and on 2026-08-16 that produced 2,568 minutes for a role whose New York office is 75.
 _MULTI = re.compile(r"\s\|\s|;|\bor\b|/(?=\s*[A-Z])|,\s*[A-Z][a-z]+,\s*[A-Z]{2}\s*,")
 
+# 🚨 A TIME ZONE IS NOT A PLACE, AND THE ROUTER MEASURED IT AS ONE. Found 2026-10-13:
+# "Eastern or Central Timezone", "United States (Any Time Zone)" and "Central and Eastern
+# USA" went to Distance Matrix, came back at 399 to 2,008 minutes to some arbitrary point,
+# and were marked too_far BY MEASUREMENT. too_far is the one verdict the gate rejects on, so
+# a remote role was hidden on a number about nowhere. A human corrected all three.
+#
+# ⭐ TWO TESTS, BOTH ABOUT THE WHOLE STRING HAVING NO CITY IN IT:
+#   1. it says "time zone" or "timezone" anywhere. No city is named that way, and a city
+#      followed by a time zone note is rare enough that one human glance is the right cost.
+#   2. EVERY word in it is region or time zone vocabulary, and at least one is a region.
+#      "Central and Eastern USA" passes. "Mountain View, CA", "Central Islip, NY" and
+#      "Eastern Shore, MD" do not, because "view", "islip" and "shore" are not in the list.
+# ⚠️ That is why test 2 is a vocabulary over EVERY token and never a search for one word.
+# "Central", "Eastern", "Mountain" and "Pacific" all start real place names.
+# 📌 "ct" and "mt" are left out of the vocabulary on purpose. They are also Connecticut and
+# Montana, and a state code must never be read as a time zone.
+_TZ_TEXT = re.compile(r"\btime\s*zones?\b|\btimezones?\b", re.I)
+_REGION_CORE = frozenset((
+    "eastern", "western", "central", "mountain", "pacific", "atlantic", "midwest",
+    "midwestern", "northeast", "northeastern", "southeast", "southeastern", "northwest",
+    "northwestern", "southwest", "southwestern", "northern", "southern", "east", "west",
+    "north", "south", "americas"))
+_REGION_FILL = frozenset((
+    "us", "usa", "united", "states", "america", "region", "regions", "coast", "mid",
+    "time", "standard", "daylight", "et", "est", "edt", "cst", "cdt", "mst", "mdt", "pt",
+    "pst", "pdt", "and", "or", "the", "of", "only", "any", "preferred"))
+
+
+def _zone_or_region(loc: str) -> bool:
+    """True when a location string is a time zone or a region with no city in it."""
+    import gates as _G
+    t = _G.norm_loc(loc)
+    if _TZ_TEXT.search(t):
+        return True
+    toks = [x.replace(".", "") for x in re.split(r"[\s,/&()+-]+", t.lower())]
+    toks = [x for x in toks if x]
+    return (bool(toks) and all(x in _REGION_CORE or x in _REGION_FILL for x in toks)
+            and any(x in _REGION_CORE for x in toks))
+
+
+# 🚨 A BOARD KEY THAT NAMES THE ATS IS NOT AN EMPLOYER. A row in `place` with a board is ONE
+# employer's office. Every Fantastic posting carries board "fantastic|<ats>", for example
+# "fantastic|greenhouse", which names the platform the employer uses and not the employer.
+# Read as an office key, every Fantastic employer on one platform shared one office row per
+# city, and the street-address lookup searched for the platform's name: "fantastic|breezy"
+# resolved to Breezy Point, NY, and "fantastic|greenhouse" in New York held another
+# company's mailbox. Measured 2026-10-13: 148 such rows, 13 of them with a verdict.
+# ⭐ So such a board is NO board here. The posting reads the city row, and no office lookup
+# runs. scan_candidate.board keeps its shape: fantastic.py's req_id and the dedupe read it.
+_NO_OFFICE_BOARD = ("fantastic|",)
+
+
+def _place_board(board: str | None) -> str:
+    """The place-table board key for a posting's board. '' means the city row."""
+    b = (board or "").strip()
+    return "" if b.startswith(_NO_OFFICE_BOARD) else b
+
 
 def _next_weekday_9am() -> int:
     """Unix time for the next Tuesday 09:00 local-ish. Commutes are a weekday question."""
@@ -6045,9 +6123,10 @@ def job_place() -> str:
     that cost money:
         1. eligibility for every row            free, no API, no model
         2. remote in the text                   no office, so no commute to find
-        3. names several places                 a single measurement would be the wrong one
-        4. a country or region                  not a destination at all
-        5. what is left                         measured, and only then
+        3. a time zone or a region, no city     not a destination at all
+        4. names several places                 a single measurement would be the wrong one
+        5. a country or region                  not a destination at all
+        6. what is left                         measured, and only then
     """
     try:
         import candidate as _C, gates as _G
@@ -6061,7 +6140,8 @@ def job_place() -> str:
     ceiling = int((cfg.get("commute") or {}).get("max_minutes") or 90)
     ver = ENGINE_VERSION
     elig_written = 0
-    ruled = {"remote": 0, "multi": 0, "unroutable": 0, "measured": 0, "failed": 0}
+    ruled = {"remote": 0, "zone": 0, "multi": 0, "unroutable": 0, "measured": 0,
+             "failed": 0}
     dropped_stale = 0
 
     with db() as con:
@@ -6161,6 +6241,15 @@ def job_place() -> str:
         if _G.REMOTE_TXT.search(loc):
             record(loc, t["n"], "remote", "rule", "remote in the location text")
             ruled["remote"] += 1
+        elif _zone_or_region(loc):
+            # 🚨 BEFORE _MULTI, because "Eastern or Central Timezone" contains "or" and would
+            # be split into two "places" and measured. See _TZ_TEXT for the incident.
+            # ⭐ 'review', NOT 'remote'. The rule layer says remote only when the text says
+            # remote, and that already ran above: "Remote (EST timezone)" never gets here.
+            # A time zone alone does not state the arrangement. 'review' never rejects
+            # (only too_far does), and a human who knows the posting outranks this rule.
+            record(loc, t["n"], "review", "rule", "a time zone or region, not an office")
+            ruled["zone"] += 1
         elif _MULTI.search(loc):
             # ⭐ MEASURE EVERY NAMED PLACE AND KEEP THE CLOSEST. The old behaviour refused to
             # measure at all, because ONE measurement of a list describes one arbitrary entry:
@@ -6228,9 +6317,10 @@ def job_place() -> str:
                 "   AND coalesce(sc.eligibility,'unknown') <> 'ineligible' "
                 "   AND sc.location IS NOT NULL AND sc.location <> '' "
                 " GROUP BY sc.board, sc.location", (PLACE_MIN_SCORE,)).fetchall()
+            # ⚠️ The same key as the pairs above, so the two sides agree on what a board is.
             have_pair = {(r["board"], r["location"]) for r in con.execute(
                 "SELECT board, location FROM place WHERE board <> '' AND origin = ? "
-                "AND retired_at IS NULL", (origin,)).fetchall()}
+                "AND retired_at IS NULL", (origin,)).fetchall() if _place_board(r["board"])}
             city = {r["location"]: dict(r) for r in con.execute(
                 "SELECT location, verdict, best_min, measured_to FROM place "
                 "WHERE board = '' AND origin = ? AND retired_at IS NULL",
@@ -6238,11 +6328,16 @@ def job_place() -> str:
 
         todo_addr = []
         for r in pairs:
-            b, loc = r["board"], r["location"]
+            b, loc = _place_board(r["board"]), r["location"]
+            if not b:
+                # An ATS-named board is no employer, so the city row already answers it.
+                # See _NO_OFFICE_BOARD. Not counted as skipped: there is no office to skip.
+                continue
             if (b, loc) in have_pair:
                 continue
             c = city.get(loc) or {}
-            if _G.REMOTE_TXT.search(loc) or _MULTI.search(loc) or _UNROUTABLE.match(loc):
+            if (_G.REMOTE_TXT.search(loc) or _zone_or_region(loc) or _MULTI.search(loc)
+                    or _UNROUTABLE.match(loc)):
                 # No office to find, or several and one address would be the wrong one.
                 addr_done["skipped"] += 1
             elif c.get("verdict") == "too_far" and (c.get("best_min") or 0) > ceiling * 2:
@@ -6324,7 +6419,8 @@ def job_place() -> str:
 
     left = max(0, len(measure_queue) - PLACE_BATCH * 4)
     return ((f"re-origin: dropped {dropped_stale} stale rows; " if dropped_stale else "")
-            + f"eligibility {elig_written}; remote {ruled['remote']}, multi {ruled['multi']}, "
+            + f"eligibility {elig_written}; remote {ruled['remote']}, zone {ruled['zone']}, "
+            f"multi {ruled['multi']}, "
             f"unroutable {ruled['unroutable']}, measured {ruled['measured']}, "
             f"failed {ruled['failed']}"
             + (f"; offices resolved {addr_done['resolved']}, rejected {addr_done['rejected']}, "
