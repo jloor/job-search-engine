@@ -23,6 +23,13 @@
     <input type="email" id="_systemfield_email" name="_systemfield_email" required></div>
   <div class="field"><label class="ashby-application-form-question-title _required_x1" for="_systemfield_resume">Resume</label>
     <input type="file" id="_systemfield_resume" name="_systemfield_resume" required></div>
+  <!-- Ashby's Location: a combobox with NO id and NO name; its title points at nothing (2026-10-15). -->
+  <div class="ashby-application-form-field-entry" data-field-path="_systemfield_location">
+    <label class="ashby-application-form-question-title _required_x1" for="_systemfield_location">Location</label>
+    <div><p>Where do you currently reside</p></div>
+    <div><input class="ashby-application-form-input-autocomplete" placeholder="Start typing..." role="combobox"
+                aria-autocomplete="list" aria-expanded="false" aria-haspopup="listbox" value="">
+      <div id="loc-list" role="listbox" hidden></div></div></div>
   <!-- A custom file question, keyed by a per-posting id, as on Assured's form (2026-10-09). -->
   <div class="field"><label class="ashby-application-form-question-title" for="1a2b3c4d-0000-4000-8000-000000000007">Cover Letter</label>
     <input type="file" id="1a2b3c4d-0000-4000-8000-000000000007" name="1a2b3c4d-0000-4000-8000-000000000007"></div>
@@ -75,6 +82,19 @@
       b.setAttribute('aria-pressed', 'true');
       w.querySelector('input[type=checkbox]').checked = b.dataset.option === 'yes';
     }));
+  });
+  // Location: typing shows places that contain the text; a click on one commits it.
+  const PLACES = ['Santos Dumont, Brazil', 'Dumont, Iowa, United States', 'Dumont, New Jersey, United States'];
+  const loc = document.querySelector('.ashby-application-form-input-autocomplete'), list = document.getElementById('loc-list');
+  loc.addEventListener('input', () => {
+    const q = loc.value.trim().toLowerCase();
+    list.innerHTML = '';
+    PLACES.filter((p) => q && p.toLowerCase().includes(q)).forEach((p) => {
+      const o = document.createElement('div'); o.setAttribute('role', 'option'); o.textContent = p;
+      o.addEventListener('click', () => { loc.value = p; list.hidden = true; });
+      list.appendChild(o);
+    });
+    list.hidden = !list.children.length;
   });
   // The submit: a request, not a navigation. React-style, the handler sits on the app root.
   let submits = 0;

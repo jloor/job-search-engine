@@ -142,7 +142,25 @@ async function open(c) {
   return { url: page.url(), title: await page.title() };
 }
 
+// ⚠️ ASHBY AUTOCOMPLETE HAS NO ID (2026-10-15). The "Location" system field is a combobox input with
+// no id and no name; its title is a label for "_systemfield_location" that points at nothing. Every
+// field here is addressed by id, so the harvest skipped it and two VA sheets went out without the
+// required Location question (APP 492, 493). Give each such input the id its title already names.
+// Idempotent, and run before harvest AND fill, so a fill never depends on a harvest in the same page.
+async function ashbyIds() {
+  await page.evaluate(() => {
+    document.querySelectorAll('.ashby-application-form-field-entry input.ashby-application-form-input-autocomplete:not([id])')
+      .forEach((el) => {
+        const entry = el.closest('.ashby-application-form-field-entry');
+        const lab = entry.querySelector('label.ashby-application-form-question-title[for]');
+        const qid = (lab && lab.getAttribute('for')) || entry.getAttribute('data-field-path');
+        if (qid && !document.getElementById(qid)) el.id = qid;
+      });
+  });
+}
+
 async function harvest() {
+  await ashbyIds();
   return page.evaluate(() => {
     const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
     const labelOf = (el) => {
@@ -200,9 +218,12 @@ async function harvest() {
       if (el.tagName === 'TEXTAREA') kind = 'textarea';
       else if (el.tagName === 'SELECT') kind = 'native_select';
       else if ((el.className || '').toString().includes('select__input')) kind = 'select';
+      else if ((el.className || '').toString().includes('ashby-application-form-input-autocomplete')) kind = 'select';
       const label = labelOf(el);
       const required = !!el.required || el.getAttribute('aria-required') === 'true'
-                       || /\*\s*$/.test(label);
+                       || /\*\s*$/.test(label)
+                       || (/ashby-application-form-question-title/.test((ashbyTitle(el.id) || {}).className || '')
+                           && ashbyReq(ashbyTitle(el.id)));
       const r = el.getBoundingClientRect();
       fields.push({ id: el.id, name: el.name || '', kind, label: label.replace(/\s*\*\s*$/, ''),
                     required, visible: r.width > 0 && r.height > 0 || type === 'file' });
@@ -285,6 +306,7 @@ async function chooseOption(id, wants) {
 }
 
 async function fill(c) {
+  await ashbyIds();
   const results = [];
   for (const f of c.files || []) {                          // 1. files first
     const el = page.locator(attr(f.id)).first();

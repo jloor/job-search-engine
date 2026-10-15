@@ -94,7 +94,8 @@ CFG = {"identity": {"full_name": "Alex Rivera", "phone": "555-010-0199",
        "form_rule": [{"match": "^name$", "from": "identity.full_name", "kind": "text"},
                      {"match": "linkedin", "from": "identity.linkedin", "kind": "text"},
                      {"match": "legally authorized", "answer": "Yes", "kind": "select"},
-                     {"match": "nyc-metro", "answer": "Yes", "kind": "select"}]}
+                     {"match": "nyc-metro", "answer": "Yes", "kind": "select"},
+                     {"match": "^location$", "answer": "Dumont, New Jersey", "kind": "select"}]}
 ALIAS = "acme@jobs.example.com"
 ENV = dict(os.environ, FORMJS_TEST_HUMAN_CLICK="1")
 
@@ -141,6 +142,20 @@ try:
           any(r["id"] == RADIO and r["status"] == "set" and r["chosen"] == "Yes" for r in fr["results"]))
     check("the read-back shows the checked option's label",
           any(f["id"] == RADIO and f.get("value") == "Yes" for f in rb["fields"]))
+    # ⚠️ 2026-10-15: the Location combobox has no id, so the harvest skipped it and two VA sheets
+    # went out without a required question (APP 492, 493).
+    lf = next((f for f in h["fields"] if f["id"] == "_systemfield_location"), {})
+    check("the Location autocomplete (no id on the page) is harvested under its title's id, as a picker",
+          lf.get("kind") == "select" and lf.get("label") == "Location")
+    check("the Location field's required is read from the title's class", "_systemfield_location" in req)
+    check("the Location answer comes from the select rule",
+          by["_systemfield_location"].value == "Dumont, New Jersey" and not by["_systemfield_location"].problem)
+    check("the fill picks the New Jersey place, never Santos Dumont or Dumont, Iowa",
+          any(r["id"] == "_systemfield_location" and r["status"] == "set"
+              and r["chosen"] == "Dumont, New Jersey, United States" for r in fr["results"]))
+    check("the read-back shows the committed place",
+          any(f["id"] == "_systemfield_location" and f.get("value") == "Dumont, New Jersey, United States"
+              for f in rb["fields"]))
     check("the phone is found by its label (Ashby ids are UUIDs)", by["1a2b3c4d-0000-4000-8000-000000000001"].value == "555-010-0199")
     check("the email is the application's alias", by["_systemfield_email"].value == ALIAS)
     check("the résumé goes to the system résumé field, never to 'Autofill from resume'",
